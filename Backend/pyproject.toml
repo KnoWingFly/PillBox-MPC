@@ -1,0 +1,13 @@
+[project]
+name = "pillcare-backend"
+version = "0.1.0"
+description = "PillCare REST API (FastAPI + Supabase Postgres)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "pydantic-settings",
+    "pyjwt[crypto]",
+    "python-dotenv>=1.2.3",
+]
