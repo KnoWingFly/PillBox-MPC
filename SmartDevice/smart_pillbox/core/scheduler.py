@@ -116,6 +116,8 @@ class PillboxScheduler:
             # UX V2: Opening the lid means the pill is taken. No need to wait for close.
             compartment.state = ChamberState.TAKEN
             compartment.door_open = True
+            if compartment.stock_count > 0:
+                compartment.stock_count = self.db.update_stock(compartment.slot_number, -1)
             
             # Estimate chime count (assume 1 chime per second, up to 60 per minute)
             elapsed_seconds = (now - compartment.activated_at).total_seconds()
@@ -133,6 +135,26 @@ class PillboxScheduler:
             # Unscheduled open
             compartment.door_open = True
             self.db.log_event(compartment_id, compartment.slot_number, "UNSCHEDULED_OPEN", now)
+
+    def refill_slot(self, slot_number: int, delta: int = 1) -> int:
+        now = self.clock.now()
+        new_stock = self.db.update_stock(slot_number, delta)
+        for c in self.compartments.values():
+            if c.slot_number == slot_number:
+                c.stock_count = new_stock
+                self.db.log_event(c.id, slot_number, "REFILL_MAINTENANCE", now)
+                break
+        return new_stock
+
+    def unload_slot(self, slot_number: int, delta: int = 1) -> int:
+        now = self.clock.now()
+        new_stock = self.db.update_stock(slot_number, -delta)
+        for c in self.compartments.values():
+            if c.slot_number == slot_number:
+                c.stock_count = new_stock
+                self.db.log_event(c.id, slot_number, "REFILL_MAINTENANCE", now)
+                break
+        return new_stock
 
     def close_compartment(self, compartment_id: int) -> None:
         compartment = self.compartments.get(compartment_id)
@@ -162,3 +184,25 @@ class PillboxScheduler:
         self.active_chamber_id = None
         self._queue.clear()
         self._actioned_today.clear()
+
+    def get_next_dose(self) -> Compartment | None:
+        """Find the earliest upcoming compartment scheduled for today that is still IDLE.
+        If all upcoming slots today have passed or are actioned, returns None.
+        """
+        now = self.clock.now()
+        candidates: list[tuple[datetime, Compartment]] = []
+        for c in self.compartments.values():
+            if c.is_active and c.state == ChamberState.IDLE:
+                sched_dt = _today_scheduled_datetime(c, now)
+                if sched_dt >= now:
+                    candidates.append((sched_dt, c))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1].slot_number))
+        return candidates[0][1]
+
+    def interact(self, compartment_id: int) -> None:
+        """Compatibility wrapper for tests / direct interaction calls."""
+        self.open_compartment(compartment_id)
