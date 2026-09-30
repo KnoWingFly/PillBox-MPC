@@ -1,25 +1,26 @@
-"""Color constants matching the proposal's LED semantics:
-Yellow = before-meal reminder, Blue = after-meal reminder,
-Green = taken, Red = missed, Gray = idle/flush.
-"""
+"""Design tokens & color constants for Clean Dark-Slate Medical IoT."""
 
-# Hardware Casing
-ABS_WHITE = "#F4F6F8"
-ABS_DARK = "#E0E5EC"
-ABS_SHADOW = "#D1D9E6"
+# Base Theme (Clean Dark-Slate)
+WINDOW_BG = "#0F172A"       # Dark Slate 900
+CHASSIS_BG = "#1E293B"      # Dark Slate 800
+CHASSIS_BORDER = "#334155"  # Dark Slate 700
 
-# LCD Display
-LCD_BG = "#1A3B34"
-LCD_TEXT = "#7BFF59"
-LCD_OFF = "#112622"
+# LCD Display (Ultra Dark OLED)
+LCD_BG = "#030712"          # Ultra Dark Gray / Black
+LCD_BORDER = "#1F2937"      # Subtle border
+LCD_TEXT = "#E2E8F0"        # Monospaced Slate 200
+LCD_MUTED = "#94A3B8"       # Slate 400
+LCD_CYAN = "#06B6D4"        # Medical Cyan
 
 # Chamber States
-IDLE_COLOR = "#B0B0B0"
-ACTIVE_BEFORE_MEAL_COLOR = "#F5C518"   # yellow — sebelum makan
-ACTIVE_AFTER_MEAL_COLOR = "#2F80ED"    # blue — sesudah makan
-TAKEN_COLOR = "#27AE60"                # green
-MISSED_COLOR = "#EB5757"               # red
+ACTIVE_CYAN = "#06B6D4"     # Glowing Cyan for active intake slot
+IDLE_SLOT_BG = "#1E293B"    # Clean dark slot background
+IDLE_SLOT_BORDER = "#334155"# Thin slate border
+TAKEN_COLOR = "#10B981"     # Emerald
+MISSED_COLOR = "#EF4444"    # Red
+IDLE_COLOR = "#475569"      # Muted slate
 
-BACKGROUND = "#1E1E1E"
-TEXT_LIGHT = "#F5F5F5"
-TEXT_DARK = "#2C3E50"
+BACKGROUND = "#0F172A"
+TEXT_LIGHT = "#F8FAFC"
+TEXT_MUTED = "#94A3B8"
+TEXT_DARK = "#475569"
