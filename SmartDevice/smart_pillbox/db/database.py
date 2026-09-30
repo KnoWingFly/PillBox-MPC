@@ -50,6 +50,10 @@ class Database:
             self._conn.execute("ALTER TABLE compartments ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
         except sqlite3.OperationalError:
             pass # Columns already exist
+        try:
+            self._conn.execute("ALTER TABLE compartments ADD COLUMN stock_count INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
     def _seed_default_compartments_if_empty(self) -> None:
         count = self._conn.execute("SELECT COUNT(*) FROM compartments").fetchone()[0]
@@ -64,7 +68,7 @@ class Database:
     # -- compartments ----------------------------------------------------------
     def get_compartments(self) -> list[Compartment]:
         rows = self._conn.execute(
-            "SELECT id, slot_number, meal_relation, meal_time, schedule_time, tolerance_minutes, medication_name, is_active "
+            "SELECT id, slot_number, meal_relation, meal_time, schedule_time, tolerance_minutes, medication_name, is_active, stock_count "
             "FROM compartments ORDER BY slot_number"
         ).fetchall()
         return [
@@ -76,10 +80,37 @@ class Database:
                 schedule_time=row["schedule_time"],
                 tolerance_minutes=row["tolerance_minutes"],
                 medication_name=row["medication_name"],
+                stock_count=row["stock_count"] if "stock_count" in row.keys() else 0,
                 is_active=bool(row["is_active"]),
             )
             for row in rows
         ]
+
+    def update_stock(self, slot_number: int, delta: int) -> int:
+        """Atomically increment or decrement stock_count for a slot, bounded between 0 and 30."""
+        row = self._conn.execute(
+            "SELECT stock_count FROM compartments WHERE slot_number = ?", (slot_number,)
+        ).fetchone()
+        if not row:
+            return 0
+        current_stock = row["stock_count"]
+        new_stock = max(0, min(30, current_stock + delta))
+        self._conn.execute(
+            "UPDATE compartments SET stock_count = ? WHERE slot_number = ?",
+            (new_stock, slot_number),
+        )
+        self._conn.commit()
+        return new_stock
+
+    def set_stock(self, slot_number: int, count: int) -> int:
+        """Set stock_count directly, bounded between 0 and 30."""
+        new_stock = max(0, min(30, count))
+        self._conn.execute(
+            "UPDATE compartments SET stock_count = ? WHERE slot_number = ?",
+            (new_stock, slot_number),
+        )
+        self._conn.commit()
+        return new_stock
 
     def update_schedules(self, schedules: list[dict]) -> None:
         self._conn.execute("UPDATE compartments SET is_active = 0")

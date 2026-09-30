@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS compartments (
     schedule_time TEXT NOT NULL, -- "HH:MM"
     tolerance_minutes INTEGER NOT NULL DEFAULT 30,
     medication_name TEXT NULL,
+    stock_count INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1
 );
 

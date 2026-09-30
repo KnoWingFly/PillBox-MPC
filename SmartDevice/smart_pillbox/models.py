@@ -22,6 +22,7 @@ class Compartment:
     schedule_time: str          # "HH:MM"
     tolerance_minutes: int = 30
     medication_name: str | None = None
+    stock_count: int = 0
     is_active: bool = True
     slot_number: int = 1        # mapped 1-8
 
