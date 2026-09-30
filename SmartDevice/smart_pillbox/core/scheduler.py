@@ -57,6 +57,10 @@ class PillboxScheduler:
             if (compartment.id, today_key) in self._actioned_today:
                 continue
 
+            # Check days_of_week (1=Monday ... 7=Sunday)
+            if compartment.days_of_week and (now.isoweekday() not in compartment.days_of_week):
+                continue
+
             scheduled_at = _today_scheduled_datetime(compartment, now)
             if now >= scheduled_at:
                 self._due(compartment, now)
@@ -193,6 +197,8 @@ class PillboxScheduler:
         candidates: list[tuple[datetime, Compartment]] = []
         for c in self.compartments.values():
             if c.is_active and c.state == ChamberState.IDLE:
+                if c.days_of_week and (now.isoweekday() not in c.days_of_week):
+                    continue
                 sched_dt = _today_scheduled_datetime(c, now)
                 if sched_dt >= now:
                     candidates.append((sched_dt, c))

@@ -58,8 +58,8 @@ class CompartmentWidget(QWidget):
     - Unload Drag Source: Caregiver can drag sachet back to Caregiver Tray during REFILL MODE.
     """
 
-    interacted = Signal(int)  # emits compartment_id
-    refilled = Signal(int)    # emits slot_number
+    interacted = Signal(int, bool)  # emits (compartment_id, is_forced)
+    refilled = Signal(int)          # emits slot_number
 
     def __init__(self, compartment: Compartment, scheduler: PillboxScheduler | None = None, parent: QWidget | None = None):
         super().__init__(parent)
@@ -155,9 +155,55 @@ class CompartmentWidget(QWidget):
         # Repaint sachet canvas
         self._canvas.update()
 
-    # -- Mouse events for Dragging sachet OUT of slot --------------------------
+    def trigger_shake(self) -> None:
+        """Physical tactile vibration effect when an action is rejected on a locked slot."""
+        if hasattr(self, "_shake_anim") and self._shake_anim.state() == QPropertyAnimation.State.Running:
+            return
+
+        self._shake_anim = QPropertyAnimation(self._housing, b"pos", self)
+        self._shake_anim.setDuration(280)
+        orig_pos = QPoint(0, 0)
+        self._shake_anim.setKeyValueAt(0.0, orig_pos)
+        self._shake_anim.setKeyValueAt(0.15, QPoint(-7, 0))
+        self._shake_anim.setKeyValueAt(0.35, QPoint(7, 0))
+        self._shake_anim.setKeyValueAt(0.55, QPoint(-5, 0))
+        self._shake_anim.setKeyValueAt(0.75, QPoint(5, 0))
+        self._shake_anim.setKeyValueAt(0.9, QPoint(-2, 0))
+        self._shake_anim.setKeyValueAt(1.0, orig_pos)
+
+        # Temporary Red Border flash to visually signify mechanical lock rejection
+        self._housing.setStyleSheet(f"""
+            QFrame {{
+                background-color: {styles.IDLE_SLOT_BG};
+                border: 2px solid #EF4444;
+                border-radius: 12px;
+            }}
+        """)
+        self._shake_anim.start()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(350, self.refresh)
+
+    # -- Mouse events for Dragging sachet OUT of slot & Forced Open ------------
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # If door is already open, clicking on it closes the lid
+            if self.compartment.door_open:
+                self.interacted.emit(self.compartment_id, False)
+                event.accept()
+                return
+
+            # If slot is locked (not refill mode and not active):
+            # Normal clicking is REJECTED with physical vibration/shake!
+            if not self.scheduler.is_refill_mode and self.compartment.state != ChamberState.ACTIVE:
+                self.trigger_shake()
+                if hasattr(self.window(), "statusBar") and self.window().statusBar():
+                    self.window().statusBar().showMessage(
+                        f"🔒 AKSES DITOLAK: Slot {self.compartment.slot_number} terkunci oleh solenoid! (Jadwal: {self.compartment.schedule_time} WIB)",
+                        3500,
+                    )
+                event.accept()
+                return
+
             # Check if drag is allowed:
             # 1. Intake: When ACTIVE and sachet is popped up
             # 2. Refill Unload: When REFILL_MODE is active and slot has stock
@@ -165,6 +211,44 @@ class CompartmentWidget(QWidget):
                (self.scheduler.is_refill_mode and self.compartment.stock_count > 0):
                 self._drag_start_pos = event.pos()
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # If door is already open, double-clicking also closes the lid
+            if self.compartment.door_open:
+                self.interacted.emit(self.compartment_id, False)
+                event.accept()
+                return
+
+            # If in refill mode: double-click opens lid for inspection
+            if self.scheduler.is_refill_mode:
+                self.interacted.emit(self.compartment_id, False)
+                event.accept()
+                return
+
+            # If active: opening lid
+            if self.compartment.state == ChamberState.ACTIVE:
+                self.interacted.emit(self.compartment_id, False)
+                event.accept()
+                return
+
+            # If locked (IDLE / TAKEN / MISSED):
+            # Check if developer/tester used Alt+Double-Click for simulated forced pry
+            if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+                self.interacted.emit(self.compartment_id, True)  # is_forced = True
+                event.accept()
+                return
+
+            # Normal double-click on locked slot: FIRMLY REJECTED with vibration!
+            self.trigger_shake()
+            if hasattr(self.window(), "statusBar") and self.window().statusBar():
+                self.window().statusBar().showMessage(
+                    f"🔒 AKSES DITOLAK: Pintu Slot {self.compartment.slot_number} terkunci rapat oleh solenoid! (Gunakan Alt + Double-Click untuk simulasi cungkil paksa).",
+                    4000,
+                )
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
         self._drag_start_pos = None
@@ -212,18 +296,20 @@ class CompartmentWidget(QWidget):
                 # Strictly validate Refill Mode and Capacity <= 30
                 if data.get("source_type") == "caregiver_tray":
                     if not self.scheduler.is_refill_mode:
+                        self.trigger_shake()
                         if hasattr(self.window(), "statusBar") and self.window().statusBar():
                             self.window().statusBar().showMessage(
-                                "Penutup bilik terkunci: Aktifkan Refill Mode di Meja Caregiver terlebih dahulu.",
-                                3000,
+                                f"🚫 PENGISIAN DITOLAK: Slot {self.compartment.slot_number} terkunci! Aktifkan Refill Mode di Meja Caregiver terlebih dahulu.",
+                                3500,
                             )
                         event.ignore()
                         return
 
                     if self.compartment.stock_count >= 30:
+                        self.trigger_shake()
                         if hasattr(self.window(), "statusBar") and self.window().statusBar():
                             self.window().statusBar().showMessage(
-                                f"Slot {self.compartment.slot_number} sudah penuh (Maksimal 30 sachet).",
+                                f"⚠️ Slot {self.compartment.slot_number} sudah penuh (Maksimal 30 sachet).",
                                 3000,
                             )
                         event.ignore()
@@ -248,7 +334,12 @@ class CompartmentWidget(QWidget):
 
         try:
             data = json.loads(bytes(event.mimeData().data("application/x-pillcare-sachet")).decode("utf-8"))
-            if data.get("source_type") == "caregiver_tray" and self.scheduler.is_refill_mode:
+            if data.get("source_type") == "caregiver_tray":
+                if not self.scheduler.is_refill_mode:
+                    self.trigger_shake()
+                    event.ignore()
+                    return
+
                 if self.compartment.stock_count < 30:
                     # Refill slot by +1
                     new_stock = self.scheduler.refill_slot(self.compartment.slot_number, 1)
@@ -256,6 +347,10 @@ class CompartmentWidget(QWidget):
                     self.refilled.emit(self.compartment.slot_number)
                     self.refresh()
                     event.acceptProposedAction()
+                    return
+                else:
+                    self.trigger_shake()
+                    event.ignore()
                     return
         except Exception:
             pass

@@ -25,6 +25,7 @@ class Compartment:
     stock_count: int = 0
     is_active: bool = True
     slot_number: int = 1        # mapped 1-8
+    days_of_week: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
 
     # --- runtime-only fields (not persisted directly on this row) ----------
     state: ChamberState = field(default=ChamberState.IDLE)

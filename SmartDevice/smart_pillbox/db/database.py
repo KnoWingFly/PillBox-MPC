@@ -7,7 +7,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-
+import json
 import uuid
 
 from smart_pillbox import config
@@ -54,6 +54,10 @@ class Database:
             self._conn.execute("ALTER TABLE compartments ADD COLUMN stock_count INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        try:
+            self._conn.execute("ALTER TABLE compartments ADD COLUMN days_of_week TEXT NOT NULL DEFAULT '[1, 2, 3, 4, 5, 6, 7]'")
+        except sqlite3.OperationalError:
+            pass
 
     def _seed_default_compartments_if_empty(self) -> None:
         count = self._conn.execute("SELECT COUNT(*) FROM compartments").fetchone()[0]
@@ -68,23 +72,31 @@ class Database:
     # -- compartments ----------------------------------------------------------
     def get_compartments(self) -> list[Compartment]:
         rows = self._conn.execute(
-            "SELECT id, slot_number, meal_relation, meal_time, schedule_time, tolerance_minutes, medication_name, is_active, stock_count "
-            "FROM compartments ORDER BY slot_number"
+            "SELECT * FROM compartments ORDER BY slot_number"
         ).fetchall()
-        return [
-            Compartment(
-                id=row["id"],
-                slot_number=row["slot_number"],
-                meal_relation=row["meal_relation"],
-                meal_time=row["meal_time"],
-                schedule_time=row["schedule_time"],
-                tolerance_minutes=row["tolerance_minutes"],
-                medication_name=row["medication_name"],
-                stock_count=row["stock_count"] if "stock_count" in row.keys() else 0,
-                is_active=bool(row["is_active"]),
+        result = []
+        for row in rows:
+            keys = row.keys()
+            days_raw = row["days_of_week"] if "days_of_week" in keys else "[1, 2, 3, 4, 5, 6, 7]"
+            try:
+                days = json.loads(days_raw) if isinstance(days_raw, str) else list(days_raw)
+            except Exception:
+                days = [1, 2, 3, 4, 5, 6, 7]
+            result.append(
+                Compartment(
+                    id=row["id"],
+                    slot_number=row["slot_number"],
+                    meal_relation=row["meal_relation"],
+                    meal_time=row["meal_time"],
+                    schedule_time=row["schedule_time"],
+                    tolerance_minutes=row["tolerance_minutes"],
+                    medication_name=row["medication_name"] if "medication_name" in keys else None,
+                    stock_count=row["stock_count"] if "stock_count" in keys else 0,
+                    is_active=bool(row["is_active"]) if "is_active" in keys else True,
+                    days_of_week=days,
+                )
             )
-            for row in rows
-        ]
+        return result
 
     def update_stock(self, slot_number: int, delta: int) -> int:
         """Atomically increment or decrement stock_count for a slot, bounded between 0 and 30."""
@@ -115,11 +127,19 @@ class Database:
     def update_schedules(self, schedules: list[dict]) -> None:
         self._conn.execute("UPDATE compartments SET is_active = 0")
         for s in schedules:
+            sched_time = s.get("window_start") or s.get("schedule_time", "08:00")
+            tolerance = s.get("tolerance_minutes", 30)
+            med_name = s.get("medication_name")
+            slot = s["slot_number"]
+            days = s.get("days_of_week", [1, 2, 3, 4, 5, 6, 7])
+            days_str = json.dumps(days) if isinstance(days, list) else str(days)
+            active = 1 if s.get("active", True) else 0
+
             self._conn.execute(
                 """UPDATE compartments 
-                   SET schedule_time = ?, tolerance_minutes = ?, medication_name = ?, is_active = 1
+                   SET schedule_time = ?, tolerance_minutes = ?, medication_name = ?, days_of_week = ?, is_active = ?
                    WHERE slot_number = ?""",
-                (s["schedule_time"], s["tolerance_minutes"], s.get("medication_name"), s["slot_number"])
+                (sched_time, tolerance, med_name, days_str, active, slot)
             )
         self._conn.commit()
 

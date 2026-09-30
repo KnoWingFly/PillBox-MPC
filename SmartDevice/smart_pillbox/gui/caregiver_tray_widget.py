@@ -265,6 +265,14 @@ class CaregiverTrayWidget(QFrame):
 
     def _on_bulk_fill(self, count: int) -> None:
         """Helper to batch set all slots."""
+        if not self.scheduler.is_refill_mode:
+            if hasattr(self.window(), "statusBar") and self.window().statusBar():
+                self.window().statusBar().showMessage(
+                    "🔒 PERANGKAT TERKUNCI: Tekan 'Unlock Device (Refill Mode)' terlebih dahulu sebelum mengisi sachet!",
+                    4000,
+                )
+            return
+
         for slot_num in range(1, 9):
             self.scheduler.db.set_stock(slot_num, count)
         for c in self.scheduler.compartments.values():

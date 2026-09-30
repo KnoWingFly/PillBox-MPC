@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS compartments (
     tolerance_minutes INTEGER NOT NULL DEFAULT 30,
     medication_name TEXT NULL,
     stock_count INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 1
+    is_active INTEGER NOT NULL DEFAULT 1,
+    days_of_week TEXT NOT NULL DEFAULT '[1, 2, 3, 4, 5, 6, 7]'
 );
 
 CREATE TABLE IF NOT EXISTS events (

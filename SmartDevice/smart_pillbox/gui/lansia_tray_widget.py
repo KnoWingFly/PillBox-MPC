@@ -7,7 +7,7 @@ from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QLinearGradient, QFont
 )
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QFrame, QListWidget, QListWidgetItem, QPushButton
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QListWidget, QListWidgetItem, QPushButton
 )
 
 from smart_pillbox.gui.sachet_graphic import SachetGraphic
@@ -69,6 +69,61 @@ class WaterGlassWidget(QWidget):
         painter.end()
 
 
+class IntakeLogItemWidget(QFrame):
+    """Clean two-line medical record card for elderly intake event."""
+
+    def __init__(self, slot_number: int, medication_name: str, time_str: str, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #0F172A;
+                border: 1px solid #334155;
+                border-radius: 6px;
+            }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+
+        # Top row: Time + Slot badge
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        lbl_time = QLabel(time_str)
+        lbl_time.setStyleSheet("color: #94A3B8; font-family: 'Consolas', monospace; font-size: 10px; font-weight: bold; border: none;")
+        top_row.addWidget(lbl_time)
+
+        top_row.addStretch()
+
+        lbl_slot = QLabel(f"Slot {slot_number}")
+        lbl_slot.setStyleSheet("""
+            background-color: #1E293B;
+            color: #38BDF8;
+            font-size: 9px;
+            font-weight: bold;
+            border-radius: 3px;
+            padding: 1px 5px;
+            border: 1px solid #0284C7;
+        """)
+        top_row.addWidget(lbl_slot)
+        layout.addLayout(top_row)
+
+        # Bottom row: Medication name + Status Taken
+        bot_row = QHBoxLayout()
+        bot_row.setContentsMargins(0, 0, 0, 0)
+
+        lbl_med = QLabel(medication_name)
+        lbl_med.setStyleSheet("color: #F8FAFC; font-size: 10px; font-weight: bold; border: none;")
+        bot_row.addWidget(lbl_med)
+
+        bot_row.addStretch()
+
+        lbl_status = QLabel("✓ Diminum")
+        lbl_status.setStyleSheet("color: #10B981; font-size: 9px; font-weight: bold; border: none;")
+        bot_row.addWidget(lbl_status)
+        layout.addLayout(bot_row)
+
+
 class LansiaTrayWidget(QFrame):
     """Zona 3: Meja Minum Lansia.
     Acts as the drop target when elderly takes medicine (drags sachet out of pop-up slot).
@@ -81,7 +136,7 @@ class LansiaTrayWidget(QFrame):
         super().__init__(parent)
         self.scheduler = scheduler
         self.setAcceptDrops(True)
-        self.setFixedWidth(230)
+        self.setFixedWidth(240)
         self.setStyleSheet("""
             LansiaTrayWidget {
                 background-color: #0F172A;
@@ -134,27 +189,21 @@ class LansiaTrayWidget(QFrame):
 
         # Intake List
         self._log_list = QListWidget()
+        self._log_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._log_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._log_list.setStyleSheet("""
             QListWidget {
                 background-color: #1E293B;
                 border: 1px solid #334155;
                 border-radius: 6px;
-                padding: 4px;
+                padding: 3px;
                 outline: none;
             }
             QListWidget::item {
-                background-color: #0F172A;
-                border: 1px solid #334155;
-                border-radius: 4px;
+                background: transparent;
+                border: none;
+                padding: 0px;
                 margin: 2px 0px;
-                padding: 6px;
-                color: #38BDF8;
-                font-family: monospace;
-                font-size: 10px;
-                font-weight: bold;
-            }
-            QListWidget::item:hover {
-                background-color: #1E293B;
             }
         """)
         layout.addWidget(self._log_list)
@@ -180,11 +229,13 @@ class LansiaTrayWidget(QFrame):
         layout.addWidget(btn_clear)
 
     def add_intake_entry(self, slot_number: int, medication_name: str, time_str: str | None = None) -> None:
-        """Adds an intake confirmation record to the tray list."""
+        """Adds an intake confirmation record to the tray list using an elegant 2-line card."""
         t_str = time_str if time_str else datetime.now().strftime("%H:%M:%S")
-        item_text = f"[{t_str}] Slot {slot_number}: {medication_name} (TAKEN)"
-        item = QListWidgetItem(item_text)
+        item = QListWidgetItem()
+        widget = IntakeLogItemWidget(slot_number, medication_name, t_str)
+        item.setSizeHint(widget.sizeHint())
         self._log_list.insertItem(0, item)
+        self._log_list.setItemWidget(item, widget)
 
     # -- Drop Handling from Pop-up Compartment ---------------------------------
     def dragEnterEvent(self, event):

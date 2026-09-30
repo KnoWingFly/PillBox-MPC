@@ -265,18 +265,32 @@ class MainWindow(QMainWindow):
         self._is_syncing = False
         self.statusBar().showMessage(message, 3000)
 
-    def _on_widget_interacted(self, compartment_id: int) -> None:
+    def _on_widget_interacted(self, compartment_id: int, is_forced: bool = False) -> None:
         compartment = self.scheduler.compartments[compartment_id]
 
         if compartment.door_open:
             # Door is currently open -> clicking closes it
             self.scheduler.close_compartment(compartment_id)
+            self.statusBar().showMessage(f"Pintu Slot {compartment.slot_number} ditutup.", 3000)
+        elif self.scheduler.is_refill_mode:
+            # In refill mode -> lid can be opened/closed for maintenance
+            self.scheduler.open_compartment(compartment_id)
+            self.statusBar().showMessage(f"Pintu Slot {compartment.slot_number} dibuka untuk inspeksi refill.", 3000)
         elif compartment.state == ChamberState.ACTIVE:
-            # Active -> clicking opens it
+            # Active scheduled dose -> clicking opens it
             self.scheduler.open_compartment(compartment_id)
+            self.statusBar().showMessage(f"Pintu Slot {compartment.slot_number} terbuka: Waktunya minum obat.", 3000)
+        elif is_forced:
+            # Deliberate forced mechanical pry outside schedule
+            self.scheduler.open_compartment(compartment_id)
+            self.statusBar().showMessage(f"🚨 PERINGATAN: Pintu Slot {compartment.slot_number} dicungkil paksa di luar jadwal! (UNSCHEDULED_OPEN)", 4000)
         else:
-            # Unscheduled open
-            self.scheduler.open_compartment(compartment_id)
+            # Strictly locked! Reject action with shake animation
+            widget = self._widgets.get(compartment_id)
+            if widget:
+                widget.trigger_shake()
+            self.statusBar().showMessage(f"🔒 AKSES DITOLAK: Slot {compartment.slot_number} terkunci oleh solenoid! (Jadwal: {compartment.schedule_time} WIB)", 3500)
+            return
 
         self._refresh_widget(compartment)
         self._refresh_lcd()
