@@ -20,6 +20,6 @@ DB_PATH = BASE_DIR / "pillbox_local.db"
 SCHEMA_PATH = Path(__file__).resolve().parent / "db" / "schema.sql"
 
 # --- Backend sync (stub — backend not built yet) -----------------------------
-BACKEND_TELEMETRY_URL = "http://localhost:8000/api/v1/telemetry"
+BACKEND_BASE_URL = "http://localhost:8000/api/v1"
 SYNC_INTERVAL_SECONDS = 15
 SYNC_HTTP_TIMEOUT_SECONDS = 3

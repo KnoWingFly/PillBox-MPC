@@ -8,6 +8,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import uuid
+
 from smart_pillbox import config
 from smart_pillbox.models import Compartment
 
@@ -15,15 +17,15 @@ from smart_pillbox.models import Compartment
 # fresh checkout has something to demo immediately. Caregivers would edit
 # this from the mobile app in the real system (Schedule Control screen).
 _DEFAULT_SCHEDULE = [
-    # (meal_relation,     meal_time, schedule_time)
-    ("sebelum_makan", "pagi", "07:00"),
-    ("sebelum_makan", "siang", "12:00"),
-    ("sebelum_makan", "sore", "17:00"),
-    ("sebelum_makan", "malam", "20:00"),
-    ("sesudah_makan", "pagi", "07:30"),
-    ("sesudah_makan", "siang", "12:30"),
-    ("sesudah_makan", "sore", "17:30"),
-    ("sesudah_makan", "malam", "20:30"),
+    # (slot_number, meal_relation, meal_time, schedule_time)
+    (1, "sebelum_makan", "pagi", "07:00"),
+    (2, "sebelum_makan", "siang", "12:00"),
+    (3, "sebelum_makan", "sore", "17:00"),
+    (4, "sebelum_makan", "malam", "20:00"),
+    (5, "sesudah_makan", "pagi", "07:30"),
+    (6, "sesudah_makan", "siang", "12:30"),
+    (7, "sesudah_makan", "sore", "17:30"),
+    (8, "sesudah_makan", "malam", "20:30"),
 ]
 
 
@@ -42,13 +44,19 @@ class Database:
         sql = config.SCHEMA_PATH.read_text()
         self._conn.executescript(sql)
         self._conn.commit()
+        # Handle migration for existing databases smoothly
+        try:
+            self._conn.execute("ALTER TABLE compartments ADD COLUMN medication_name TEXT NULL")
+            self._conn.execute("ALTER TABLE compartments ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass # Columns already exist
 
     def _seed_default_compartments_if_empty(self) -> None:
         count = self._conn.execute("SELECT COUNT(*) FROM compartments").fetchone()[0]
         if count > 0:
             return
         self._conn.executemany(
-            "INSERT INTO compartments (meal_relation, meal_time, schedule_time) VALUES (?, ?, ?)",
+            "INSERT INTO compartments (slot_number, meal_relation, meal_time, schedule_time) VALUES (?, ?, ?, ?)",
             _DEFAULT_SCHEDULE,
         )
         self._conn.commit()
@@ -56,33 +64,40 @@ class Database:
     # -- compartments ----------------------------------------------------------
     def get_compartments(self) -> list[Compartment]:
         rows = self._conn.execute(
-            "SELECT id, meal_relation, meal_time, schedule_time, tolerance_minutes, refill_units "
-            "FROM compartments ORDER BY meal_time, meal_relation"
+            "SELECT id, slot_number, meal_relation, meal_time, schedule_time, tolerance_minutes, medication_name, is_active "
+            "FROM compartments ORDER BY slot_number"
         ).fetchall()
         return [
             Compartment(
                 id=row["id"],
+                slot_number=row["slot_number"],
                 meal_relation=row["meal_relation"],
                 meal_time=row["meal_time"],
                 schedule_time=row["schedule_time"],
                 tolerance_minutes=row["tolerance_minutes"],
-                refill_units=row["refill_units"],
+                medication_name=row["medication_name"],
+                is_active=bool(row["is_active"]),
             )
             for row in rows
         ]
 
-    def update_schedule(self, compartment_id: int, schedule_time: str, tolerance_minutes: int) -> None:
-        self._conn.execute(
-            "UPDATE compartments SET schedule_time = ?, tolerance_minutes = ? WHERE id = ?",
-            (schedule_time, tolerance_minutes, compartment_id),
-        )
+    def update_schedules(self, schedules: list[dict]) -> None:
+        self._conn.execute("UPDATE compartments SET is_active = 0")
+        for s in schedules:
+            self._conn.execute(
+                """UPDATE compartments 
+                   SET schedule_time = ?, tolerance_minutes = ?, medication_name = ?, is_active = 1
+                   WHERE slot_number = ?""",
+                (s["schedule_time"], s["tolerance_minutes"], s.get("medication_name"), s["slot_number"])
+            )
         self._conn.commit()
 
     # -- events / telemetry buffer ----------------------------------------------
-    def log_event(self, compartment_id: int, event_type: str, occurred_at: datetime) -> int:
+    def log_event(self, compartment_id: int, slot_number: int, event_type: str, occurred_at: datetime, chime_count: int = 0) -> int:
+        event_id = str(uuid.uuid4())
         cur = self._conn.execute(
-            "INSERT INTO events (compartment_id, event_type, occurred_at) VALUES (?, ?, ?)",
-            (compartment_id, event_type, occurred_at.isoformat()),
+            "INSERT INTO events (event_id, compartment_id, slot_number, event_type, occurred_at, chime_count) VALUES (?, ?, ?, ?, ?, ?)",
+            (event_id, compartment_id, slot_number, event_type, occurred_at.isoformat(), chime_count),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -100,12 +115,24 @@ class Database:
             "SELECT * FROM events WHERE synced = 0 ORDER BY occurred_at"
         ).fetchall()
 
-    def mark_synced(self, event_ids: list[int]) -> None:
-        if not event_ids:
+    def mark_synced(self, db_ids: list[int]) -> None:
+        if not db_ids:
             return
-        placeholders = ",".join("?" for _ in event_ids)
+        placeholders = ",".join("?" for _ in db_ids)
         self._conn.execute(
-            f"UPDATE events SET synced = 1 WHERE id IN ({placeholders})", event_ids
+            f"UPDATE events SET synced = 1 WHERE id IN ({placeholders})", db_ids
+        )
+        self._conn.commit()
+
+    # -- device state -----------------------------------------------------------
+    def get_device_state(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM device_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def update_device_state(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO device_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value)
         )
         self._conn.commit()
 
