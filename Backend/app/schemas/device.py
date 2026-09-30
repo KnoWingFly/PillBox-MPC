@@ -6,6 +6,7 @@ from datetime import datetime
 class ChamberStatus(BaseModel):
     slot_number: int = Field(..., ge=1, le=8)
     door: str = Field(..., description="CLOSED or OPEN")
+    stock_count: Optional[int] = Field(None, ge=0, le=30, description="Remaining sachet stock in compartment")
 
 class HeartbeatRequest(BaseModel):
     sent_at: datetime
