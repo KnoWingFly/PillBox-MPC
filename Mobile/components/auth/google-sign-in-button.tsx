@@ -1,78 +1,49 @@
 import { useState } from 'react';
-import { TouchableOpacity, Text, Alert, ActivityIndicator, Image } from 'react-native';
-import * as WebBrowser from 'expo-web-browser';
-import * as Linking from 'expo-linking';
-import { supabase } from '@root/utils/supabase';
+import { ActivityIndicator, Alert, Image, Text, TouchableOpacity, View } from 'react-native';
 
-WebBrowser.maybeCompleteAuthSession();
+import { Strings } from '@/constants/strings';
+import { useAuth } from '@/hooks/use-auth';
+import { errorMessage } from '@/lib/api/error-message';
+import { isGoogleSignInAvailable } from '@/lib/google-signin';
 
-export default function GoogleSignInButton() {
+export default function GoogleSignInButton({ disabled }: { disabled?: boolean }) {
+  const { signInWithGoogle } = useAuth();
   const [loading, setLoading] = useState(false);
+  const available = isGoogleSignInAvailable();
 
-  const handleGoogleSignIn = async () => {
+  const onPress = async () => {
+    setLoading(true);
     try {
-      setLoading(true);
-      
-      const redirectUri = Linking.createURL('/auth/callback');
-
-      const { data, error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: redirectUri,
-          skipBrowserRedirect: true,
-        },
-      });
-
-      if (error) throw error;
-
-      if (data?.url) {
-        const result = await WebBrowser.openAuthSessionAsync(data.url, redirectUri);
-
-        if (result.type === 'success') {
-          const { url } = result;
-          const accessTokenMatch = url.match(/access_token=([^&]*)/);
-          const refreshTokenMatch = url.match(/refresh_token=([^&]*)/);
-          const codeMatch = url.match(/code=([^&]*)/);
-
-          if (accessTokenMatch && refreshTokenMatch) {
-            const { error: sessionError } = await supabase.auth.setSession({
-              access_token: accessTokenMatch[1],
-              refresh_token: refreshTokenMatch[1],
-            });
-            if (sessionError) throw sessionError;
-          } else if (codeMatch && typeof supabase.auth.exchangeCodeForSession === 'function') {
-            const { error: sessionError } = await supabase.auth.exchangeCodeForSession(codeMatch[1]);
-            if (sessionError) throw sessionError;
-          }
-        }
-      }
-    } catch (err: any) {
-      Alert.alert('Google Sign-In Error', err.message);
+      await signInWithGoogle(); // false = cancelled, stays silent
+    } catch (err) {
+      Alert.alert(Strings.common.error, errorMessage(err));
     } finally {
       setLoading(false);
     }
   };
 
+  const isDisabled = !available || loading || disabled;
+
   return (
-    <TouchableOpacity 
-      onPress={handleGoogleSignIn}
-      disabled={loading}
-      className={`w-full bg-white border border-gray-300 rounded-xl py-3.5 flex-row items-center justify-center space-x-3 shadow-sm ${loading ? 'opacity-70' : 'opacity-100'}`}
-    >
-      {loading ? (
-        <ActivityIndicator color="#4b5563" />
-      ) : (
-        <>
-          <Image 
-            source={{ uri: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png' }}
-            style={{ width: 24, height: 24 }}
-            resizeMode="contain"
-          />
-          <Text className="text-gray-700 font-semibold text-lg ml-2">
-            Continue with Google
-          </Text>
-        </>
-      )}
-    </TouchableOpacity>
+    <View>
+      <TouchableOpacity
+        onPress={onPress}
+        disabled={isDisabled}
+        className={`w-full bg-white border border-gray-300 rounded-xl py-3.5 flex-row items-center justify-center shadow-sm ${isDisabled ? 'opacity-50' : 'opacity-100'}`}>
+        {loading ? (
+          <ActivityIndicator color="#4b5563" />
+        ) : (
+          <>
+            <Image
+              source={{ uri: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png' }}
+              style={{ width: 24, height: 24 }}
+              resizeMode="contain"
+            />
+            <Text className="text-gray-700 font-semibold text-lg ml-2">{Strings.auth.continueWithGoogle}</Text>
+          </>
+        )}
+      </TouchableOpacity>
+      {!available && <Text className="text-xs text-gray-500 text-center mt-2">{Strings.auth.googleUnavailable}</Text>}
+    </View>
   );
 }

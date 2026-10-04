@@ -2,6 +2,7 @@ import * as Device from 'expo-device';
 import { Platform, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import AccountSummary from '@root/components/auth/account-summary';
 import { AnimatedIcon } from '@/components/animated-icon';
 import { HintRow } from '@/components/hint-row';
 import { ThemedText } from '@/components/themed-text';
@@ -41,6 +42,8 @@ export default function HomeScreen() {
             <Text className="text-xs font-bold text-black">NW OK</Text>
           </View>
         </ThemedView>
+
+        <AccountSummary />
 
         <ThemedText type="code" style={styles.code}>
           get started
