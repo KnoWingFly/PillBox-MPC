@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import health, me
+from app.api.routes import health, me, devices
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -30,4 +30,5 @@ app.include_router(health.router)
 
 api_v1 = APIRouter(prefix="/api/v1")
 api_v1.include_router(me.router)
+api_v1.include_router(devices.router)
 app.include_router(api_v1)

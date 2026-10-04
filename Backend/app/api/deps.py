@@ -1,8 +1,9 @@
 from typing import Annotated
 from uuid import UUID
 
+# pyrefly: ignore [missing-import]
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -49,3 +50,24 @@ def get_current_user(
         email=claims.get("email"),
         role=claims.get("role"),
     )
+
+def verify_device_key(x_device_key: Annotated[str | None, Header(alias="X-Device-Key")] = None) -> bool:
+    """
+    Validates that the request comes from an authenticated IoT Smart Device.
+    Checks the X-Device-Key header.
+    """
+    if not x_device_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-Device-Key header",
+        )
+    
+    # TODO: In production, check this against the database (devices table).
+    # For now, we allow a dummy key for development/handover purposes.
+    # Alternatively, you could check if it starts with 'sim-' etc.
+    if x_device_key != "dummy-device-key-for-dev" and not x_device_key.startswith("dev_"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid device key",
+        )
+    return True
