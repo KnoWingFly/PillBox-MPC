@@ -6,7 +6,9 @@
     "@expo/ui": "~57.0.20",
     "@prisma/client": "6.19.3",
     "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-google-signin/google-signin": "^16.1.5",
     "@supabase/supabase-js": "^2.117.2",
+    "bcryptjs": "^3.0.3",
     "expo": "~57.0.25",
     "expo-auth-session": "~57.0.13",
     "expo-constants": "~57.0.19",
@@ -15,6 +17,7 @@
     "expo-glass-effect": "~57.0.4",
     "expo-image": "~57.0.5",
     "expo-linking": "~57.0.11",
+    "expo-notifications": "~57.0.21",
     "expo-router": "~57.0.23",
     "expo-secure-store": "~57.0.4",
     "expo-splash-screen": "~57.0.9",
@@ -22,6 +25,7 @@
     "expo-symbols": "~57.0.3",
     "expo-system-ui": "~57.0.4",
     "expo-web-browser": "~57.0.3",
+    "jose": "^6.2.12",
     "nativewind": "^4.2.7",
     "react": "19.2.3",
     "react-dom": "19.2.3",
@@ -32,12 +36,14 @@
     "react-native-screens": "~4.26.0",
     "react-native-web": "~0.21.0",
     "react-native-worklets": "0.10.1",
-    "tailwindcss": "^3.4.19"
+    "tailwindcss": "^3.4.19",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
     "dotenv": "^18.0.4",
     "prisma": "6.19.3",
+    "tsx": "^4.23.15",
     "typescript": "~6.0.3"
   },
   "scripts": {
