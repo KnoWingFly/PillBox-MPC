@@ -37,9 +37,25 @@ class PillboxScheduler:
         self.on_taken: list[Callable[[Compartment], None]] = []
 
     def _load_compartments(self):
-        # Reload compartments from DB (used on startup and after config sync)
+        # All 8 chambers are physical, so all are kept (and get a widget);
+        # inactive ones simply never pop up (see tick()).
         compartments = self.db.get_compartments()
-        self.compartments: dict[int, Compartment] = {c.id: c for c in compartments if c.is_active}
+        self.compartments: dict[int, Compartment] = {c.id: c for c in compartments}
+
+    def reload_schedules(self) -> None:
+        """Applies a freshly pulled config (schedule time, tolerance, days,
+        active flag) to the live chambers without losing their runtime state
+        (an alarm that is ringing keeps ringing)."""
+        for fresh in self.db.get_compartments():
+            current = self.compartments.get(fresh.id)
+            if current is None:
+                self.compartments[fresh.id] = fresh
+                continue
+            current.schedule_time = fresh.schedule_time
+            current.tolerance_minutes = fresh.tolerance_minutes
+            current.medication_name = fresh.medication_name
+            current.days_of_week = fresh.days_of_week
+            current.is_active = fresh.is_active
 
     # -- main loop, call this from a QTimer every ~1s --------------------------
     # -- main loop, call this from a QTimer every ~1s --------------------------
@@ -54,6 +70,8 @@ class PillboxScheduler:
 
             if compartment.state != ChamberState.IDLE:
                 continue  # already TAKEN/MISSED for today
+            if not compartment.is_active:
+                continue  # no schedule configured for this chamber
             if (compartment.id, today_key) in self._actioned_today:
                 continue
 

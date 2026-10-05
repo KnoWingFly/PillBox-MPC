@@ -56,3 +56,18 @@ needed, so they run headless in CI too.
   before this becomes a real device app.
 - `BACKEND_TELEMETRY_URL` in `config.py` is a placeholder — update it once
   the FastAPI endpoint spec is finalized so the JSON payload shape matches.
+
+## Connecting to the PillCare backend
+
+1. Start the backend (`Backend/README.md`). It must have `PROVISIONING_TOKEN` set in `Backend/.env`.
+2. Run the emulator. In the **Koneksi Server** panel (bottom right), press **Daftarkan Perangkat**.
+   The emulator reads `PROVISIONING_TOKEN` from `PILLCARE_PROVISIONING_TOKEN`, `SmartDevice/.env`
+   or `../Backend/.env` (asks you to paste it if none is found), registers itself with the backend,
+   stores its own device code + secret in `pillbox_local.db`, and copies the code to the clipboard.
+3. In the mobile app, the dashboard shows **Hubungkan Pillbox**: type the code, choose a 4-digit PIN,
+   press **Hubungkan**. The panel switches to "Terpasang ke aplikasi" on the next heartbeat (≤ 15 s).
+4. Schedules saved in the app are pulled on the next heartbeat and applied live.
+
+Backend elsewhere? Set `PILLCARE_BACKEND_URL=http://<host>:8000` before starting the emulator.
+"Reset Identitas" forgets the code/secret (e.g. after the backend database was reset).
+Device ↔ backend protocol: `docs/DEVICE_CONTRACT.md`.
