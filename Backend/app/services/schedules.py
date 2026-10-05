@@ -183,7 +183,7 @@ async def update(
 ) -> ScheduleOut:
     device, _ = await get_device_for_user(session, user.id, device_id, EDITOR_ROLES, for_update=True)
     schedule = await _get_schedule(session, device.id, schedule_id)
-    changes = body.model_dump(exclude_unset=True)
+    changes = {field: getattr(body, field) for field in body.model_fields_set}
     for required in ("window_start", "window_end", "tolerance_minutes", "days_of_week", "active"):
         if required in changes and changes[required] is None:
             raise unprocessable("VALIDATION_ERROR", f"{required} cannot be null")
