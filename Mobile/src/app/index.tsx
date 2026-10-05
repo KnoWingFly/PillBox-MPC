@@ -1,8 +1,8 @@
 // Frontend-only test harness for the Smart Pillbox caregiver app.
-// Everything runs against the mock data layer in lib/api.ts (USE_MOCK = true).
+// Data comes from lib/api.ts: the FastAPI backend when EXPO_PUBLIC_PILLBOX_API_URL is set, else mock data.
 
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ComponentProps, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -11,6 +11,7 @@ import {
   ScrollView,
   Switch,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -347,12 +348,99 @@ function ConnectionCard({
         <InfoRow label="Wi-Fi" value={device.online ? device.wifiLabel : 'Tidak terhubung'} />
         <InfoRow label="Sinkron terakhir" value={formatRelative(device.lastSyncedAt, now)} />
       </View>
-      <Button
-        label={device.online ? 'Simulasi Putuskan Koneksi' : 'Simulasi Sambungkan'}
-        variant="outline"
-        loading={busy}
-        onPress={onToggle}
+      {/* With the real backend, connectivity comes from the device itself (emulator Wi-Fi toggle). */}
+      {api.USE_MOCK && (
+        <Button
+          label={device.online ? 'Simulasi Putuskan Koneksi' : 'Simulasi Sambungkan'}
+          variant="outline"
+          loading={busy}
+          onPress={onToggle}
+        />
+      )}
+    </Card>
+  );
+}
+
+const CONNECT_ERRORS: Record<string, string> = {
+  QR_CODE_NOT_RECOGNIZED: 'Kode perangkat tidak dikenal. Daftarkan dulu dari emulator (tombol "Daftarkan Perangkat").',
+  DEVICE_PIN_INVALID: 'PIN harus 4 digit angka.',
+  DEVICE_PIN_INCORRECT: 'PIN salah untuk pillbox yang sudah terpasang.',
+  TOO_MANY_ATTEMPTS: 'Terlalu banyak percobaan PIN. Coba lagi beberapa menit lagi.',
+  NETWORK_ERROR: 'Server tidak dapat dihubungi. Pastikan backend berjalan.',
+};
+
+function ConnectInput({
+  label,
+  ...props
+}: { label: string } & ComponentProps<typeof TextInput>) {
+  return (
+    <View className="gap-1">
+      <Text className="text-base font-semibold text-slate-700">{label}</Text>
+      <TextInput
+        className="min-h-[48px] rounded-xl border-2 border-slate-300 bg-white px-4 text-lg text-slate-900"
+        placeholderTextColor="#94A3B8"
+        autoCorrect={false}
+        {...props}
       />
+    </View>
+  );
+}
+
+function ConnectPillboxCard({ onConnected }: { onConnected: (result: api.ConnectPillboxResult) => void }) {
+  const [deviceCode, setDeviceCode] = useState('');
+  const [pin, setPin] = useState('');
+  const [nickname, setNickname] = useState('Pillbox Lansia');
+  const [elderlyName, setElderlyName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canSubmit = deviceCode.trim().length > 0 && /^\d{4}$/.test(pin);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      onConnected(await api.connectPillbox({ deviceCode, pin, nickname, elderlyName }));
+    } catch (err) {
+      if (err instanceof api.BackendError) setError(CONNECT_ERRORS[err.code] ?? err.message);
+      else setError('Gagal menghubungkan pillbox.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card title="Hubungkan Pillbox">
+      <Text className="text-base text-slate-600">
+        Di emulator Smart Device, tekan "Daftarkan Perangkat" pada panel "Koneksi Server", lalu ketik kode yang
+        muncul di sini. Buat PIN 4 digit baru; jika pillbox sudah dipasangkan caregiver lain, masukkan PIN-nya
+        untuk bergabung.
+      </Text>
+      <ConnectInput
+        label="Kode perangkat"
+        value={deviceCode}
+        onChangeText={setDeviceCode}
+        placeholder="PB-1A2B3C4D"
+        autoCapitalize="characters"
+      />
+      <ConnectInput
+        label="PIN perangkat (4 digit)"
+        value={pin}
+        onChangeText={(v) => setPin(v.replace(/\D/g, '').slice(0, 4))}
+        placeholder="1234"
+        keyboardType="number-pad"
+        secureTextEntry
+        maxLength={4}
+      />
+      <ConnectInput label="Nama pillbox" value={nickname} onChangeText={setNickname} />
+      <ConnectInput
+        label="Nama lansia (jika belum ada profil)"
+        value={elderlyName}
+        onChangeText={setElderlyName}
+        placeholder="mis. Oma Sari"
+      />
+      {error && <Text className="text-base font-semibold text-red-700">{error}</Text>}
+      <Button label="Hubungkan" onPress={submit} loading={busy} disabled={!canSubmit} />
     </Card>
   );
 }
@@ -771,6 +859,9 @@ export default function PillboxTestScreen() {
 
   const [device, setDevice] = useState<DeviceStatus | null>(null);
   const [connectionBusy, setConnectionBusy] = useState(false);
+  // Backend mode only: the caregiver has no paired pillbox yet.
+  const [needsPairing, setNeedsPairing] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
 
   const [savedSlots, setSavedSlots] = useState<Slot[]>([]);
   const [draftSlots, setDraftSlots] = useState<Slot[]>([]);
@@ -797,17 +888,24 @@ export default function PillboxTestScreen() {
     Promise.all([api.getDeviceStatus(), api.getSchedules()])
       .then(([status, slots]) => {
         if (cancelled) return;
+        setNeedsPairing(false);
         setDevice(status);
         setSavedSlots(slots);
         setDraftSlots(slots);
       })
-      .catch(() => {
-        if (!cancelled) setToast(makeToast('Gagal memuat data perangkat', 'error'));
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof api.BackendError && err.code === 'NO_DEVICE') {
+          setNeedsPairing(true);
+          return;
+        }
+        const detail = err instanceof api.BackendError ? `: ${err.message}` : '';
+        setToast(makeToast(`Gagal memuat data perangkat${detail}`, 'error'));
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   // New notifications go to the top of the list and trigger the banner.
   useEffect(
@@ -819,6 +917,20 @@ export default function PillboxTestScreen() {
       }),
     [],
   );
+
+  // Backend mode: online/offline, battery and last sync change on the device side, so poll them.
+  useEffect(() => {
+    if (api.USE_MOCK || needsPairing) return;
+    const timer = setInterval(() => {
+      api.getDeviceStatus().then(setDevice).catch(() => undefined);
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [needsPairing]);
+
+  const handleConnected = (result: api.ConnectPillboxResult) => {
+    showToast(result.joined ? 'Bergabung ke pillbox (mode pemantau)' : 'Pillbox berhasil dihubungkan', 'success');
+    setReloadKey((k) => k + 1);
+  };
 
   // Keeps relative times ("5 mnt lalu") fresh.
   useEffect(() => {
@@ -875,8 +987,9 @@ export default function PillboxTestScreen() {
     try {
       await api.triggerAlarm(n.slotId);
       showToast(`Alarm dibunyikan di ${device?.deviceName ?? 'Pillbox'}`, 'success');
-    } catch {
-      showToast('Gagal membunyikan alarm', 'error');
+    } catch (err) {
+      // e.g. "Device is offline; the command was not sent" from the backend
+      showToast(err instanceof api.BackendError ? `Gagal membunyikan alarm: ${err.message}` : 'Gagal membunyikan alarm', 'error');
     } finally {
       setAlarmBusyId(null);
     }
@@ -910,8 +1023,8 @@ export default function PillboxTestScreen() {
       } else {
         showToast('Jadwal disimpan, akan dikirim saat Pillbox online', 'warning');
       }
-    } catch {
-      showToast('Gagal menyimpan jadwal', 'error');
+    } catch (err) {
+      showToast(err instanceof api.BackendError ? `Gagal menyimpan jadwal: ${err.message}` : 'Gagal menyimpan jadwal', 'error');
     } finally {
       setSaving(false);
     }
@@ -931,42 +1044,50 @@ export default function PillboxTestScreen() {
             </Text>
           </View>
 
-          <AdherenceCard summary={adherence} />
+          {needsPairing ? (
+            <ConnectPillboxCard onConnected={handleConnected} />
+          ) : (
+            <>
+              <AdherenceCard summary={adherence} />
 
-          <ConnectionCard device={device} busy={connectionBusy} now={now} onToggle={handleToggleConnection} />
+              <ConnectionCard device={device} busy={connectionBusy} now={now} onToggle={handleToggleConnection} />
 
-          <SimulatorCard
-            slots={savedSlots}
-            slotId={effectiveSimSlot}
-            onSelectSlot={setSimSlotId}
-            minutesLate={minutesLate}
-            onChangeMinutesLate={setMinutesLate}
-            busyType={simBusy}
-            onSimulate={handleSimulate}
-          />
+              {api.USE_MOCK && (
+                <SimulatorCard
+                  slots={savedSlots}
+                  slotId={effectiveSimSlot}
+                  onSelectSlot={setSimSlotId}
+                  minutesLate={minutesLate}
+                  onChangeMinutesLate={setMinutesLate}
+                  busyType={simBusy}
+                  onSimulate={handleSimulate}
+                />
+              )}
 
-          <NotificationCenter
-            notifications={notifications}
-            filter={filter}
-            onFilter={setFilter}
-            now={now}
-            alarmBusyId={alarmBusyId}
-            onMarkRead={markRead}
-            onCall={handleCall}
-            onAlarm={handleAlarm}
-          />
+              <NotificationCenter
+                notifications={notifications}
+                filter={filter}
+                onFilter={setFilter}
+                now={now}
+                alarmBusyId={alarmBusyId}
+                onMarkRead={markRead}
+                onCall={handleCall}
+                onAlarm={handleAlarm}
+              />
 
-          <ScheduleCard
-            draft={draftSlots}
-            saved={savedSlots}
-            selectedId={selectedSlotId}
-            onSelect={(id) => setSelectedSlotId((current) => (current === id ? null : id))}
-            onChangeSlot={handleChangeSlot}
-            testing={testing}
-            onTest={handleTestSlot}
-            saving={saving}
-            onSave={handleSave}
-          />
+              <ScheduleCard
+                draft={draftSlots}
+                saved={savedSlots}
+                selectedId={selectedSlotId}
+                onSelect={(id) => setSelectedSlotId((current) => (current === id ? null : id))}
+                onChangeSlot={handleChangeSlot}
+                testing={testing}
+                onTest={handleTestSlot}
+                saving={saving}
+                onSave={handleSave}
+              />
+            </>
+          )}
         </ScrollView>
       </SafeAreaView>
 

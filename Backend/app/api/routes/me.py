@@ -1,14 +1,21 @@
-from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
+from pydantic import BaseModel
 
-from app.api.deps import CurrentUser, get_current_user
+from app.api.deps import CurrentUser
 
 router = APIRouter(tags=["auth"])
 
 
-@router.get("/me", response_model=CurrentUser)
-def me(user: Annotated[CurrentUser, Depends(get_current_user)]) -> CurrentUser:
-    """Temporary sanity-check endpoint: proves the Expo app's Supabase token
-    is accepted by this backend. Replace with real profile routes later."""
-    return user
+class MeOut(BaseModel):
+    id: UUID
+    full_name: str
+    email: str
+    timezone: str
+
+
+@router.get("/me", response_model=MeOut)
+async def me(user: CurrentUser) -> MeOut:
+    """Sanity check: proves the app's access token is accepted by this backend."""
+    return MeOut(id=user.id, full_name=user.full_name, email=user.email, timezone=user.timezone)

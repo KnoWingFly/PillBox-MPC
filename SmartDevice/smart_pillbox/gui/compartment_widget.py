@@ -373,5 +373,7 @@ class CompartmentWidget(QWidget):
         if compartment.state == ChamberState.MISSED:
             return styles.MISSED_COLOR, "MISSED", False, False
             
+        if not compartment.is_active:
+            return styles.TEXT_MUTED, "TIDAK AKTIF", False, False
         return styles.TEXT_MUTED, f"DUE: {compartment.schedule_time}", False, False
 

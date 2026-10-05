@@ -7,7 +7,8 @@ from PySide6.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QDoubleSpinBox, QStatusBar, QFrame, QGroupBox, QSlider, QCheckBox, QComboBox
+    QLabel, QPushButton, QDoubleSpinBox, QStatusBar, QFrame, QGroupBox, QSlider, QCheckBox, QComboBox,
+    QApplication, QInputDialog, QLineEdit, QMessageBox
 )
 
 from smart_pillbox import config
@@ -42,6 +43,12 @@ class SyncWorker(QRunnable):
         self.signals = SyncSignals()
 
     def run(self):
+        if not sync.is_registered(self.db):
+            try:
+                self.signals.finished.emit(0, "Belum terdaftar ke server: tekan 'Daftarkan Perangkat'.")
+            except RuntimeError:
+                pass
+            return
         try:
             sync.send_heartbeat(self.db, self.now_str, self.battery, self.is_online)
             synced_count = sync.flush_pending_events(self.db)
@@ -57,6 +64,27 @@ class SyncWorker(QRunnable):
                 self.signals.finished.emit(0, f"Sync error: {e}")
             except RuntimeError:
                 pass
+
+
+class RegisterSignals(QObject):
+    finished = Signal(bool, str)
+
+
+class RegisterWorker(QRunnable):
+    """Registers the device with the backend off the GUI thread."""
+
+    def __init__(self, db: Database, token: str):
+        super().__init__()
+        self.db = db
+        self.token = token
+        self.signals = RegisterSignals()
+
+    def run(self):
+        try:
+            code = sync.register_device(self.db, self.token)
+            self.signals.finished.emit(True, code)
+        except sync.RegistrationError as exc:
+            self.signals.finished.emit(False, str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -77,9 +105,12 @@ class MainWindow(QMainWindow):
         self._widgets: dict[int, CompartmentWidget] = {}
         self._is_online = True
         self._is_syncing = False
+        self._is_registering = False
         self._battery_percent = 100
+        self._config_version_seen = self.db.get_device_state("config_version")
 
         self._build_ui()
+        self._refresh_connection_panel()
 
 
         self._tick_timer = QTimer(self)
@@ -160,7 +191,7 @@ class MainWindow(QMainWindow):
 
         # -- Bottom Section: Developer Lab Workbench --
         lab_panel = QFrame(self)
-        lab_panel.setFixedHeight(110)
+        lab_panel.setFixedHeight(120)
         lab_panel.setStyleSheet(f"""
             QFrame {{ background-color: {styles.CHASSIS_BG}; border: 1px solid {styles.CHASSIS_BORDER}; border-radius: 8px; }}
             QLabel, QGroupBox {{ color: {styles.TEXT_LIGHT}; }}
@@ -233,6 +264,28 @@ class MainWindow(QMainWindow):
         batt_layout.addWidget(self._batt_slider)
         lab_layout.addWidget(batt_group)
 
+        # Server connection / pairing
+        conn_group = QGroupBox("Koneksi Server")
+        conn_layout = QHBoxLayout(conn_group)
+        conn_info = QVBoxLayout()
+        self._lbl_device_code = QLabel()
+        self._lbl_device_code.setStyleSheet("border: none; font-size: 13px; font-weight: bold; color: #E2E8F0;")
+        self._lbl_device_code.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._lbl_pair_status = QLabel()
+        self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px;")
+        conn_info.addWidget(self._lbl_device_code)
+        conn_info.addWidget(self._lbl_pair_status)
+        conn_layout.addLayout(conn_info)
+        conn_buttons = QVBoxLayout()
+        self._btn_register = QPushButton()
+        self._btn_register.clicked.connect(self._on_register_clicked)
+        self._btn_forget = QPushButton("Reset Identitas")
+        self._btn_forget.clicked.connect(self._on_forget_clicked)
+        conn_buttons.addWidget(self._btn_register)
+        conn_buttons.addWidget(self._btn_forget)
+        conn_layout.addLayout(conn_buttons)
+        lab_layout.addWidget(conn_group)
+
         lab_layout.addStretch()
 
         main_layout.addWidget(lab_panel)
@@ -246,6 +299,7 @@ class MainWindow(QMainWindow):
     def _on_tick(self) -> None:
         self.scheduler.tick()
         self._refresh_lcd()
+        self._refresh_connection_panel()
 
     def _on_sync_tick(self) -> None:
         if not self._is_online:
@@ -264,6 +318,87 @@ class MainWindow(QMainWindow):
     def _on_sync_finished(self, synced_count: int, message: str) -> None:
         self._is_syncing = False
         self.statusBar().showMessage(message, 3000)
+        # A new config from the app was pulled during this sync: apply it live.
+        version = self.db.get_device_state("config_version")
+        if version != self._config_version_seen:
+            self._config_version_seen = version
+            self.scheduler.reload_schedules()
+            for compartment in self.scheduler.compartments.values():
+                self._refresh_widget(compartment)
+            self._refresh_lcd()
+            self.statusBar().showMessage(f"Jadwal baru dari aplikasi diterapkan (config v{version}).", 4000)
+
+    # -- server connection / pairing -------------------------------------------
+    def _refresh_connection_panel(self) -> None:
+        code, _ = sync.get_identity(self.db)
+        if not sync.is_registered(self.db):
+            self._lbl_device_code.setText("Kode: -")
+            self._lbl_pair_status.setText("Belum terdaftar ke server")
+            self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px; color: #FCA5A5;")
+            self._btn_register.setText("Mendaftarkan..." if self._is_registering else "Daftarkan Perangkat")
+            self._btn_register.setEnabled(not self._is_registering)
+            self._btn_forget.setEnabled(False)
+            return
+        self._lbl_device_code.setText(f"Kode: {code}")
+        if sync.is_paired(self.db):
+            self._lbl_pair_status.setText("Terpasang ke aplikasi")
+            self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px; color: #6EE7B7;")
+        else:
+            self._lbl_pair_status.setText("Masukkan kode ini di aplikasi")
+            self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px; color: #FCD34D;")
+        self._btn_register.setText("Salin Kode")
+        self._btn_register.setEnabled(True)
+        self._btn_forget.setEnabled(True)
+
+    def _on_register_clicked(self) -> None:
+        if sync.is_registered(self.db):
+            code, _ = sync.get_identity(self.db)
+            QApplication.clipboard().setText(code or "")
+            self.statusBar().showMessage(f"Kode {code} disalin. Tempel di aplikasi: 'Hubungkan Pillbox'.", 4000)
+            return
+        token = config.provisioning_token()
+        if not token:
+            token, ok = QInputDialog.getText(
+                self,
+                "Daftarkan Perangkat",
+                "PROVISIONING_TOKEN dari Backend/.env tidak ditemukan.\nTempel token di sini:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok or not token.strip():
+                return
+            token = token.strip()
+        self._is_registering = True
+        self._refresh_connection_panel()
+        worker = RegisterWorker(self.db, token)
+        worker.signals.finished.connect(self._on_register_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_register_finished(self, ok: bool, message: str) -> None:
+        self._is_registering = False
+        self._config_version_seen = self.db.get_device_state("config_version")
+        self._refresh_connection_panel()
+        if ok:
+            QApplication.clipboard().setText(message)
+            QMessageBox.information(
+                self,
+                "Perangkat terdaftar",
+                f"Kode perangkat: {message}\n\n"
+                "Kode sudah disalin. Di aplikasi PillCare, buka 'Hubungkan Pillbox', "
+                "masukkan kode ini dan buat PIN 4 digit.",
+            )
+        else:
+            QMessageBox.warning(self, "Pendaftaran gagal", message)
+
+    def _on_forget_clicked(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Reset Identitas",
+            "Hapus kode & kunci perangkat ini dari emulator? Perangkat harus didaftarkan "
+            "dan dipasangkan ulang di aplikasi.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            sync.forget_identity(self.db)
+            self._refresh_connection_panel()
 
     def _on_widget_interacted(self, compartment_id: int, is_forced: bool = False) -> None:
         compartment = self.scheduler.compartments[compartment_id]
