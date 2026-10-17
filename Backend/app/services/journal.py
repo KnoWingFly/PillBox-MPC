@@ -13,6 +13,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.errors import conflict, not_found, unprocessable
 from app.models import Device, Notification, Schedule, TelemetryLog, User
 from app.models.enums import (
@@ -34,7 +35,8 @@ from app.schemas.journal import (
 )
 from app.services.access import require_role
 from app.services.adherence import AdherenceSummary, delay_minutes_for, dose_instants, is_scheduled_on, journal_status
-from app.services.doses import auto_resolve_missed
+from app.services.device_clock import device_now
+from app.services.doses import report_taken_after_missed
 from app.services.slots import slot_layout
 from app.services.timeutil import as_aware, zone
 
@@ -281,7 +283,7 @@ async def summary_view(session: AsyncSession, user: User, elderly_id: UUID, star
 
 
 async def manual_confirmation(
-    session: AsyncSession, user: User, dose_log_id: UUID, body: ManualConfirmationIn, now: datetime
+    session: AsyncSession, user: User, dose_log_id: UUID, body: ManualConfirmationIn, now: datetime, settings: Settings
 ) -> ManualConfirmationOut:
     log = (
         await session.execute(select(TelemetryLog).where(TelemetryLog.id == dose_log_id).with_for_update())
@@ -293,10 +295,9 @@ async def manual_confirmation(
     await require_role(session, user.id, log.elderly_id, EDITOR_ROLES)
     if log.status == DoseStatus.TAKEN and log.log_source == LogSource.AUTO_SENSOR:
         raise conflict("ALREADY_TAKEN_BY_DEVICE", "The device already recorded this dose as taken")
-    if log.scheduled_for is None or now < log.scheduled_for:
-        raise conflict("DOSE_NOT_YET_DUE", "This dose is not due yet")
-
     device = await session.get(Device, log.device_id)
+    if log.scheduled_for is None or (device_now(device, now, settings) if device else now) < log.scheduled_for:
+        raise conflict("DOSE_NOT_YET_DUE", "This dose is not due yet")
     tz = zone(device.timezone if device else None)
     confirmed_at = as_aware(body.confirmed_at, tz)
     if body.override_status == "TAKEN_ON_TIME":
@@ -319,7 +320,8 @@ async def manual_confirmation(
     log.confirmation_note = body.note
     log.recorded_at = confirmed_at
     if previous == DoseStatus.MISSED:
-        await auto_resolve_missed(session, log.id, now, f"Manually confirmed as taken by {user.full_name}")
+        await session.flush()
+        await report_taken_after_missed(session, log, tz, now, f"dikonfirmasi oleh {user.full_name}")
     await session.commit()
     logger.info("dose_manually_confirmed", extra={"telemetry_log_id": str(log.id), "user_id": str(user.id)})
     return ManualConfirmationOut(

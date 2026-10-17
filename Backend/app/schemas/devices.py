@@ -142,6 +142,13 @@ class DeviceStatusOut(BaseModel):
     rtc_backup_active: bool | None
     command_channel_connected: bool
     chambers: list[ChamberDoor]
+    # Device clock right now (device timezone), extrapolated from its last heartbeat; null
+    # until it reported one. clock_speed = device seconds per real second (1.0 = real time).
+    device_time: datetime | None = None
+    clock_speed: float | None = None
+    # True: doses are judged by device_time (FOLLOW_DEVICE_CLOCK), so the app should use it
+    # for "today" and "next dose" instead of the phone clock.
+    follow_device_clock: bool = False
 
 
 class ClockOut(BaseModel):

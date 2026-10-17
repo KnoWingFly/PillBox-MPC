@@ -21,6 +21,8 @@ class HeartbeatRequest(BaseModel):
     battery_percent: int = Field(..., ge=0, le=100)
     wifi_rssi_dbm: int | None = None
     rtc_time: datetime | None = None
+    # How fast rtc_time advances per real second (the emulator's lab clock runs 1x/10x/60x).
+    rtc_speed: float | None = Field(None, gt=0, le=10_000)
     config_version_applied: int | None = Field(None, ge=0)
     chambers: list[ChamberStatus] = Field(default_factory=list, max_length=8)
     rtc_backup_active: bool | None = None

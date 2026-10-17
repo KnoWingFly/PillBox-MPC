@@ -108,8 +108,12 @@ async def get_or_create_dose(
     return row.scalar_one()
 
 
+# What the app may offer on an open DOSE_MISSED notification (see services/late_dose.py).
+MISSED_DOSE_ACTIONS = ["LATE_RELEASE", "CONFIRM_TAKEN"]
+
+
 async def notify_dose(
-    session: AsyncSession, log: TelemetryLog, ntype: NotificationType, tz: ZoneInfo
+    session: AsyncSession, log: TelemetryLog, ntype: NotificationType, tz: ZoneInfo, *, variant: str | None = None
 ) -> list[UUID]:
     if log.elderly_id is None or log.slot_number is None:
         return []
@@ -122,6 +126,7 @@ async def notify_dose(
     if not recipients:
         return []
     scheduled = log.scheduled_for.astimezone(tz).strftime("%H:%M") if log.scheduled_for else "-"
+    taken = log.recorded_at.astimezone(tz).strftime("%H:%M") if log.recorded_at else "-"
     return await notify(
         session,
         NotificationSpec(
@@ -137,9 +142,12 @@ async def notify_dose(
                 "time": scheduled,
                 "elderly": recipients[0].elderly_name,
                 "delay": log.delay_minutes or 0,
+                "taken": taken,
             },
             slot_number=log.slot_number,
             delay_minutes=log.delay_minutes,
+            variant=variant,
+            actions=MISSED_DOSE_ACTIONS if ntype is NotificationType.DOSE_MISSED else [],
         ),
         recipients=recipients,
     )
@@ -147,12 +155,38 @@ async def notify_dose(
 
 async def auto_resolve_missed(session: AsyncSession, log_id: UUID, now: datetime, note: str) -> None:
     """A dose first decided MISSED and later proven TAKEN: close the open
-    DOSE_MISSED notifications for it (resolved_by_user_id stays NULL = system)."""
+    DOSE_MISSED notifications for it, and a forced-open alert linked to it
+    (resolved_by_user_id stays NULL = system). They stay in history, resolved."""
     await session.execute(
         update(Notification)
         .where(
-            Notification.event_key == f"{NotificationType.DOSE_MISSED.value}:{log_id}",
+            Notification.telemetry_log_id == log_id,
+            Notification.type.in_([NotificationType.DOSE_MISSED.value, NotificationType.UNSCHEDULED_OPEN.value]),
             Notification.is_resolved.is_(False),
         )
         .values(is_resolved=True, resolved_at=now, resolution_note=note)
     )
+
+
+async def report_taken_after_missed(
+    session: AsyncSession, log: TelemetryLog, tz: ZoneInfo, now: datetime, how: str
+) -> None:
+    """The dose was MISSED and is now TAKEN (log already updated and flushed): close the
+    missed alert with a note and tell every caregiver it was taken after all, so whoever
+    was alarmed knows it is settled. `how` ends the note, e.g. "lewat sensor pillbox"."""
+    taken = log.recorded_at.astimezone(tz).strftime("%H:%M") if log.recorded_at else "-"
+    note = f"Diminum terlambat pukul {taken} (+{log.delay_minutes or 0} menit), {how}."
+    await auto_resolve_missed(session, log.id, now, note)
+    await notify_dose(session, log, NotificationType.DOSE_LATE, tz, variant="AFTER_MISSED")
+
+
+async def forget_dose(session: AsyncSession, log: TelemetryLog, now: datetime, note: str) -> None:
+    """Removes a decided dose row so it can be recorded again from scratch (its open alerts are
+    resolved with `note` first; other notifications and device_events keep their history, unlinked)."""
+    await session.execute(
+        update(Notification)
+        .where(Notification.telemetry_log_id == log.id, Notification.is_resolved.is_(False))
+        .values(is_resolved=True, resolved_at=now, resolution_note=note)
+    )
+    await session.delete(log)
+    await session.flush()

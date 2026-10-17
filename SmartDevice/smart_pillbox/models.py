@@ -30,6 +30,8 @@ class Compartment:
     # --- runtime-only fields (not persisted directly on this row) ----------
     state: ChamberState = field(default=ChamberState.IDLE)
     activated_at: datetime | None = None   # when it popped up, for tolerance checks
+    due_at: datetime | None = None         # schedule time of the dose being served (window start)
+    release_until: datetime | None = None  # re-opened after MISSED by a caregiver: open until then
     door_open: bool = False                # current Reed Switch reading
 
     @property

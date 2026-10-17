@@ -2,6 +2,8 @@
 classification, and offline-flush ordering."""
 
 import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import httpx
@@ -200,3 +202,25 @@ async def test_device_key_is_required(client: httpx.AsyncClient, db: asyncpg.Con
     )
     assert res.status_code == 401
     assert res.json()["error"]["code"] == "DEVICE_KEY_INVALID"
+
+
+async def test_replayed_dose_after_the_clock_was_set_back_is_notified_again(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    """Emulator demo: jump to 20:05, take it; set the clock back; jump to 20:05 again, take it.
+    The second take must be recorded and notified, not swallowed by the first."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    due = datetime.now(ZoneInfo("Asia/Jakarta")).replace(second=0, microsecond=0) - timedelta(minutes=5)
+    await create_schedule(client, owner, device, start=f"{due:%H:%M}", end=f"{due:%H:%M}", tolerance=30)
+
+    first = [event("p1", "POPUP_ACTIVATED", due.isoformat()), event("o1", "COMPARTMENT_OPENED", (due + timedelta(minutes=7)).isoformat())]
+    assert (await send_telemetry(client, device, first)).status_code == 200
+    replay = [event("p2", "POPUP_ACTIVATED", due.isoformat()), event("o2", "COMPARTMENT_OPENED", (due + timedelta(seconds=20)).isoformat())]
+    assert (await send_telemetry(client, device, replay)).status_code == 200
+
+    doses = await db.fetch("SELECT status, actual_open_time FROM telemetry_logs WHERE status IS NOT NULL")
+    assert len(doses) == 1 and doses[0]["status"] == "TAKEN"
+    assert doses[0]["actual_open_time"] == due + timedelta(seconds=20)
+    taken = await db.fetchval("SELECT count(*) FROM notifications WHERE type IN ('DOSE_TAKEN', 'DOSE_LATE')")
+    assert taken == 2  # one per take

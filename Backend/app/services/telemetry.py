@@ -53,9 +53,11 @@ from app.schemas.device_protocol import (
     TelemetryResponse,
 )
 from app.services.app_hub import queue_device_change
-from app.services.adherence import DoseInstants, delay_minutes_for, match_dose, on_time_grace
+from app.services.adherence import DoseInstants, delay_minutes_for, dose_instants, match_dose, on_time_grace
+from app.services.device_clock import device_now
 from app.services.device_protocol import is_fresh, status_builder
-from app.services.doses import auto_resolve_missed, get_or_create_dose, notify_dose, slot_label
+from app.services.doses import forget_dose, get_or_create_dose, notify_dose, report_taken_after_missed, slot_label
+from app.services.late_dose import CONFIRM_TAKEN, missed_dose_before_cutoff
 from app.services.notifications import NotificationSpec, notify
 from app.services.presence import device_label, mark_seen
 from app.services.timeutil import as_aware, zone
@@ -107,6 +109,8 @@ async def ingest_batch(
     # device row, so batches from one device are applied one at a time.
     await mark_seen(session, device, now)
     tz = zone(device.timezone)
+    # A lab clock moved ahead on purpose is not "too far in the future".
+    clock = max(now, device_now(device, now, settings))
 
     results: list[EventResult | None] = [None] * len(req.events)
     first_index: dict[str, int] = {}
@@ -123,7 +127,7 @@ async def ingest_batch(
     for i in first_index.values():
         ev = req.events[i]
         occurred = as_aware(ev.occurred_at, tz)
-        prepared.append(_Prepared(i, ev, occurred, _validate(ev, occurred, now, settings)))
+        prepared.append(_Prepared(i, ev, occurred, _validate(ev, occurred, clock, settings)))
     prepared.sort(key=lambda p: (p.occurred_at, p.event.event_id))
 
     log_links: list[dict[str, UUID]] = []  # device_events.id -> telemetry_logs.id
@@ -157,7 +161,7 @@ async def ingest_batch(
             continue
         token = timing.correlation_id_var.set(item.event.event_id)
         try:
-            log_id = await _apply(session, device, item.event, item.occurred_at, tz, now, settings)
+            log_id = await _apply(session, device, item.event, item.occurred_at, tz, now, settings, req.is_offline_flush)
         finally:
             timing.correlation_id_var.reset(token)
         if log_id is not None:
@@ -245,12 +249,13 @@ async def _apply(
     tz: ZoneInfo,
     now: datetime,
     settings: Settings,
+    offline_flush: bool = False,
 ) -> UUID | None:
     etype = DeviceEventType(ev.event_type)
     if etype in _DOSE_TYPES:
-        return await _apply_dose_event(session, device, ev, etype, occurred_at, tz, now, settings)
+        return await _apply_dose_event(session, device, ev, etype, occurred_at, tz, now, settings, offline_flush)
     if etype is DeviceEventType.UNSCHEDULED_OPEN:
-        return await _apply_unscheduled_open(session, device, ev, occurred_at, tz)
+        return await _apply_unscheduled_open(session, device, ev, occurred_at, tz, settings)
     if etype is DeviceEventType.BATTERY_STATUS and ev.battery_percent is not None:
         # Old buffered readings must not overwrite a fresher heartbeat value.
         if is_fresh(occurred_at, now, settings):
@@ -299,6 +304,7 @@ async def _apply_dose_event(
     tz: ZoneInfo,
     now: datetime,
     settings: Settings,
+    offline_flush: bool = False,
 ) -> UUID | None:
     schedule = await resolve_schedule(session, device.id, ev.slot_number, ev.schedule_id)
     if schedule is None:
@@ -321,6 +327,12 @@ async def _apply_dose_event(
         settings.dose_early_accept_minutes,
         late_grace,
     )
+    log: TelemetryLog | None = None
+    if inst is None and etype in (DeviceEventType.COMPARTMENT_OPENED, DeviceEventType.COMPARTMENT_CLOSED):
+        # After its deadline, but a caregiver re-opened this missed dose ("Buka bilik sekarang").
+        log = await _released_dose(session, schedule, occurred_at)
+        if log is not None and log.scheduled_date is not None:
+            inst = dose_instants(log.scheduled_date, schedule.window_start, schedule.window_end, schedule.tolerance_minutes, tz)
     if inst is None:
         logger.info(
             "dose_event_outside_window",
@@ -328,7 +340,12 @@ async def _apply_dose_event(
         )
         return None
 
-    log = await get_or_create_dose(session, device.id, device.elderly_id, schedule, inst, etype.value)
+    if log is None:
+        log = await get_or_create_dose(session, device.id, device.elderly_id, schedule, inst, etype.value)
+        if etype is DeviceEventType.POPUP_ACTIVATED and _is_replay(log, occurred_at, offline_flush):
+            await forget_dose(session, log, now, "Jam pillbox dimundurkan; dosis ini diulang.")
+            logger.info("dose_replayed", extra={"device_id": str(device.id), "slot": ev.slot_number})
+            log = await get_or_create_dose(session, device.id, device.elderly_id, schedule, inst, etype.value)
     grace = on_time_grace(schedule.tolerance_minutes, settings.on_time_grace_minutes)
 
     if etype is DeviceEventType.COMPARTMENT_OPENED:
@@ -355,6 +372,41 @@ async def _apply_dose_event(
     elif etype is DeviceEventType.POPUP_ACTIVATED and log.chime_count is None and ev.chime_count is not None:
         log.chime_count = ev.chime_count
     return log.id
+
+
+def _is_replay(log: TelemetryLog, popup_at: datetime, offline_flush: bool) -> bool:
+    """The chamber popped up for a dose whose outcome was recorded at a LATER device time: the
+    pillbox clock was set back (emulator lab clock: "Sync Jam Nyata", then "Jadwal Berikutnya"),
+    and on the pillbox this dose has not happened yet. Without this the new take would land on
+    the old row, which is already TAKEN, and no notification would be sent.
+
+    Not for an offline flush: there an earlier pop-up arriving after a rules-engine MISSED is
+    late evidence, handled by the MISSED -> TAKEN upgrade. A caregiver's confirmation is kept."""
+    if log.status not in (DoseStatus.TAKEN, DoseStatus.MISSED) or log.recorded_at is None:
+        return False
+    if log.log_source == LogSource.MANUAL_CAREGIVER_CONFIRMATION:
+        return False
+    if log.log_source == LogSource.SYSTEM_RULES_ENGINE and offline_flush:
+        return False
+    return log.recorded_at > popup_at
+
+
+async def _released_dose(session: AsyncSession, schedule: Schedule, occurred_at: datetime) -> TelemetryLog | None:
+    """The MISSED dose of this schedule whose late release covers occurred_at (services/late_dose.py)."""
+    return (
+        await session.execute(
+            select(TelemetryLog)
+            .where(
+                TelemetryLog.schedule_id == schedule.id,
+                TelemetryLog.status == DoseStatus.MISSED.value,
+                TelemetryLog.late_release_until >= occurred_at,
+                TelemetryLog.scheduled_for <= occurred_at,
+            )
+            .order_by(TelemetryLog.scheduled_for.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
 
 
 async def _mark_taken(
@@ -398,15 +450,14 @@ async def _mark_taken(
     await session.flush()
 
     if previous == DoseStatus.MISSED:
-        await auto_resolve_missed(
-            session, log.id, now, f"Device reported the dose taken at {taken_at.astimezone(tz).isoformat()}"
-        )
+        await report_taken_after_missed(session, log, tz, now, "tercatat oleh sensor pillbox")
+        return
     ntype = NotificationType.DOSE_LATE if (log.delay_minutes or 0) > 0 else NotificationType.DOSE_TAKEN
     await notify_dose(session, log, ntype, tz)
 
 
 async def _apply_unscheduled_open(
-    session: AsyncSession, device: Device, ev: TelemetryEvent, occurred_at: datetime, tz: ZoneInfo
+    session: AsyncSession, device: Device, ev: TelemetryEvent, occurred_at: datetime, tz: ZoneInfo, settings: Settings
 ) -> UUID:
     log = TelemetryLog(
         device_id=device.id,
@@ -421,6 +472,31 @@ async def _apply_unscheduled_open(
     session.add(log)
     await session.flush()
     if device.elderly_id is not None and ev.slot_number is not None:
+        missed = await missed_dose_before_cutoff(session, device, ev.slot_number, occurred_at, tz, settings)
+        if missed is not None:
+            # Forced open soon after this slot's dose was missed: probably taken late. Linked to
+            # the missed dose so the caregiver can confirm it (and it resolves with it).
+            await notify(
+                session,
+                NotificationSpec(
+                    type=NotificationType.UNSCHEDULED_OPEN,
+                    severity=Severity.WARNING,
+                    event_key=f"UNSCHEDULED_OPEN:{log.id}",
+                    elderly_id=device.elderly_id,
+                    device_id=device.id,
+                    telemetry_log_id=missed.id,
+                    params={
+                        "slot": slot_label(ev.slot_number),
+                        "device": device_label(device),
+                        "time": occurred_at.astimezone(tz).strftime("%H:%M"),
+                        "scheduled": missed.scheduled_for.astimezone(tz).strftime("%H:%M") if missed.scheduled_for else "-",
+                    },
+                    slot_number=ev.slot_number,
+                    variant="AFTER_MISSED",
+                    actions=[CONFIRM_TAKEN],
+                ),
+            )
+            return log.id
         await notify(
             session,
             NotificationSpec(

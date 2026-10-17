@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
 from smart_pillbox import config
 from smart_pillbox.core.rtc import SimulatedClock
 from smart_pillbox.core.scheduler import PillboxScheduler
-from smart_pillbox.core.audio import play_chime
+from smart_pillbox.core.audio import play_chime, stop_chime
 from smart_pillbox.core import sync
 from smart_pillbox.core.ws_client import DeviceSocket
 from smart_pillbox.db.database import Database
@@ -36,15 +37,20 @@ class SyncSignals(QObject):
 class SyncWorker(QRunnable):
     """Background worker to execute telemetry sync without blocking the Qt GUI thread."""
 
-    def __init__(self, db: Database, now_str: str, battery: int, is_online: bool, after_reconnect: bool = False):
+    def __init__(self, db: Database, clock: SimulatedClock, battery: int, is_online: bool, after_reconnect: bool = False):
         super().__init__()
         self.db = db
-        self.now_str = now_str
+        self.clock = clock
         self.battery = battery
         self.is_online = is_online
         # Contract §5.3: right after Wi-Fi returns, heartbeat first, then flush the buffer.
         self.after_reconnect = after_reconnect
         self.signals = SyncSignals()
+
+    def _heartbeat(self) -> None:
+        # Read the RTC when the heartbeat goes out, not when the sync started: the event flush
+        # before it can take seconds, which at 60x is minutes of device time.
+        sync.send_heartbeat(self.db, self.clock.now().isoformat(), self.battery, self.is_online, self.clock.speed)
 
     def run(self):
         if not sync.is_registered(self.db):
@@ -55,12 +61,12 @@ class SyncWorker(QRunnable):
             return
         try:
             if self.after_reconnect:
-                sync.send_heartbeat(self.db, self.now_str, self.battery, self.is_online)
+                self._heartbeat()
                 synced_count = sync.flush_pending_events(self.db, offline_flush=True)
             else:
                 # Events first: they are what the caregiver is waiting for.
                 synced_count = sync.flush_pending_events(self.db)
-                sync.send_heartbeat(self.db, self.now_str, self.battery, self.is_online)
+                self._heartbeat()
             try:
                 if synced_count > 0:
                     self.signals.finished.emit(synced_count, f"Synced {synced_count} event(s) to backend.")
@@ -112,6 +118,7 @@ class MainWindow(QMainWindow):
         self.scheduler.on_taken.append(self._on_state_changed)
         for hook in (self.scheduler.on_activated, self.scheduler.on_missed, self.scheduler.on_taken):
             hook.append(lambda _compartment: self._request_sync())
+        self.scheduler.on_restored.append(self._on_day_restored)
 
         self._widgets: dict[int, CompartmentWidget] = {}
         self._is_online = True
@@ -121,6 +128,12 @@ class MainWindow(QMainWindow):
         self._is_registering = False
         self._battery_percent = 100
         self._config_version_seen = self.db.get_device_state("config_version")
+        # True once the lab clock was moved on purpose (+1 hour, speed, jump): the server's
+        # clock must then not silently undo it on reconnect. "Sync Jam Nyata" clears it.
+        self._manual_clock = False
+        # "Bunyikan alarm" / "Test pengingat" from the app: rings until this monotonic time.
+        self._alarm_until: float | None = None
+        self._alarm_slot: int | None = None  # None = the whole box
 
         self._build_ui()
         self._refresh_connection_panel()
@@ -130,6 +143,11 @@ class MainWindow(QMainWindow):
         self._tick_timer.setInterval(1000)  # real 1s; simulated speed handled by SimulatedClock
         self._tick_timer.timeout.connect(self._on_tick)
         self._tick_timer.start()
+
+        # Rings again every few seconds while a chamber is popped up, like the real buzzer.
+        self._chime_timer = QTimer(self)
+        self._chime_timer.setInterval(config.CHIME_REPEAT_SECONDS * 1000)
+        self._chime_timer.timeout.connect(play_chime)
 
         self._sync_timer = QTimer(self)
         self._sync_timer.setInterval(config.SYNC_INTERVAL_SECONDS * 1000)
@@ -243,23 +261,30 @@ class MainWindow(QMainWindow):
         time_inner_layout = QHBoxLayout()
         self._speed_combo = QComboBox()
         self._speed_combo.addItems(["1.0x", "10.0x", "60.0x"])
-        self._speed_combo.currentTextChanged.connect(lambda t: self.clock.set_speed(float(t.replace("x", ""))))
+        self._speed_combo.currentTextChanged.connect(self._on_speed_changed)
         time_lbl = QLabel("Speed:")
         time_lbl.setStyleSheet("border: none;")
         time_inner_layout.addWidget(time_lbl)
         time_inner_layout.addWidget(self._speed_combo)
         
-        btn_jump = QPushButton("+1 Hour")
-        btn_jump.clicked.connect(self._on_jump_hour)
-        time_inner_layout.addWidget(btn_jump)
+        # Small steps to test a slot's tolerance: pop-up, then +5 / +30 to land late or missed.
+        for label, minutes in (("+5 Mnt", 5), ("+30 Mnt", 30), ("+1 Jam", 60)):
+            btn_jump = QPushButton(label)
+            btn_jump.setToolTip(f"Majukan jam pillbox {minutes} menit")
+            btn_jump.clicked.connect(lambda _checked=False, m=minutes: self._on_jump_minutes(m))
+            time_inner_layout.addWidget(btn_jump)
         time_layout.addLayout(time_inner_layout)
         
         time_buttons = QHBoxLayout()
-        btn_reset = QPushButton("Reset Day to IDLE")
+        # Jumping by whole hours can skip a dose window entirely (it then turns MISSED without
+        # ringing); this lands just before the next pop-up instead.
+        btn_next = QPushButton("Jadwal Berikutnya")
+        btn_next.clicked.connect(self._on_jump_next_dose)
+        time_buttons.addWidget(btn_next)
+        btn_reset = QPushButton("Reset Day")
         btn_reset.clicked.connect(self._on_reset_day)
         time_buttons.addWidget(btn_reset)
-        # The backend judges on-time / late / missed against ITS clock; after "+1 Hour"
-        # or a fast speed the device events no longer line up with the schedule.
+        # Back to real time at 1x (the backend and the app follow the pillbox clock either way).
         btn_real_time = QPushButton("Sync Jam Nyata")
         btn_real_time.clicked.connect(self._on_sync_real_time)
         time_buttons.addWidget(btn_real_time)
@@ -333,6 +358,8 @@ class MainWindow(QMainWindow):
     def _on_tick(self) -> None:
         self.scheduler.tick()
         self._refresh_lcd()
+        if self._alarm_until is not None:
+            self._update_chime()  # ends an app alarm whose time is up
         self._refresh_connection_panel()
 
     def _on_sync_tick(self) -> None:
@@ -347,8 +374,7 @@ class MainWindow(QMainWindow):
             return
 
         self._is_syncing = True
-        now_str = self.clock.now().isoformat()
-        worker = SyncWorker(self.db, now_str, self._battery_percent, self._is_online, after_reconnect=self._reconnected)
+        worker = SyncWorker(self.db, self.clock, self._battery_percent, self._is_online, after_reconnect=self._reconnected)
         self._reconnected = False
         worker.signals.finished.connect(self._on_sync_finished)
         QThreadPool.globalInstance().start(worker)
@@ -449,6 +475,8 @@ class MainWindow(QMainWindow):
 
     def _on_widget_interacted(self, compartment_id: int, is_forced: bool = False) -> None:
         compartment = self.scheduler.compartments[compartment_id]
+        if self._alarm_until is not None and self._alarm_slot in (None, compartment.slot_number):
+            self._alarm_until = self._alarm_slot = None  # someone came to the box: the app alarm stops
 
         if compartment.door_open:
             # Door is currently open -> clicking closes it
@@ -476,19 +504,47 @@ class MainWindow(QMainWindow):
 
         self._refresh_widget(compartment)
         self._refresh_lcd()
+        self._update_chime()
         self._request_sync()
 
-    def _on_jump_hour(self) -> None:
-        self.clock.jump(timedelta(hours=1))
+    def _on_clock_changed(self) -> None:
+        """After any change to the simulated RTC: apply it now and report it right away (the
+        heartbeat carries rtc_time + speed), so the backend and the app follow the new time."""
         self.scheduler.tick()
         self._refresh_lcd()
+        self._request_sync()
+
+    def _on_speed_changed(self, text: str) -> None:
+        self.clock.set_speed(float(text.replace("x", "")))
+        if self.clock.speed != 1.0:
+            self._manual_clock = True
+        self._on_clock_changed()
+
+    def _on_jump_minutes(self, minutes: int) -> None:
+        self._manual_clock = True
+        self.clock.jump(timedelta(minutes=minutes))
+        self._on_clock_changed()
+        self.statusBar().showMessage(f"Jam pillbox dimajukan {minutes} menit ({self.clock.now():%H:%M}).", 3000)
+
+    def _on_jump_next_dose(self) -> None:
+        due_at = self.scheduler.next_due_at()
+        if due_at is None:
+            self.statusBar().showMessage("Tidak ada jadwal aktif dalam 7 hari ke depan.", 4000)
+            return
+        self._manual_clock = True
+        self.clock.set_time(due_at - timedelta(seconds=5))
+        self._on_clock_changed()
+        self.statusBar().showMessage(f"Jam dimajukan ke 5 detik sebelum jadwal {due_at:%d/%m %H:%M}.", 4000)
 
     def _on_sync_real_time(self) -> None:
         """Back to wall-clock time at 1.0x, so device events match the backend's schedule windows."""
-        self._speed_combo.setCurrentIndex(0)  # 1.0x (re-anchors via set_speed)
+        self._manual_clock = False
+        self._speed_combo.blockSignals(True)
+        self._speed_combo.setCurrentIndex(0)
+        self._speed_combo.blockSignals(False)
+        self.clock.set_speed(1.0)
         self.clock.set_time(datetime.now())
-        self.scheduler.tick()
-        self._refresh_lcd()
+        self._on_clock_changed()
         self.statusBar().showMessage("Jam perangkat disamakan dengan jam nyata (1.0x).", 4000)
 
     def _on_reset_day(self) -> None:
@@ -500,9 +556,52 @@ class MainWindow(QMainWindow):
     def _on_state_changed(self, compartment: Compartment) -> None:
         self._refresh_widget(compartment)
         self._refresh_lcd()
-        if compartment.state == ChamberState.ACTIVE and compartment.stock_count > 0:
-            play_chime()
+        self._update_chime()
 
+    def _on_day_restored(self) -> None:
+        for compartment in self.scheduler.compartments.values():
+            self._refresh_widget(compartment)
+        self._refresh_lcd()
+        self._update_chime()
+
+    def _update_chime(self) -> None:
+        """Rings (and keeps ringing) while a chamber with sachets is popped up, or while an alarm
+        from the app lasts; silent otherwise. The speaker badges show what is ringing."""
+        if self._alarm_until is not None and time.monotonic() >= self._alarm_until:
+            self._alarm_until = self._alarm_slot = None
+        app_alarm = self._alarm_until is not None
+
+        active_id = self.scheduler.active_chamber_id
+        active = self.scheduler.compartments.get(active_id) if active_id else None
+        scheduled = (
+            active is not None
+            and active.state == ChamberState.ACTIVE
+            and active.stock_count > 0
+            and not self.scheduler.is_refill_mode
+        )
+
+        if scheduled or app_alarm:
+            if not self._chime_timer.isActive():
+                play_chime()
+                self._chime_timer.start()
+        elif self._chime_timer.isActive():
+            self._chime_timer.stop()
+            stop_chime()
+
+        ringing_slots = set()
+        if scheduled:
+            ringing_slots.add(active.slot_number)
+        if app_alarm and self._alarm_slot is not None:
+            ringing_slots.add(self._alarm_slot)
+        for widget in self._widgets.values():
+            widget.set_ringing(widget.compartment.slot_number in ringing_slots)
+        if app_alarm:
+            where = f"SLOT {self._alarm_slot}" if self._alarm_slot else "SEMUA"
+            self._lcd.set_sound(f"ALARM APLIKASI · {where}")
+        elif scheduled:
+            self._lcd.set_sound(f"BERBUNYI · SLOT {active.slot_number}")
+        else:
+            self._lcd.set_sound(None)
 
     def _on_widget_refilled(self, slot_number: int) -> None:
         compartment = self.scheduler.compartments.get(slot_number)
@@ -536,6 +635,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_refill_mode(self) -> None:
         self.scheduler.is_refill_mode = not self.scheduler.is_refill_mode
+        self._update_chime()
         self.db.update_device_state("is_refill_mode", "1" if self.scheduler.is_refill_mode else "0")
         
         # Sync Caregiver Tray in Zone 1
@@ -619,8 +719,9 @@ class MainWindow(QMainWindow):
 
     def _on_welcome(self, message: dict) -> None:
         """Command channel connected: correct the RTC from the server clock (a real
-        device would use NTP). Skipped while the lab clock runs fast on purpose."""
-        if self.clock.speed != 1.0:
+        device would use NTP). Skipped while the lab clock was moved on purpose: the
+        backend and the app follow the device clock instead (heartbeat rtc_time)."""
+        if self.clock.speed != 1.0 or self._manual_clock:
             return
         try:
             server_now = self._server_local_time(message["server_time"], message.get("timezone"))
@@ -630,7 +731,7 @@ class MainWindow(QMainWindow):
         if abs(drift) < 30:
             return
         self.clock.set_time(server_now)
-        self._refresh_lcd()
+        self._on_clock_changed()
         logger.info("RTC corrected from server time (was %+.0f s off).", drift)
         self.statusBar().showMessage(f"Jam perangkat disinkronkan dengan server (selisih {drift:+.0f} detik).", 5000)
 
@@ -643,13 +744,34 @@ class MainWindow(QMainWindow):
             if compartment is not None:
                 self.db.log_event(compartment.id, compartment.slot_number, "ALARM_STARTED", self.clock.now())
                 self._request_sync()
-            play_chime()
+            # Rings for the requested time ("Bunyikan alarm" 60 s, "Test pengingat" 10 s), not one beep.
+            try:
+                duration = max(1, int(payload.get("duration_seconds") or 10))
+            except (TypeError, ValueError):
+                duration = 10
+            self._alarm_until = time.monotonic() + duration
+            self._alarm_slot = slot if compartment is not None else None
+            self._chime_timer.stop()  # restart so it rings right away
+            self._update_chime()
             where = f"Slot {slot}" if slot else "semua slot"
-            self.statusBar().showMessage(f"🔔 Alarm dari aplikasi ({where})", 5000)
-            self._socket.send_ack(command_id, True, {"ringing": True})
+            self.statusBar().showMessage(f"Alarm dari aplikasi ({where}, {duration} detik)", 5000)
+            self._socket.send_ack(command_id, True, {"ringing": True, "duration_seconds": duration})
         elif command == "schedule_updated":
             self._socket.send_ack(command_id, True)
             self._request_sync()  # pulls the new config now instead of on the next heartbeat
+        elif command == "release_slot":
+            try:
+                slot = int(payload["slot_number"])
+                until = datetime.fromisoformat(str(payload["until"])).replace(tzinfo=None)
+            except (KeyError, TypeError, ValueError) as exc:
+                self._socket.send_ack(command_id, False, error=f"invalid release_slot payload: {exc}")
+                return
+            refused = self.scheduler.release_late(slot, until)
+            if refused:
+                self._socket.send_ack(command_id, False, error=refused)
+                return
+            self.statusBar().showMessage(f"🔓 Slot {slot} dibuka lagi dari aplikasi sampai {until:%H:%M} (dosis terlewat).", 6000)
+            self._socket.send_ack(command_id, True, {"released": True, "release_until": until.isoformat()})
         elif command == "refill_mode":
             enabled = bool(payload.get("enabled"))
             if enabled != self.scheduler.is_refill_mode:
@@ -662,8 +784,14 @@ class MainWindow(QMainWindow):
             except (KeyError, ValueError, ZoneInfoNotFoundError) as exc:
                 self._socket.send_ack(command_id, False, error=f"invalid time_sync payload: {exc}")
                 return
+            # A caregiver asked for it ("Kalibrasi jam"): real time again, at real speed.
+            self._manual_clock = False
+            self._speed_combo.blockSignals(True)
+            self._speed_combo.setCurrentIndex(0)
+            self._speed_combo.blockSignals(False)
+            self.clock.set_speed(1.0)
             self.clock.set_time(local)
-            self._refresh_lcd()
+            self._on_clock_changed()
             self._socket.send_ack(
                 command_id, True,
                 {"device_time_before": before.isoformat(), "device_time_after": self.clock.now().isoformat()},

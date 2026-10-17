@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -20,6 +21,9 @@ class NotificationItem(BaseModel):
     is_read: bool
     is_resolved: bool
     created_at: datetime
+    # Buttons the app may offer (services/late_dose.py): LATE_RELEASE = "Buka bilik sekarang",
+    # CONFIRM_TAKEN = "Sudah diminum". Only on open notifications about a still-missed dose.
+    actions: list[Literal["LATE_RELEASE", "CONFIRM_TAKEN"]] = Field(default_factory=list)
 
 
 class NotificationPage(BaseModel):
@@ -56,3 +60,26 @@ class ReadOut(BaseModel):
 
 class ReadAllOut(BaseModel):
     marked_read: int
+
+
+class LateReleaseIn(BaseModel):
+    device_pin: str = Field(..., pattern=r"^\d{4}$")
+
+
+class LateReleaseOut(BaseModel):
+    notification_id: UUID
+    dose_log_id: UUID
+    slot_number: int
+    # Device clock, device timezone: the chamber stays popped up until release_until.
+    release_until: datetime
+    # Latest moment the dose may still be taken (safety cutoff before the next dose).
+    cutoff_at: datetime
+    command_id: str
+
+
+class ConfirmTakenIn(BaseModel):
+    note: str | None = Field(None, max_length=2000)
+
+
+class DeleteAllOut(BaseModel):
+    deleted: int

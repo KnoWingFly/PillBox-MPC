@@ -12,9 +12,22 @@ physical hardware built).
   "Ambil Obat (Buka → Tutup)" button per active compartment
 - **Single Active Chamber** constraint — a second due compartment queues
   until the first is closed or marked MISSED
-- A Rules Engine that flags **MISSED** once the tolerance window expires
-- A simulated RTC with adjustable speed and a "Jump +1 hour" control, so a
-  demo doesn't require waiting real hours between meal times
+- A Rules Engine that flags **MISSED** once the tolerance window expires.
+  A dose window is `schedule_time` to `schedule_time + tolerance`, the same
+  window the backend uses. A chamber only pops up inside it. If the simulator
+  starts, or the clock jumps, after a window has closed, that dose shows
+  MISSED without ringing instead of popping up hours late.
+- Today's TAKEN/MISSED states are rebuilt from the local event log at
+  start-up, at midnight and when the clock is set back, so a restart never
+  re-pops a dose that was already taken.
+- A simulated RTC with adjustable speed, "+1 Hour" and "Jadwal Berikutnya"
+  (jump to 5 s before the next pop-up) controls, so a demo doesn't require
+  waiting real hours between meal times. Every clock change is sent in a
+  heartbeat right away (`rtc_time` + `rtc_speed`). The backend and the mobile
+  app then follow the pillbox clock ("Jam Pillbox" on the Perangkat tab).
+  "Sync Jam Nyata" goes back to real time at 1x.
+- A chime that repeats every `CHIME_REPEAT_SECONDS` while a chamber is popped
+  up (see "Chime sound" below)
 - An offline-first local SQLite event log that doubles as the telemetry
   queue — sync attempts fail gracefully (and just keep buffering) until the
   FastAPI backend exists
@@ -47,15 +60,26 @@ needed, so they run headless in CI too.
   press rather than two separate physical transitions — acceptable for a
   simulator, but note it if a reviewer asks how the real Reed Switch flow maps
   to this code.
-- No actual chime audio (`QSoundEffect`) is wired up yet — the UI shows a 🔔
-  indicator text instead. Add an asset + `QSoundEffect` in
-  `compartment_widget.py` if audio is required for the demo.
 - `sync.flush_pending_events()` runs on the GUI thread via `QTimer`, blocking
   briefly (bounded by `SYNC_HTTP_TIMEOUT_SECONDS`) if the backend is
   unreachable. Fine for a 3-second timeout in a demo; move to a `QThread`
   before this becomes a real device app.
 - `BACKEND_TELEMETRY_URL` in `config.py` is a placeholder — update it once
   the FastAPI endpoint spec is finalized so the JSON payload shape matches.
+
+## Chime sound
+
+Put the sound at `smart_pillbox/assets/chime.wav`, or point
+`PILLCARE_CHIME_FILE` at another file. It is played with `QSoundEffect`, which
+only plays **uncompressed PCM WAV**:
+
+- `.wav`, PCM (not MP3/OGG/AAC inside a WAV), 16-bit
+- 44.1 kHz or 48 kHz, mono or stereo
+- about 1-3 seconds; it repeats every `CHIME_REPEAT_SECONDS` (config.py)
+
+Without a usable file the simulator falls back to the system beep, which is
+often silent on Linux. To convert another file:
+`ffmpeg -i chime.mp3 -ac 1 -ar 44100 -c:a pcm_s16le smart_pillbox/assets/chime.wav`
 
 ## Connecting to the PillCare backend
 

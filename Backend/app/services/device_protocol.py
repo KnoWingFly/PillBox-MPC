@@ -78,6 +78,7 @@ async def process_heartbeat(
     if hb.rtc_time is not None:
         device.rtc_time = as_aware(hb.rtc_time, tz)
         device.rtc_reported_at = now
+        device.rtc_speed = hb.rtc_speed or 1.0
     if hb.rtc_backup_active is not None:
         device.rtc_backup_active = hb.rtc_backup_active
     if hb.chambers:

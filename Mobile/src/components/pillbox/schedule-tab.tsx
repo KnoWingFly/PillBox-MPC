@@ -3,10 +3,11 @@ import { ActivityIndicator, Pressable, ScrollView, Switch, Text, View } from 're
 import * as tokens from '@/theme/tokens';
 import * as api from '@root/lib/api';
 import {
-  findAllDuplicates,
-  findDuplicateSlot,
+  findAllConflicts,
+  findSlotConflict,
   hasPassedToday,
   SCHEDULE_TIMEZONE_LABEL,
+  type SlotConflict,
 } from '@root/lib/schedule-time';
 import type { Slot, SlotId } from '@root/lib/types';
 
@@ -24,8 +25,15 @@ import {
 import { TimeField } from './time-field';
 import { Button, Card, Chip, Divider, Icon, InfoRow, LoadErrorBox, ScreenHeader, StatusPill } from './ui';
 
-function duplicateMessage(minutes: number, other: SlotId): string {
-  return `Jam ${api.formatTime(minutes)} sudah dipakai slot ${other} (${slotTitle(other)}). Pilih jam lain.`;
+function conflictMessage(minutes: number, conflict: SlotConflict, slots: Slot[]): string {
+  if (conflict.kind === 'same_time') {
+    return `Jam ${api.formatTime(minutes)} sudah dipakai slot ${conflict.other} (${slotTitle(conflict.other)}). Pilih jam lain.`;
+  }
+  const otherTime = slots.find((s) => s.id === conflict.other)?.timeMinutes ?? null;
+  return (
+    `Terlalu dekat dengan slot ${conflict.other} (${api.formatTime(otherTime)}). Pillbox hanya membuka satu bilik ` +
+    `sekaligus: beri jarak minimal ${conflict.gapMinutes} menit (toleransi), atau kecilkan toleransinya.`
+  );
 }
 
 function SlotCell({
@@ -48,7 +56,7 @@ function SlotCell({
       accessibilityRole="button"
       accessibilityLabel={`Slot ${slot.id}, ${empty ? 'kosong' : api.formatTime(slot.timeMinutes)}, ${
         active ? 'aktif' : 'nonaktif'
-      }${changed ? ', belum disimpan' : ''}${conflict ? ', jam bentrok dengan slot lain' : ''}`}
+      }${changed ? ', belum disimpan' : ''}${conflict ? ', jam bentrok atau terlalu dekat dengan slot lain' : ''}`}
       accessibilityState={{ selected }}
       onPress={onPress}
       className={`min-h-[84px] flex-1 items-center justify-center gap-1 rounded-2xl border-2 px-1 py-2 active:opacity-75 ${
@@ -85,7 +93,7 @@ function SlotEditor({
   /** The whole draft, for the duplicate-time check. */
   allSlots: Slot[];
   /** Enabled slot that already uses this slot's time, if any. */
-  conflictWith: SlotId | null;
+  conflictWith: SlotConflict | null;
   now: number;
   testing: boolean;
   onChange: (patch: Partial<Slot>) => void;
@@ -93,10 +101,11 @@ function SlotEditor({
 }) {
   const defaultTime = COLUMN_DEFAULT_TIMES[columnIndex(slot.id)];
 
-  // Duplicates only matter for slots that will ring; a disabled slot may share a time.
+  // Conflicts only matter for slots that will ring; a disabled slot may share a time.
   const validate = (minutes: number) => {
-    const other = slot.enabled || slot.timeMinutes === null ? findDuplicateSlot(allSlots, slot.id, minutes) : null;
-    return other ? duplicateMessage(minutes, other) : null;
+    const conflict =
+      slot.enabled || slot.timeMinutes === null ? findSlotConflict(allSlots, slot.id, minutes, slot.toleranceMinutes) : null;
+    return conflict ? conflictMessage(minutes, conflict, allSlots) : null;
   };
 
   // Picking a time for an empty slot also turns it on, like the switch does; otherwise it would be
@@ -135,7 +144,7 @@ function SlotEditor({
           label={`Waktu minum (24 jam, ${SCHEDULE_TIMEZONE_LABEL})`}
           value={slot.timeMinutes}
           fallback={defaultTime}
-          externalError={conflictWith && slot.timeMinutes !== null ? duplicateMessage(slot.timeMinutes, conflictWith) : null}
+          externalError={conflictWith && slot.timeMinutes !== null ? conflictMessage(slot.timeMinutes, conflictWith, allSlots) : null}
           validate={validate}
           onChange={setTime}
         />
@@ -199,7 +208,7 @@ export function ScheduleTab({
 }) {
   const dirty = isDraftDirty(draft, saved);
   const selected = draft.find((s) => s.id === selectedId);
-  const conflicts = findAllDuplicates(draft);
+  const conflicts = findAllConflicts(draft);
   const activeCount = draft.filter(isSlotActive).length;
 
   return (
@@ -277,7 +286,7 @@ export function ScheduleTab({
         <View className="gap-2 border-t border-line bg-surface px-4 pb-3 pt-3">
           {conflicts.size > 0 ? (
             <Text className="text-body-sm font-semibold text-missed-fg" accessibilityRole="alert">
-              Jam bentrok di {[...conflicts.keys()].join(', ')}. Ubah salah satunya sebelum menyimpan.
+              Jam bentrok atau terlalu dekat di {[...conflicts.keys()].join(', ')}. Ubah salah satunya sebelum menyimpan.
             </Text>
           ) : (
             <Text className="text-body-sm text-ink-muted">Ada perubahan yang belum dikirim ke Pillbox.</Text>

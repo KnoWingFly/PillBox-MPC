@@ -37,6 +37,8 @@ class TelemetryLog(Base):
     scheduled_date: Mapped[date | None] = mapped_column(Date)
     scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # migration 0005: a MISSED dose re-opened by a caregiver may be taken (late) until then
+    late_release_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DeviceEvent(Base):

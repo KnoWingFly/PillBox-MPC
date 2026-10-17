@@ -16,6 +16,14 @@ MAX_STOCK_CAPACITY = 30              # max sachets per compartment (monthly bulk
 # --- Simulated RTC ----------------------------------------------------------
 DEFAULT_SIM_SPEED = 1.0              # 1.0 = realtime; e.g. 60.0 = 1 min/sec
 
+# --- Chime -------------------------------------------------------------------
+# Uncompressed PCM WAV (16-bit, 44.1/48 kHz); see core/audio.py. Missing file = system beep.
+CHIME_SOUND_PATH = Path(
+    os.environ.get("PILLCARE_CHIME_FILE") or Path(__file__).resolve().parent / "assets" / "chime.wav"
+)
+CHIME_VOLUME = 0.8                   # 0.0 - 1.0
+CHIME_REPEAT_SECONDS = 5             # repeats while a chamber is popped up, until opened or missed
+
 # --- Storage -----------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "pillbox_local.db"
@@ -39,7 +47,8 @@ def device_ws_url(device_code: str) -> str:
 # Requests run in a worker thread, so generous timeouts never freeze the GUI. A remote
 # database (e.g. Supabase in another region, ~400 ms per round-trip) makes one heartbeat
 # take several seconds; a short timeout would drop responses the server already handled.
-SYNC_HTTP_TIMEOUT_SECONDS = 12
+# Retrying before the server finished only re-sends the same events and adds load.
+SYNC_HTTP_TIMEOUT_SECONDS = 40
 REGISTER_HTTP_TIMEOUT_SECONDS = 30
 
 # Files searched (in order) for PROVISIONING_TOKEN when the "Daftarkan Perangkat"

@@ -140,3 +140,41 @@ async def test_connection_manager_ack_timeout_and_not_connected() -> None:
     socket.auto_ack = False
     with pytest.raises(CommandTimeoutError):
         await manager.send_command(device_id, DeviceCommand.TRIGGER_ALARM, {}, timeout=0.1)
+
+
+async def test_bulk_save_applies_all_slots_with_one_config_version(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, slot=1, start="08:00", end="08:00")
+    await create_schedule(client, owner, device, slot=2, start="12:00", end="12:00")
+    before = await db.fetchval("SELECT config_version FROM devices WHERE id = $1", uuid.UUID(device.id))
+
+    # Move slot 1's time onto slot 2's old time while clearing slot 2 and adding slot 3:
+    # one at a time this order would trip WINDOW_OVERLAP; checked on the final state it is fine.
+    body = {
+        "slots": [
+            {"slot_number": 1, "window_start": "12:00", "window_end": "12:00"},
+            {"slot_number": 2, "clear": True},
+            {"slot_number": 3, "window_start": "17:00", "window_end": "17:00", "tolerance_minutes": 45, "active": False},
+        ]
+    }
+    res = await client.put(f"{API}/devices/{device.id}/schedules", json=body, headers=owner.headers)
+    assert res.status_code == 200, res.text
+    slots = {s["slot_number"]: s for s in res.json()}
+    assert slots[1]["window_start"] == "12:00" and slots[2]["is_empty"]
+    assert slots[3]["tolerance_minutes"] == 45 and slots[3]["active"] is False
+    after = await db.fetchval("SELECT config_version FROM devices WHERE id = $1", uuid.UUID(device.id))
+    assert after == before + 1
+
+    # Nothing changed: no new version.
+    res = await client.put(f"{API}/devices/{device.id}/schedules", json=body, headers=owner.headers)
+    assert res.status_code == 200
+    assert await db.fetchval("SELECT config_version FROM devices WHERE id = $1", uuid.UUID(device.id)) == after
+
+    # A real overlap in the final state is rejected and nothing is saved.
+    clash = {"slots": [{"slot_number": 4, "window_start": "12:00", "window_end": "12:00"}]}
+    res = await client.put(f"{API}/devices/{device.id}/schedules", json=clash, headers=owner.headers)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "WINDOW_OVERLAP"
+    assert await db.fetchval("SELECT count(*) FROM schedules WHERE slot_number = 4") == 0

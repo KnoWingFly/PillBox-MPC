@@ -122,6 +122,28 @@ export function deviceLook(device: DeviceStatus, now: number): DeviceLook {
 }
 
 /** The next active dose (WIB): today if still ahead, otherwise the first one tomorrow. */
+/** "Now" on the pillbox clock (epoch ms); the phone clock when the pillbox reports none. */
+export function pillboxNow(device: DeviceStatus | null, nowMs: number): number {
+  const clock = device?.clock;
+  return clock ? clock.deviceTimeMs + (nowMs - clock.receivedAt) * clock.speed : nowMs;
+}
+
+/** "Simulasi 60x · 3 jam 5 menit lebih cepat" when the pillbox clock is not on real time; null otherwise. */
+export function pillboxClockNote(device: DeviceStatus | null, nowMs: number): string | null {
+  const clock = device?.clock;
+  if (!clock) return null;
+  const parts: string[] = [];
+  if (clock.speed !== 1) parts.push(`Simulasi ${clock.speed}x`);
+  const offset = Math.round((pillboxNow(device, nowMs) - nowMs) / 60000);
+  if (Math.abs(offset) >= 2) {
+    const hours = Math.floor(Math.abs(offset) / 60);
+    const minutes = Math.abs(offset) % 60;
+    const amount = [hours ? `${hours} jam` : '', minutes ? `${minutes} menit` : ''].filter(Boolean).join(' ');
+    parts.push(`${amount} ${offset > 0 ? 'lebih cepat' : 'lebih lambat'}`);
+  }
+  return parts.length ? parts.join(' · ') : null;
+}
+
 export function nextDose(slots: Slot[], nowMs: number): { slot: Slot; inMinutes: number; tomorrow: boolean } | null {
   const active = slots.filter(isSlotActive).sort((a, b) => (a.timeMinutes ?? 0) - (b.timeMinutes ?? 0));
   if (active.length === 0) return null;

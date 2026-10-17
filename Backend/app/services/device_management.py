@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
@@ -48,6 +48,7 @@ from app.services.connection_manager import (
     DeviceNotConnectedError,
     connection_manager,
 )
+from app.services.device_clock import extrapolated
 from app.services.pin_attempts import pin_limiter
 from app.services.slots import SLOT_NUMBERS, all_slots
 from app.services.timeutil import as_aware, is_valid_timezone, zone
@@ -417,6 +418,7 @@ def build_status(device: Device, settings: Settings) -> DeviceStatusOut:
     """GET /devices/{id}/status body from an already-loaded row (no DB access);
     also pushed to app sockets after a device change (services/app_hub.py)."""
     doors = device.chamber_doors or []
+    device_time = extrapolated(device, datetime.now(UTC))
     return DeviceStatusOut(
         device_id=device.id,
         connectivity=Connectivity(device.status),
@@ -430,14 +432,17 @@ def build_status(device: Device, settings: Settings) -> DeviceStatusOut:
         rtc_backup_active=device.rtc_backup_active,
         command_channel_connected=connection_manager.is_connected(device.id),
         chambers=[ChamberDoor(slot_number=int(c["slot_number"]), door=c["door"]) for c in doors],
+        device_time=device_time.astimezone(zone(device.timezone)) if device_time else None,
+        clock_speed=(device.rtc_speed or 1.0) if device_time else None,
+        follow_device_clock=settings.follow_device_clock,
     )
 
 
 def _clock_values(device: Device, now: datetime) -> tuple[datetime | None, float | None]:
-    if device.rtc_time is None or device.rtc_reported_at is None:
+    internal = extrapolated(device, now)
+    if internal is None:
         return None, None
-    drift = (device.rtc_time - device.rtc_reported_at).total_seconds()
-    return now + timedelta(seconds=drift), round(drift, 1)
+    return internal, round((internal - now).total_seconds(), 1)
 
 
 async def clock(session: AsyncSession, user: User, device_id: UUID, settings: Settings, now: datetime) -> ClockOut:
@@ -476,6 +481,7 @@ async def calibrate(
             await session.refresh(device, with_for_update=True)
             device.rtc_time = device_time
             device.rtc_reported_at = ack.acked_at
+            device.rtc_speed = 1.0  # time_sync also puts the emulator's lab clock back to 1x
             await session.commit()
     return device, ack
 

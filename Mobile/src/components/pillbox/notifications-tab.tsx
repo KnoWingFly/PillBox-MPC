@@ -5,33 +5,43 @@ import * as tokens from '@/theme/tokens';
 import * as api from '@root/lib/api';
 import { NOTIFICATION_FILTERS, type NotificationFilter } from '@root/lib/notifications';
 import { formatJakartaTimestamp } from '@root/lib/schedule-time';
-import type { AppNotification } from '@root/lib/types';
+import type { AppNotification, NotificationAction } from '@root/lib/types';
 
 import { EMPTY_TEXT, formatRelative, notificationLook } from './helpers';
 import { SwipeToDelete } from './swipe-to-delete';
-import { Button, Chip, EmptyState, IconBadge, LoadErrorBox, ScreenHeader } from './ui';
+import { Button, Chip, EmptyState, Icon, IconBadge, LoadErrorBox, ScreenHeader } from './ui';
+
+/** Which late-dose action is running, for the spinner. */
+export type DoseActionBusy = { id: string; action: NotificationAction } | null;
 
 function NotificationItem({
   notification,
   now,
   alarmBusy,
+  actionBusy,
   onPress,
   onCall,
   onAlarm,
+  onAction,
   onDelete,
 }: {
   notification: AppNotification;
   now: number;
   alarmBusy: boolean;
+  actionBusy: NotificationAction | null;
   onPress: () => void;
   onCall: () => void;
   onAlarm: () => void;
+  onAction: (action: NotificationAction) => void;
   /** Omitted when deleting is not supported. */
   onDelete?: () => void;
 }) {
   const look = notificationLook(notification);
   // Only a missed dose needs the caregiver to act; a late dose was still taken.
   const needsAction = notification.type === 'missed';
+  const actions = notification.actions ?? [];
+  const canRelease = actions.includes('LATE_RELEASE');
+  const canConfirm = actions.includes('CONFIRM_TAKEN');
   const when = `${formatJakartaTimestamp(notification.createdAt, now)} · ${formatRelative(notification.createdAt, now)}`;
   const slot = notification.slotId
     ? `Slot ${notification.slotId} · ${api.getSlotColumnLabel(notification.slotId)}`
@@ -61,7 +71,7 @@ function NotificationItem({
         className="flex-row gap-3 p-4 active:opacity-80">
         <IconBadge icon={look.icon} tone={look.tone} />
         <View className="flex-1 gap-1">
-          <View className="flex-row items-start gap-2">
+          <View className={`flex-row items-start gap-2 ${onDelete ? 'pr-9' : ''}`}>
             <Text className={`flex-1 text-body text-ink ${notification.read ? 'font-semibold' : 'font-bold'}`}>
               {notification.title}
             </Text>
@@ -74,6 +84,17 @@ function NotificationItem({
           </Text>
         </View>
       </Pressable>
+      {onDelete && (
+        // A sibling of the card's Pressable (not nested), so screen readers reach it on its own.
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Hapus notifikasi ${notification.title}`}
+          onPress={onDelete}
+          hitSlop={8}
+          className="absolute right-2 top-2 h-10 w-10 items-center justify-center rounded-full active:bg-canvas">
+          <Icon name="trash-outline" size={20} color={tokens.colors.ink.muted} />
+        </Pressable>
+      )}
       {needsAction && (
         <View className="flex-row gap-2 px-4 pb-4">
           <View className="flex-1">
@@ -82,6 +103,43 @@ function NotificationItem({
           <View className="flex-1">
             <Button label="Bunyikan Alarm" icon="alarm-outline" variant="danger" size="sm" loading={alarmBusy} onPress={onAlarm} />
           </View>
+        </View>
+      )}
+      {(canRelease || canConfirm) && (
+        <View className="flex-row gap-2 px-4 pb-4">
+          {!needsAction && (
+            <View className="flex-1">
+              <Button label="Hubungi" icon="call-outline" variant="secondary" size="sm" onPress={onCall} accessibilityLabel="Hubungi lansia" />
+            </View>
+          )}
+          {canRelease && (
+            <View className="flex-1">
+              <Button
+                label="Buka Bilik"
+                icon="lock-open-outline"
+                variant="warning"
+                size="sm"
+                loading={actionBusy === 'LATE_RELEASE'}
+                disabled={actionBusy !== null}
+                onPress={() => onAction('LATE_RELEASE')}
+                accessibilityLabel="Buka bilik sekarang agar obat bisa diminum terlambat"
+              />
+            </View>
+          )}
+          {canConfirm && (
+            <View className="flex-1">
+              <Button
+                label={needsAction ? 'Sudah Diminum' : 'Ya, Sudah Diminum'}
+                icon="checkmark-done-outline"
+                variant="success"
+                size="sm"
+                loading={actionBusy === 'CONFIRM_TAKEN'}
+                disabled={actionBusy !== null}
+                onPress={() => onAction('CONFIRM_TAKEN')}
+                accessibilityLabel="Tandai obat sudah diminum terlambat"
+              />
+            </View>
+          )}
         </View>
       )}
     </View>
@@ -180,11 +238,13 @@ export function NotificationsTab({
   canDelete,
   now,
   alarmBusyId,
+  actionBusy,
   refreshing,
   onRefresh,
   onMarkRead,
   onCall,
   onAlarm,
+  onAction,
   onDelete,
   onClearAll,
 }: {
@@ -205,11 +265,13 @@ export function NotificationsTab({
   canDelete: boolean;
   now: number;
   alarmBusyId: string | null;
+  actionBusy: DoseActionBusy;
   refreshing: boolean;
   onRefresh: () => void;
   onMarkRead: (id: string) => void;
   onCall: (n: AppNotification) => void;
   onAlarm: (n: AppNotification) => void;
+  onAction: (n: AppNotification, action: NotificationAction) => void;
   onDelete: (n: AppNotification) => void;
   onClearAll: () => void;
 }) {
@@ -245,9 +307,11 @@ export function NotificationsTab({
         notification={n}
         now={now}
         alarmBusy={alarmBusyId === n.id}
+        actionBusy={actionBusy?.id === n.id ? actionBusy.action : null}
         onPress={() => onMarkRead(n.id)}
         onCall={() => onCall(n)}
         onAlarm={() => onAlarm(n)}
+        onAction={(action) => onAction(n, action)}
         onDelete={canDelete ? () => onDelete(n) : undefined}
       />
     );

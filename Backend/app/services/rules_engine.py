@@ -7,13 +7,18 @@ Every RULES_ENGINE_INTERVAL_SECONDS:
    DEVICE's timezone (defaulted from the pairing caregiver's users.timezone),
    create the PENDING dose row once its window_start has passed. The unique
    index on (schedule_id, scheduled_for) makes this idempotent across runs,
-   restarts and workers. Doses before the schedule was created or the device
-   was paired are never materialized, so a new schedule does not back-fill
-   history as "missed".
+   restarts and workers. Doses before the schedule's current timing took effect
+   (schedules.effective_from: created, or time/days/tolerance/on-off changed) or
+   before the device was paired are never materialized, so a new or edited
+   schedule does not back-fill history as "missed".
 
 2. decide_missed: PENDING doses whose deadline_at (window_end + tolerance)
    passed more than MISSED_DECISION_GRACE_SECONDS ago become MISSED, with a
    DOSE_MISSED notification per caregiver (event_key makes it exactly-once).
+
+"Now" in both steps is the DEVICE clock (services/device_clock.py,
+FOLLOW_DEVICE_CLOCK): when the emulator's lab clock is moved or sped up, doses
+fall due and are missed by the time the pillbox shows, not the server's.
 
 OFFLINE RULE: a device that was offline may still hold the door events for
 the dose in its local buffer. We therefore only decide MISSED when
@@ -45,6 +50,7 @@ from app.models.enums import (
     NotificationType,
 )
 from app.services.adherence import dose_instants, is_scheduled_on
+from app.services.device_clock import device_now, device_now_sql
 from app.services.doses import notify_dose, pending_dose_row, pending_doses_insert_stmt
 from app.services.timeutil import zone
 
@@ -60,7 +66,9 @@ def can_decide_missed(device: Device, deadline_at: datetime, now: datetime, sett
         and device.online_since is not None
         and device.online_since <= now - timedelta(seconds=settings.offline_flush_wait_seconds)
     )
-    gave_up_waiting = now >= deadline_at + timedelta(minutes=settings.offline_max_wait_minutes)
+    gave_up_waiting = device_now(device, now, settings) >= deadline_at + timedelta(
+        minutes=settings.offline_max_wait_minutes
+    )
     return flushed or gave_up_waiting
 
 
@@ -78,14 +86,17 @@ async def materialize_due_doses(session: AsyncSession, now: datetime, settings: 
     due: list[dict[str, Any]] = []
     for schedule, device in rows.all():
         tz = zone(device.timezone)
-        today = now.astimezone(tz).date()
-        not_before = max(schedule.created_at, device.paired_at or device.created_at)
+        clock = device_now(device, now, settings)
+        today = clock.astimezone(tz).date()
+        # When the schedule's current timing / the pairing took effect, on the device clock. Not
+        # created_at: an edited slot keeps it, and its new time must not back-fill past days.
+        not_before = max(schedule.effective_from, device.paired_at or device.created_at) + (clock - now)
         for offset in range(settings.rules_engine_lookback_days, -1, -1):
             day = today - timedelta(days=offset)
             if not is_scheduled_on(schedule.days_of_week, day):
                 continue
             inst = dose_instants(day, schedule.window_start, schedule.window_end, schedule.tolerance_minutes, tz)
-            if inst.scheduled_for > now or inst.scheduled_for < not_before:
+            if inst.scheduled_for > clock or inst.scheduled_for < not_before:
                 continue
             due.append(pending_dose_row(device.id, device.elderly_id, schedule, inst, EVENT_SCHEDULE_DUE))
     # A few multi-row statements instead of one round trip per (schedule, day):
@@ -106,7 +117,7 @@ async def decide_missed(session: AsyncSession, now: datetime, settings: Settings
         .where(
             TelemetryLog.status == DoseStatus.PENDING.value,
             TelemetryLog.deadline_at.is_not(None),
-            TelemetryLog.deadline_at <= now - grace,
+            TelemetryLog.deadline_at <= device_now_sql(now, settings) - grace,
         )
         .order_by(TelemetryLog.deadline_at)
         # Rows being updated by telemetry right now are skipped this round.
@@ -120,7 +131,7 @@ async def decide_missed(session: AsyncSession, now: datetime, settings: Settings
         log.log_source = LogSource.SYSTEM_RULES_ENGINE.value
         log.event_type = EVENT_RULES_ENGINE_MISSED
         log.delay_minutes = None
-        log.recorded_at = now
+        log.recorded_at = device_now(device, now, settings)
         await session.flush()
         await notify_dose(session, log, NotificationType.DOSE_MISSED, zone(device.timezone))
         decided += 1

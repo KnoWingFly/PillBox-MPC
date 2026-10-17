@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from smart_pillbox.gui import styles
+from smart_pillbox.gui.icons import speaker_pixmap
 from smart_pillbox.gui.sachet_graphic import SachetGraphic
 from smart_pillbox.models import ChamberState, Compartment
 from smart_pillbox.core.audio import play_chime
@@ -103,6 +104,14 @@ class CompartmentWidget(QWidget):
         self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title_label.setStyleSheet("font-family: 'Segoe UI'; font-weight: bold; color: #E2E8F0; font-size: 11px;")
 
+        # Speaker badge, top right: this chamber is ringing (set_ringing)
+        self._sound_badge = QLabel(self._housing)
+        self._sound_badge.setPixmap(speaker_pixmap(16, "#0F172A"))
+        self._sound_badge.setGeometry(123, 17, 24, 24)
+        self._sound_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sound_badge.setStyleSheet("background: #FBBF24; border: none; border-radius: 12px;")
+        self._sound_badge.hide()
+
         # 2. Chamber Canvas (holds the layered sachet graphics)
         self._canvas = ChamberCanvas(self.compartment, self._housing)
         self._canvas.setGeometry(12, 42, 131, 160)
@@ -154,6 +163,12 @@ class CompartmentWidget(QWidget):
 
         # Repaint sachet canvas
         self._canvas.update()
+
+    def set_ringing(self, ringing: bool) -> None:
+        if ringing != self._sound_badge.isVisible():
+            self._sound_badge.setVisible(ringing)
+            if ringing:
+                self._sound_badge.raise_()
 
     def trigger_shake(self) -> None:
         """Physical tactile vibration effect when an action is rejected on a locked slot."""

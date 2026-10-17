@@ -6,15 +6,17 @@
 
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, BackHandler, Linking, View } from 'react-native';
+import { BackHandler, Linking, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppConfig } from '@/config';
 import { ConnectPillboxScreen } from '@/components/pillbox/connect-card';
 import { DeviceTab } from '@/components/pillbox/device-tab';
-import { deviceLook, isDraftDirty, isSlotActive, notificationLook, type ToastTone } from '@/components/pillbox/helpers';
+import { deviceLook, isDraftDirty, isSlotActive, notificationLook, pillboxNow, type ToastTone } from '@/components/pillbox/helpers';
 import { HomeTab } from '@/components/pillbox/home-tab';
-import { NotificationsTab } from '@/components/pillbox/notifications-tab';
+import { NotificationsTab, type DoseActionBusy } from '@/components/pillbox/notifications-tab';
+import { ConfirmDialog, type ConfirmRequest } from '@/components/pillbox/dialog';
+import { PinPrompt } from '@/components/pillbox/pin-prompt';
 import { ScheduleTab } from '@/components/pillbox/schedule-tab';
 import { TabBar, type TabKey } from '@/components/pillbox/tab-bar';
 import { makeToast, Toast, type ToastData } from '@/components/pillbox/toast';
@@ -22,8 +24,16 @@ import { useNotificationFeed } from '@/hooks/use-notification-feed';
 import { perfLog, perfLoginStep } from '@/lib/perf';
 import * as api from '@root/lib/api';
 import { fetchNotificationPage, NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
-import { findAllDuplicates } from '@root/lib/schedule-time';
-import type { AdherenceSummary, AppNotification, DeviceStatus, DoseEventType, Slot, SlotId } from '@root/lib/types';
+import { findAllConflicts } from '@root/lib/schedule-time';
+import type {
+  AdherenceSummary,
+  AppNotification,
+  DeviceStatus,
+  DoseEventType,
+  NotificationAction,
+  Slot,
+  SlotId,
+} from '@root/lib/types';
 
 const RECENT_COUNT = 3;
 
@@ -52,6 +62,12 @@ export default function PillboxDashboard() {
   const [testing, setTesting] = useState(false);
 
   const [alarmBusyId, setAlarmBusyId] = useState<string | null>(null);
+  const [doseActionBusy, setDoseActionBusy] = useState<DoseActionBusy>(null);
+  // Missed-dose notification waiting for the device PIN ("Buka bilik sekarang").
+  const [releaseTarget, setReleaseTarget] = useState<AppNotification | null>(null);
+  // "Are you sure?" dialog (Alert.alert does nothing on web).
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const [adherence, setAdherence] = useState<AdherenceSummary | null>(null);
   const [recent, setRecent] = useState<AppNotification[]>([]);
 
@@ -169,11 +185,13 @@ export default function PillboxDashboard() {
     };
   }, [needsPairing]);
 
-  // Keeps relative times ("5 menit lalu") fresh.
+  // Keeps relative times ("5 menit lalu") fresh; every second while the pillbox clock runs fast
+  // (emulator at 10x / 60x), so "next dose" keeps up with it.
+  const clockSpeed = device?.clock?.speed ?? 1;
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    const timer = setInterval(() => setNow(Date.now()), clockSpeed > 1 ? 1_000 : 30_000);
     return () => clearInterval(timer);
-  }, []);
+  }, [clockSpeed]);
 
   // Android back: return to Beranda before leaving the app.
   useEffect(() => {
@@ -190,6 +208,8 @@ export default function PillboxDashboard() {
     simSlotId && isSlotActive(savedSlots.find((s) => s.id === simSlotId)) ? simSlotId : (firstActiveSlot?.id ?? null);
   const draftDirty = isDraftDirty(draftSlots, savedSlots);
   const deviceTone = device ? deviceLook(device, now).tone : dashboardError ? 'missed' : null;
+  // Time of day as the pillbox sees it: doses are due and missed by this clock, not the phone's.
+  const pillboxNowMs = pillboxNow(device, now);
 
   const openTab = (next: TabKey) => {
     setTab(next);
@@ -286,27 +306,35 @@ export default function PillboxDashboard() {
     else showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
   };
 
+  const runConfirm = async () => {
+    if (!confirmRequest) return;
+    setConfirmBusy(true);
+    try {
+      await confirmRequest.onConfirm();
+    } finally {
+      setConfirmBusy(false);
+      setConfirmRequest(null);
+    }
+  };
+
   const handleClearAll = () => {
-    Alert.alert(
-      'Hapus semua notifikasi?',
-      'Semua notifikasi, termasuk yang tidak tampil di filter ini, akan dihapus permanen dan tidak bisa dikembalikan.',
-      [
-        { text: 'Batal', style: 'cancel' },
-        {
-          text: 'Hapus',
-          style: 'destructive',
-          onPress: async () => {
-            if (await feed.clearAll()) {
-              refreshRecent();
-              showToast('Semua notifikasi dihapus', 'success');
-            } else {
-              showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
-            }
-          },
-        },
-      ],
-      { cancelable: true },
-    );
+    setConfirmRequest({
+      title: 'Hapus semua notifikasi?',
+      message:
+        'Semua notifikasi, termasuk yang tidak tampil di filter ini, akan dihapus permanen dan tidak bisa dikembalikan. ' +
+        'Notifikasi pengasuh lain tidak ikut terhapus.',
+      confirmLabel: 'Hapus Semua',
+      tone: 'danger',
+      icon: 'trash-outline',
+      onConfirm: async () => {
+        if (await feed.clearAll()) {
+          refreshRecent();
+          showToast('Semua notifikasi dihapus', 'success');
+        } else {
+          showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
+        }
+      },
+    });
   };
 
   const handleCall = async (n: AppNotification) => {
@@ -332,15 +360,78 @@ export default function PillboxDashboard() {
     }
   };
 
+  /** A late-dose action changed the dose: refresh what shows it. */
+  const afterDoseAction = () => {
+    void feed.refresh();
+    refreshRecent();
+    refreshAdherence();
+  };
+
+  const confirmTaken = async (n: AppNotification) => {
+    setDoseActionBusy({ id: n.id, action: 'CONFIRM_TAKEN' });
+    try {
+      await api.confirmDoseTaken(n.id);
+      showToast('Dicatat: obat diminum terlambat', 'success');
+      afterDoseAction();
+    } catch (err) {
+      // e.g. "Sudah lewat batas aman (pukul 10:00) ... Jangan diminum, tunggu jadwal berikutnya."
+      showToast(failMessage('Gagal mencatat', err), 'error');
+    } finally {
+      setDoseActionBusy(null);
+    }
+  };
+
+  const handleDoseAction = (n: AppNotification, action: NotificationAction) => {
+    markRead(n.id);
+    if (action === 'LATE_RELEASE') {
+      setReleaseTarget(n);
+      return;
+    }
+    setConfirmRequest({
+      title: 'Obat sudah diminum?',
+      message:
+        'Dosis ini akan dicatat sebagai diminum terlambat dan peringatannya ditutup. Pastikan lansia benar-benar sudah meminumnya.',
+      confirmLabel: 'Ya, Sudah Diminum',
+      tone: 'success',
+      icon: 'checkmark-done-outline',
+      onConfirm: () => confirmTaken(n),
+    });
+  };
+
+  const handleRelease = async (pin: string) => {
+    const n = releaseTarget;
+    if (!n) return;
+    setDoseActionBusy({ id: n.id, action: 'LATE_RELEASE' });
+    try {
+      const { releaseUntil } = await api.releaseMissedDose(n.id, pin);
+      setReleaseTarget(null);
+      const until = releaseUntil.slice(11, 16); // pillbox clock, already in WIB
+      showToast(`Bilik ${n.slotId ?? ''} dibuka sampai ${until}. Minta lansia mengambil obatnya.`, 'success');
+    } catch (err) {
+      if (!(err instanceof api.BackendError) || err.code !== 'DEVICE_PIN_INCORRECT') setReleaseTarget(null);
+      showToast(
+        err instanceof api.BackendError && err.code === 'DEVICE_PIN_INCORRECT' ? 'PIN salah' : failMessage('Gagal membuka bilik', err),
+        'error',
+      );
+    } finally {
+      setDoseActionBusy(null);
+    }
+  };
+
   const handleChangeSlot = (id: SlotId, patch: Partial<Slot>) => {
     setDraftSlots((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
   };
 
   const handleDiscard = () => {
-    Alert.alert('Batalkan perubahan?', 'Jadwal kembali seperti yang tersimpan di Pillbox.', [
-      { text: 'Tidak', style: 'cancel' },
-      { text: 'Batalkan perubahan', style: 'destructive', onPress: () => setDraftSlots(savedSlots) },
-    ]);
+    setConfirmRequest({
+      title: 'Batalkan perubahan?',
+      message: 'Perubahan jadwal yang belum disimpan akan hilang. Jadwal kembali seperti yang tersimpan di Pillbox.',
+      confirmLabel: 'Batalkan Perubahan',
+      cancelLabel: 'Tidak',
+      tone: 'danger',
+      icon: 'arrow-undo-outline',
+      onConfirm: () => setDraftSlots(savedSlots),
+    });
   };
 
   const handleTestSlot = async (id: SlotId) => {
@@ -357,8 +448,8 @@ export default function PillboxDashboard() {
 
   const handleSave = async () => {
     // The button is disabled on conflicts; re-check in case state changed in between.
-    if (findAllDuplicates(draftSlots).size > 0) {
-      showToast('Ada jam yang bentrok. Perbaiki dulu sebelum menyimpan.', 'error');
+    if (findAllConflicts(draftSlots).size > 0) {
+      showToast('Ada jam yang bentrok atau terlalu dekat. Perbaiki dulu sebelum menyimpan.', 'error');
       return;
     }
     setSaving(true);
@@ -391,6 +482,7 @@ export default function PillboxDashboard() {
               {tab === 'home' && (
                 <HomeTab
                   now={now}
+                  pillboxNow={pillboxNowMs}
                   device={device}
                   deviceLoadError={dashboardError}
                   onRetryDevice={handleRetryDashboard}
@@ -411,7 +503,7 @@ export default function PillboxDashboard() {
                   onChangeSlot={handleChangeSlot}
                   loadError={dashboardError}
                   onRetry={handleRetryDashboard}
-                  now={now}
+                  now={pillboxNowMs}
                   testing={testing}
                   onTest={handleTestSlot}
                   saving={saving}
@@ -425,6 +517,8 @@ export default function PillboxDashboard() {
                   canDelete={NOTIFICATION_DELETE_SUPPORTED}
                   now={now}
                   alarmBusyId={alarmBusyId}
+                  actionBusy={doseActionBusy}
+                  onAction={handleDoseAction}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
                   onMarkRead={markRead}
@@ -471,6 +565,21 @@ export default function PillboxDashboard() {
         )}
       </SafeAreaView>
 
+      <PinPrompt
+        visible={releaseTarget !== null}
+        title="Buka bilik sekarang?"
+        message={`Bilik ${releaseTarget?.slotId ?? ''} akan terbuka sebentar agar obat yang terlewat bisa diminum terlambat. Masukkan PIN pillbox.`}
+        confirmLabel="Buka Bilik"
+        busy={doseActionBusy?.action === 'LATE_RELEASE'}
+        onSubmit={(pin) => void handleRelease(pin)}
+        onCancel={() => setReleaseTarget(null)}
+      />
+      <ConfirmDialog
+        request={confirmRequest}
+        busy={confirmBusy}
+        onConfirm={() => void runConfirm()}
+        onCancel={() => setConfirmRequest(null)}
+      />
       {toast && <Toast key={toast.id} toast={toast} onDone={hideToast} />}
     </View>
   );

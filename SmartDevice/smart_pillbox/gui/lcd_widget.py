@@ -1,8 +1,9 @@
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QLabel
 
 from smart_pillbox.gui import styles
+from smart_pillbox.gui.icons import speaker_pixmap
 
 
 class LcdDisplay(QFrame):
@@ -45,11 +46,34 @@ class LcdDisplay(QFrame):
         self.bot_row.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
         self.bot_row.setStyleSheet(f"color: {styles.LCD_MUTED}; background: transparent; border: none;")
 
+        # Sound indicator, right of the status row: shown while the buzzer rings (set_sound).
+        self.sound_badge = QFrame()
+        self.sound_badge.setObjectName("SoundBadge")
+        self.sound_badge.setStyleSheet("QFrame#SoundBadge { background: #FBBF24; border: none; border-radius: 4px; }")
+        badge_layout = QHBoxLayout(self.sound_badge)
+        badge_layout.setContentsMargins(6, 1, 7, 1)
+        badge_layout.setSpacing(4)
+        sound_icon = QLabel()
+        sound_icon.setPixmap(speaker_pixmap(14, "#0F172A"))
+        sound_icon.setStyleSheet("background: transparent; border: none;")
+        self.sound_text = QLabel()
+        self.sound_text.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.sound_text.setStyleSheet("color: #0F172A; background: transparent; border: none;")
+        badge_layout.addWidget(sound_icon)
+        badge_layout.addWidget(self.sound_text)
+        self.sound_badge.hide()
+        # Right end of the status row: the clock row above has no room to spare.
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.addWidget(self.bot_row)
+        bottom.addStretch()
+        bottom.addWidget(self.sound_badge)
+
         layout.addWidget(self.top_row)
         layout.addStretch()
         layout.addWidget(self.mid_row)
         layout.addStretch()
-        layout.addWidget(self.bot_row)
+        layout.addLayout(bottom)
 
     def update_display(
         self,
@@ -95,3 +119,11 @@ class LcdDisplay(QFrame):
                     border-radius: 8px;
                 }}
             """)
+
+    def set_sound(self, text: str | None) -> None:
+        """Shows the speaker icon and `text` while the buzzer rings; None hides it."""
+        if text is None:
+            self.sound_badge.hide()
+        else:
+            self.sound_text.setText(text)
+            self.sound_badge.show()

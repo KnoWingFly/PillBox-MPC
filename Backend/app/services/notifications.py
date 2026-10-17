@@ -142,9 +142,28 @@ _TEMPLATES: dict[NotificationType, dict[str, str]] = {
 }
 
 
-def render_message(ntype: NotificationType, language: str, params: dict[str, Any]) -> str:
+# Alternative wording for the same type, chosen with NotificationSpec.variant.
+_VARIANTS: dict[tuple[NotificationType, str], dict[str, str]] = {
+    # A dose first reported missed was taken after all (late release, sensor, or caregiver).
+    (NotificationType.DOSE_LATE, "AFTER_MISSED"): {
+        "ID": "Obat {slot} ({period}) untuk {elderly} yang tadi terlewat akhirnya diminum pukul {taken} "
+        "(terlambat {delay} menit dari jadwal {time}).",
+        "EN": "{elderly} took the earlier missed dose {slot} ({period}) after all at {taken} "
+        "({delay} minutes late, scheduled {time}).",
+    },
+    # Forced open soon after a missed dose of the same slot: probably taken late.
+    (NotificationType.UNSCHEDULED_OPEN, "AFTER_MISSED"): {
+        "ID": "Bilik {slot} pada {device} dibuka paksa pukul {time}, setelah dosis jadwal {scheduled} terlewat. "
+        "Mungkin obatnya diminum terlambat: konfirmasi di aplikasi.",
+        "EN": "Compartment {slot} on {device} was forced open at {time}, after the {scheduled} dose was missed. "
+        "The dose may have been taken late: please confirm in the app.",
+    },
+}
+
+
+def render_message(ntype: NotificationType, language: str, params: dict[str, Any], variant: str | None = None) -> str:
     """A param value may be a {"ID": ..., "EN": ...} dict for localized fragments."""
-    templates = _TEMPLATES[ntype]
+    templates = _VARIANTS.get((ntype, variant or ""), _TEMPLATES[ntype])
     template = templates.get(language, templates["ID"])
     resolved = {
         key: (value.get(language, value.get("ID")) if isinstance(value, dict) else value)
@@ -173,6 +192,10 @@ class NotificationSpec:
     # Set them when known so the pushed item (app_hub) matches the feed.
     slot_number: int | None = None
     delay_minutes: int | None = None
+    # Key into _VARIANTS for alternative wording of the same type.
+    variant: str | None = None
+    # What the app may offer on the pushed item (the feed derives the same, see notification_feed).
+    actions: list[str] = field(default_factory=list)
 
 
 async def notify(
@@ -200,7 +223,7 @@ async def notify(
             "telemetry_log_id": spec.telemetry_log_id,
             "type": spec.type.value,
             "severity": spec.severity.value,
-            "message": render_message(spec.type, r.language, spec.params),
+            "message": render_message(spec.type, r.language, spec.params, spec.variant),
             "event_key": spec.event_key,
         }
         for r in targets
@@ -242,6 +265,7 @@ async def notify(
                     "message": messages[uid],
                     "is_read": False,
                     "is_resolved": False,
+                    "actions": spec.actions,
                     "created_at": created_at.isoformat(),
                 }
             )
