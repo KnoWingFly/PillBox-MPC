@@ -22,6 +22,7 @@ import type {
   AppNotification,
   DeviceStatus,
   DoseEventType,
+  NotificationAction,
   NotificationSeverity,
   NotificationType,
   Slot,
@@ -149,7 +150,18 @@ async function send(
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-  } catch {
+  } catch (err) {
+    // The server got the request but did not answer in time (slow database): a write may still
+    // have been applied, so say so instead of claiming the backend is unreachable.
+    if (err instanceof Error && err.message === 'Request timed out') {
+      throw new BackendError(
+        0,
+        'TIMEOUT',
+        method === 'GET'
+          ? 'Server terlalu lama merespons. Coba lagi sebentar lagi.'
+          : 'Server terlalu lama merespons. Perubahan mungkin sudah tersimpan: tarik ke bawah untuk memuat ulang sebelum mencoba lagi.',
+      );
+    }
     throw new BackendError(0, 'NETWORK_ERROR', `Cannot reach the backend at ${BASE_URL}`);
   }
 }
@@ -171,9 +183,12 @@ async function toBackendError(res: Response): Promise<BackendError> {
   let code = 'HTTP_ERROR';
   let message = `Backend request failed (${res.status})`;
   try {
-    const err = (await res.json()) as { error?: { code?: string; message?: string } };
+    const err = (await res.json()) as { error?: { code?: string; message?: string; details?: { error?: unknown } } };
     code = err.error?.code ?? code;
     message = err.error?.message ?? message;
+    // The pillbox's own reason (e.g. "Bilik lain sedang terbuka") says more than "Device rejected the command".
+    const deviceReason = err.error?.details?.error;
+    if (code === 'DEVICE_REJECTED_COMMAND' && typeof deviceReason === 'string') message = deviceReason;
   } catch {
     // non-JSON error body
   }
@@ -214,6 +229,9 @@ type BackendStatus = {
   wifi_strength: 'LEMAH' | 'SEDANG' | 'KUAT' | null;
   battery_percent: number | null;
   chambers?: { slot_number: number; door: 'OPEN' | 'CLOSED' }[];
+  device_time?: string | null;
+  clock_speed?: number | null;
+  follow_device_clock?: boolean;
 };
 type BackendSlotSchedule = {
   id: string | null;
@@ -234,6 +252,7 @@ type BackendNotification = {
   message: string;
   is_read: boolean;
   created_at: string;
+  actions?: NotificationAction[];
 };
 
 const SEVERITY: Record<BackendNotification['severity'], NotificationSeverity> = {
@@ -360,12 +379,15 @@ function toStatusFields(status: BackendStatus): DeviceStatusFields {
     wifiLabel: status.wifi_strength ? `Sinyal ${status.wifi_strength.toLowerCase()}` : '-',
     lastSyncedAt: status.last_seen_at ? Date.parse(status.last_seen_at) : 0,
     openSlots: (status.chambers ?? []).filter((c) => c.door === 'OPEN').map((c) => slotIdOf(c.slot_number)),
+    clock:
+      status.follow_device_clock && status.device_time
+        ? { deviceTimeMs: Date.parse(status.device_time), speed: status.clock_speed ?? 1, receivedAt: Date.now() }
+        : null,
   };
 }
 
 type ScheduleState = {
   slots: Slot[];
-  scheduleIds: Map<SlotId, string>;
   /** Backend rows by slot, to skip writes that would change nothing. */
   rows: Map<SlotId, BackendSlotSchedule>;
 };
@@ -377,12 +399,10 @@ async function backendSchedules(): Promise<ScheduleState> {
     backend<BackendStock[]>(`/devices/${id}/stock`),
   ]);
   const stockBySlot = new Map(stock.map((s) => [s.slot_number, s.remaining_units]));
-  const scheduleIds = new Map<SlotId, string>();
   const rows = new Map<SlotId, BackendSlotSchedule>();
   const slots = schedules.map((s): Slot => {
     const slotId = slotIdOf(s.slot_number);
     rows.set(slotId, s);
-    if (s.id) scheduleIds.set(slotId, s.id);
     return {
       id: slotId,
       timeMinutes: s.is_empty ? null : parseHHmm(s.window_start),
@@ -392,7 +412,7 @@ async function backendSchedules(): Promise<ScheduleState> {
       capacity: AppConfig.slotCapacity,
     };
   });
-  return { slots, scheduleIds, rows };
+  return { slots, rows };
 }
 
 /** Sachets per slot as last reported by the pillbox (heartbeat), without the schedules. */
@@ -416,39 +436,39 @@ function isUnchanged(row: BackendSlotSchedule | undefined, fields: { window_star
 
 async function backendSaveSchedule(slots: Slot[]): Promise<Slot[]> {
   const id = await deviceId();
-  const { scheduleIds, rows } = await backendSchedules();
-  // Clear/deactivate first so moving a time from one slot to another never trips the
-  // backend's WINDOW_OVERLAP check halfway through.
-  const ordered = [...slots].sort((a, b) => Number(a.enabled && a.timeMinutes !== null) - Number(b.enabled && b.timeMinutes !== null));
-  for (const slot of ordered) {
-    const existing = scheduleIds.get(slot.id);
+  const { slots: current, rows } = await backendSchedules();
+  // Only slots that change are sent, all in one request: the backend saves them in one transaction
+  // (one device lock, one config version, one push to the pillbox) and checks WINDOW_OVERLAP on the
+  // final state, so the order does not matter. One write per slot was slow on a remote database.
+  const changes: Record<string, unknown>[] = [];
+  for (const slot of slots) {
+    const slotNumber = slotNumberOf(slot.id);
+    const row = rows.get(slot.id);
     if (slot.timeMinutes === null) {
-      if (existing) await backend<void>(`/devices/${id}/schedules/${existing}`, 'DELETE');
+      if (row && !row.is_empty) changes.push({ slot_number: slotNumber, clear: true });
       continue;
     }
     // The dashboard edits a single time per slot, so the window is [time, time] and
     // tolerance_minutes is the grace period (see Backend/app/services/adherence.py).
     const time = formatTime(slot.timeMinutes);
-    const fields = {
-      window_start: time,
-      window_end: time,
-      tolerance_minutes: slot.toleranceMinutes,
-      active: slot.enabled,
-    };
-    if (existing) {
-      // Every PUT bumps the device config version and makes the device pull its config again, so
-      // untouched slots are skipped. Writes stay sequential: their order avoids WINDOW_OVERLAP.
-      if (isUnchanged(rows.get(slot.id), fields)) continue;
-      await backend(`/devices/${id}/schedules/${existing}`, 'PUT', fields);
-    } else {
-      await backend(`/devices/${id}/schedules`, 'POST', {
-        ...fields,
-        slot_number: slotNumberOf(slot.id),
-        days_of_week: [1, 2, 3, 4, 5, 6, 7],
-      });
-    }
+    const fields = { window_start: time, window_end: time, tolerance_minutes: slot.toleranceMinutes, active: slot.enabled };
+    if (isUnchanged(row, fields)) continue;
+    changes.push({ slot_number: slotNumber, ...fields, ...(row && !row.is_empty ? {} : { days_of_week: [1, 2, 3, 4, 5, 6, 7] }) });
   }
-  return (await backendSchedules()).slots;
+  if (changes.length === 0) return current;
+  const saved = await backend<BackendSlotSchedule[]>(`/devices/${id}/schedules`, 'PUT', { slots: changes });
+  const stock = new Map(current.map((s) => [s.id, s.stock]));
+  return saved.map((s): Slot => {
+    const slotId = slotIdOf(s.slot_number);
+    return {
+      id: slotId,
+      timeMinutes: s.is_empty ? null : parseHHmm(s.window_start),
+      enabled: !s.is_empty && s.active,
+      toleranceMinutes: toTolerance(s.tolerance_minutes),
+      stock: stock.get(slotId) ?? 0,
+      capacity: AppConfig.slotCapacity,
+    };
+  });
 }
 
 async function backendAlarm(slotId: SlotId | null, durationSeconds: number): Promise<void> {
@@ -498,6 +518,9 @@ function toAppNotification(n: BackendNotification): AppNotification {
     createdAt: Date.parse(n.created_at),
     read: n.is_read,
     ...(type === 'late' && n.delay_minutes !== null ? { minutesLate: n.delay_minutes } : {}),
+    ...(n.actions?.length ? { actions: n.actions } : {}),
+    // A forced open right after a missed dose: probably taken late, not a break-in.
+    ...(n.type === 'UNSCHEDULED_OPEN' && n.actions?.includes('CONFIRM_TAKEN') ? { title: 'Mungkin Diminum Terlambat' } : {}),
   };
 }
 
@@ -823,6 +846,21 @@ export async function markBackendNotificationRead(id: string): Promise<void> {
   await backend(`/notifications/${id}/read`, 'PUT');
 }
 
+/** Deletes the caller's copy of one notification; already gone (404) counts as done. */
+export async function deleteBackendNotification(id: string): Promise<void> {
+  try {
+    await backend<void>(`/notifications/${id}`, 'DELETE');
+  } catch (err) {
+    if (!(err instanceof BackendError && err.status === 404)) throw err;
+  }
+}
+
+/** "Hapus semua": deletes every notification at or older than `upTo` (feed order). */
+export async function clearBackendNotifications(upTo: { createdAt: number; id: string }): Promise<{ deleted: number }> {
+  const query = new URLSearchParams({ up_to_created_at: new Date(upTo.createdAt).toISOString(), up_to_id: upTo.id });
+  return backend<{ deleted: number }>(`/notifications?${query.toString()}`, 'DELETE');
+}
+
 /** Days covered by the adherence card in backend mode (today included, WIB). */
 const ADHERENCE_DAYS = 30;
 
@@ -925,6 +963,22 @@ export async function saveSchedule(slots: Slot[]): Promise<Slot[]> {
 }
 
 /** Rings the pillbox alarm, e.g. after a late or missed dose. */
+/** "Buka bilik sekarang" on a missed dose: the pillbox pops the chamber up again for a short time;
+ * opening it records the dose as taken late. Returns when it closes again (pillbox clock, ISO). */
+export async function releaseMissedDose(notificationId: string, pin: string): Promise<{ releaseUntil: string }> {
+  if (USE_MOCK) mockOnly('releaseMissedDose');
+  const res = await backend<{ release_until: string }>(`/notifications/${notificationId}/late-release`, 'POST', {
+    device_pin: pin,
+  });
+  return { releaseUntil: res.release_until };
+}
+
+/** "Sudah diminum" on a missed dose (or a forced open after one): recorded as taken late. */
+export async function confirmDoseTaken(notificationId: string): Promise<void> {
+  if (USE_MOCK) mockOnly('confirmDoseTaken');
+  await backend(`/notifications/${notificationId}/confirm-taken`, 'POST', {});
+}
+
 export async function triggerAlarm(slotId: SlotId | null): Promise<{ slotId: SlotId | null }> {
   if (!USE_MOCK) {
     await backendAlarm(slotId, 60);

@@ -26,6 +26,19 @@ export interface DeviceStatus {
   lastSyncedAt: number;
   /** Compartments whose door the pillbox last reported as open. */
   openSlots: SlotId[];
+  /** The pillbox's own clock, when the backend judges doses by it; null = use the phone clock. */
+  clock?: PillboxClock | null;
+}
+
+/** A reading of the pillbox clock (backend `device_time`). The emulator's lab clock can be moved
+ * and sped up for demos, so "today" and "next dose" follow this rather than the phone. */
+export interface PillboxClock {
+  /** Pillbox time (epoch ms) at `receivedAt`. */
+  deviceTimeMs: number;
+  /** Pillbox seconds per real second: 1 = real time, the emulator can run 10x or 60x. */
+  speed: number;
+  /** Phone time (epoch ms) when the reading arrived. */
+  receivedAt: number;
 }
 
 export type NotificationType = 'on_time' | 'late' | 'missed' | 'system';
@@ -48,7 +61,12 @@ export interface AppNotification {
   read: boolean;
   /** Only set for `late` notifications. */
   minutesLate?: number;
+  /** What the caregiver can still do about it (backend `actions`; only on open, still-missed doses). */
+  actions?: NotificationAction[];
 }
+
+/** LATE_RELEASE = "Buka bilik sekarang" (device PIN), CONFIRM_TAKEN = "Sudah diminum". */
+export type NotificationAction = 'LATE_RELEASE' | 'CONFIRM_TAKEN';
 
 export interface AdherenceSummary {
   totalDoses: number;

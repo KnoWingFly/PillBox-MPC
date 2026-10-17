@@ -201,7 +201,9 @@ def flush_pending_events(db: Database, offline_flush: bool = False) -> int:
 
 # --- heartbeat & config -----------------------------------------------------------
 
-def send_heartbeat(db: Database, current_time_str: str, battery_percent: int, is_online: bool) -> None:
+def send_heartbeat(
+    db: Database, current_time_str: str, battery_percent: int, is_online: bool, clock_speed: float = 1.0
+) -> None:
     if not is_online:
         return
     auth = _auth(db)
@@ -215,6 +217,9 @@ def send_heartbeat(db: Database, current_time_str: str, battery_percent: int, is
         "battery_percent": battery_percent,
         "wifi_rssi_dbm": -50,
         "rtc_time": current_time_str,
+        # The simulated RTC can run fast; the backend and the app extrapolate the device clock
+        # with it between heartbeats (docs/DEVICE_CONTRACT.md, heartbeat).
+        "rtc_speed": clock_speed,
         "config_version_applied": int(config_version),
         "chambers": [
             {

@@ -2,7 +2,7 @@ from datetime import datetime, time
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Time
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, SmallInteger, String, Time, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -40,6 +40,8 @@ class Device(Base):
     rtc_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rtc_reported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rtc_backup_active: Mapped[bool | None] = mapped_column(Boolean)
+    # migration 0004: RTC speed relative to real time (emulator lab clock); NULL = 1.0
+    rtc_speed: Mapped[float | None] = mapped_column(Float)
     chamber_doors: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     online_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     offline_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -62,6 +64,8 @@ class Schedule(Base):
     days_of_week: Mapped[list[int]] = mapped_column(ARRAY(SmallInteger))
     is_active: Mapped[bool] = mapped_column(Boolean, server_default="true")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # migration 0006: when the current timing took effect; doses before it are never created
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     created_at: Mapped[datetime] = created_at_col()
     updated_at: Mapped[datetime] = updated_at_col()
 

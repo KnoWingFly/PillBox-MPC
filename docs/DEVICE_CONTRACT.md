@@ -61,6 +61,7 @@ Send one every **`heartbeat_interval_seconds`** (default **15 s**, returned in e
   "battery_percent": 98,
   "wifi_rssi_dbm": -50,
   "rtc_time": "2026-09-30T14:05:00+07:00",
+  "rtc_speed": 1.0,
   "config_version_applied": 3,
   "rtc_backup_active": true,
   "chambers": [
@@ -71,7 +72,8 @@ Send one every **`heartbeat_interval_seconds`** (default **15 s**, returned in e
 ```
 - Required: `battery_percent`. Everything else is optional, but please send it.
 - `stock_count` is the physical sachet count and is **authoritative**: it overwrites the backend's stock for that slot.
-- `rtc_time` feeds the clock-drift view in the app.
+- `rtc_time` feeds the clock-drift view in the app. Read it when the heartbeat is sent, not when a sync starts.
+- `rtc_speed` (default 1.0): device seconds per real second. The emulator's lab clock runs 1x/10x/60x and can be moved; the backend extrapolates the device clock as `rtc_time + (now - received_at) * rtc_speed`. With `FOLLOW_DEVICE_CLOCK=true` (default) the rules engine and the app judge doses by that clock, so a moved lab clock stays consistent end to end. A real device sends 1.0 and keeps its RTC on real time, so nothing changes for it. Send a heartbeat right after the clock is changed.
 
 Response `200`:
 ```json
@@ -220,6 +222,7 @@ Reply:
 | `time_sync` | `server_time`, `timezone` | Set the RTC | `{"device_time_before": "…", "device_time_after": "…"}` |
 | `schedule_updated` | `config_version` | Run `GET /config` then `POST /config-ack` | `{"config_version_applied": 5}` |
 | `refill_mode` | `enabled` | Lock or unlock the lids | `{"is_refill_mode": true}` |
+| `release_slot` | `slot_number`, `until`, `scheduled_for` (naive local device time) | Pop a MISSED dose's chamber up again until `until` ("Buka bilik sekarang"). Opening it is sent as a normal `COMPARTMENT_OPENED`; the backend records the dose TAKEN (late). Reject (`ok: false`, Indonesian reason in `error`) when another chamber is popped up, in refill mode, or already taken | `{"released": true, "release_until": "…"}` |
 
 **Ack (device → server)**, sent once per command and as fast as possible:
 ```json

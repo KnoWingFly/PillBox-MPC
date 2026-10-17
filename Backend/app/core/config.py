@@ -108,6 +108,19 @@ class Settings(BaseSettings):
     low_stock_threshold_units: int = 3
     stock_capacity_per_slot: int = 30
     clock_drift_tolerance_seconds: int = 60
+    # Judge doses (rules engine) and show the app's day by the DEVICE clock as last reported
+    # (rtc_time, rtc_speed), so a lab clock moved or sped up on the emulator stays consistent
+    # end to end. A real device's RTC is on real time, so this changes nothing for it.
+    # See app/services/device_clock.py.
+    follow_device_clock: bool = True
+
+    # --- Missed dose taken late ("Buka bilik sekarang", app/services/late_dose.py) -----
+    # How long the re-opened chamber stays popped up.
+    late_release_minutes: int = Field(15, ge=1, le=120)
+    # A missed dose may still be taken until this fraction of the way from its schedule
+    # time to the device's next dose (any slot); later it would come too close to the next
+    # dose (double dose). 0.5 = halfway.
+    late_release_cutoff_fraction: float = Field(0.5, gt=0, le=1)
     # Rated runtime of a full battery, used for estimated_battery_days_remaining.
     # Unset = the estimate is returned as null.
     battery_rated_days: float | None = None

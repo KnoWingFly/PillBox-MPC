@@ -134,3 +134,27 @@ def test_old_database_is_migrated_and_keeps_its_events(tmp_path):
     assert {"idx_events_unsynced", "idx_events_compartment"} <= indexes
     # Opening again must not migrate (or break) anything.
     Database(db_path=db_path)
+
+
+def test_gui_and_sync_threads_can_share_the_connection(tmp_path):
+    """The GUI tick and the sync worker run the same queries at the same time; on one shared
+    connection that used to fail with "InterfaceError: bad parameter or other API misuse"."""
+    import threading
+
+    db = make_db(tmp_path)
+    errors = []
+
+    def poll():
+        for _ in range(3000):
+            try:
+                db.get_device_state("device_code")
+                db.get_compartments()
+            except Exception as exc:  # noqa: BLE001 - collected for the assert
+                errors.append(exc)
+
+    threads = [threading.Thread(target=poll) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []

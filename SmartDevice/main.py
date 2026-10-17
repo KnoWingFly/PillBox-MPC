@@ -1,4 +1,11 @@
+import os
 import sys
+
+# Qt's Wayland text-input plugin logs "QWaylandTextInputv3::disableSurface ... but 0x0 is focused" on
+# focus changes (a harmless Qt bug); hide just that category, keep any rules the user set.
+os.environ["QT_LOGGING_RULES"] = ";".join(
+    filter(None, [os.environ.get("QT_LOGGING_RULES"), "qt.qpa.wayland.textinput=false"])
+)
 
 from PySide6.QtWidgets import QApplication
 

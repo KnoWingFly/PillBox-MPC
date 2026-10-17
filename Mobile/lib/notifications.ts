@@ -3,6 +3,8 @@
 // The hook and UI (src/hooks/use-notification-feed.ts) are the same for both.
 
 import {
+  clearBackendNotifications,
+  deleteBackendNotification,
   fetchBackendNotifications,
   getMockNotifications,
   markBackendNotificationRead,
@@ -32,12 +34,8 @@ export {
 
 export const NOTIFICATION_PAGE_SIZE = 20;
 
-/**
- * False while the backend has no delete endpoint: the UI then hides "Hapus semua" and
- * swipe-to-delete instead of offering an action that always fails.
- * TODO(backend): set to true once DELETE /notifications/{id} and DELETE /notifications exist.
- */
-export const NOTIFICATION_DELETE_SUPPORTED = USE_MOCK;
+/** Deleting one ("Hapus", swipe) and "Hapus semua" work in both modes (backend: DELETE /notifications). */
+export const NOTIFICATION_DELETE_SUPPORTED = true;
 
 /** Set to true to test the optimistic-delete rollback against the mock. */
 const MOCK_FAIL_DELETES = false;
@@ -125,12 +123,14 @@ export function fetchNotificationPage({
 }
 
 /**
- * Permanently deletes one notification.
- * TODO(backend): DELETE /notifications/{id} -> 204. Treat 404 as success (already gone).
- * Deletes only the caller's row, never other caregivers' copies of a shared incident.
+ * Permanently deletes one notification. Backend: DELETE /notifications/{id} -> 204 (404 = already
+ * gone, counts as success). Deletes only the caller's row, never other caregivers' copies.
  */
 export async function deleteNotification(id: string): Promise<void> {
-  if (!NOTIFICATION_DELETE_SUPPORTED) throw new Error('Deleting notifications is not supported by the backend yet');
+  if (!USE_MOCK) {
+    await deleteBackendNotification(id);
+    return;
+  }
   await mockDelay();
   if (MOCK_FAIL_DELETES) throw new Error('mock delete failure');
   setMockNotifications(getMockNotifications().filter((n) => n.id !== id));
@@ -138,12 +138,11 @@ export async function deleteNotification(id: string): Promise<void> {
 
 /**
  * Permanently deletes every notification up to and including `upTo` (the newest one the user saw
- * when confirming), so anything that arrives after the confirmation survives.
- * TODO(backend): DELETE /notifications?tab=ALL&up_to_created_at=<ISO8601>&up_to_id=<uuid>
- *   -> 200 {"deleted": number}; only rows with (created_at, id) <= (up_to_created_at, up_to_id).
+ * when confirming), so anything that arrives after the confirmation survives. Backend:
+ * DELETE /notifications?up_to_created_at=<ISO8601>&up_to_id=<uuid> -> 200 {"deleted": number}.
  */
 export async function clearNotifications(upTo: FeedPosition): Promise<{ deleted: number }> {
-  if (!NOTIFICATION_DELETE_SUPPORTED) throw new Error('Deleting notifications is not supported by the backend yet');
+  if (!USE_MOCK) return clearBackendNotifications(upTo);
   await mockDelay();
   if (MOCK_FAIL_DELETES) throw new Error('mock clear failure');
   const before = getMockNotifications();

@@ -21,7 +21,12 @@ def _settings(**overrides: object) -> Settings:
 async def _backdate(db: asyncpg.Connection, device_id: str, days: int = 3) -> None:
     """Pretend the device was paired and the schedule created `days` ago."""
     did = uuid.UUID(device_id)
-    await db.execute("UPDATE schedules SET created_at = now() - make_interval(days => $2) WHERE device_id = $1", did, days)
+    await db.execute(
+        "UPDATE schedules SET created_at = now() - make_interval(days => $2), effective_from = now() - make_interval(days => $2) "
+        "WHERE device_id = $1",
+        did,
+        days,
+    )
     await db.execute("UPDATE devices SET paired_at = now() - make_interval(days => $2) WHERE id = $1", did, days)
 
 
@@ -120,3 +125,61 @@ async def test_late_evidence_upgrades_missed_and_resolves_alert(
         db, "SELECT count(*) FROM notifications WHERE telemetry_log_id = $1 AND type = 'DOSE_MISSED' AND NOT is_resolved",
         row["id"],
     ) == 0
+
+
+async def test_rules_engine_follows_a_device_clock_moved_ahead(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    """The emulator's lab clock is 3 h ahead: a dose due in 2 h (real time) is already
+    past its deadline on the pillbox, so it is missed by the pillbox's clock."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    jakarta = ZoneInfo("Asia/Jakarta")
+    due = (datetime.now(jakarta) + timedelta(hours=2)).strftime("%H:%M")
+    await create_schedule(client, owner, device, start=due, end=due, tolerance=15)
+    await _backdate(db, device.id)
+    device_clock = datetime.now(jakarta).replace(tzinfo=None) + timedelta(hours=3)  # naive, like the emulator
+    res = await client.post(
+        f"/api/v1/devices/{device.code}/heartbeat",
+        json={"battery_percent": 90, "rtc_time": device_clock.isoformat(), "rtc_speed": 1.0},
+        headers=device.device_headers,
+    )
+    assert res.status_code == 200, res.text
+    await _set_online(db, device.id, datetime.now(UTC) - timedelta(hours=1))
+    missed_sql = "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED' AND scheduled_for > now()"
+
+    await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0, follow_device_clock=False))
+    assert await _count(db, missed_sql) == 0  # server clock: not even due yet
+
+    await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0))
+    assert await _count(db, missed_sql) == 1
+
+    status = (await client.get(f"/api/v1/devices/{device.id}/status", headers=owner.headers)).json()
+    shown = datetime.fromisoformat(status["device_time"]).astimezone(jakarta).replace(tzinfo=None)
+    assert abs((shown - device_clock).total_seconds()) < 60
+    assert status["clock_speed"] == 1.0 and status["follow_device_clock"] is True
+
+
+async def test_editing_an_old_slot_does_not_back_fill_yesterday(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    """An old, inactive slot is moved to a time later today: yesterday's dose at that time never
+    existed, so it must not be created (and at once reported missed)."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, slot=2, start="08:00", end="08:00", tolerance=30)
+    await _backdate(db, device.id, days=10)
+    await db.execute("UPDATE schedules SET is_active = false WHERE device_id = $1", uuid.UUID(device.id))
+    await _set_online(db, device.id, datetime.now(UTC) - timedelta(days=1))
+
+    later_today = (datetime.now(ZoneInfo("Asia/Jakarta")) + timedelta(minutes=40)).strftime("%H:%M")
+    res = await client.put(
+        f"/api/v1/devices/{device.id}/schedules",
+        json={"slots": [{"slot_number": 2, "window_start": later_today, "window_end": later_today, "active": True}]},
+        headers=owner.headers,
+    )
+    assert res.status_code == 200, res.text
+
+    await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0))
+    assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status IS NOT NULL") == 0
+    assert await _count(db, "SELECT count(*) FROM notifications WHERE type = 'DOSE_MISSED'") == 0

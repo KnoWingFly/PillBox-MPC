@@ -1,16 +1,16 @@
-"""Caregiver notification center: list/filter, detail, read, resolve."""
+"""Caregiver notification center: list/filter, detail, read, resolve, delete."""
 
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import Select, and_, func, select, update
+from sqlalchemy import Select, and_, delete, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.errors import conflict, not_found
 from app.models import Device, Elderly, Notification, TelemetryLog, User
-from app.models.enums import NotificationType, Severity
+from app.models.enums import DoseStatus, NotificationType, Severity
 from app.schemas.notifications import (
     NotificationDetail,
     NotificationItem,
@@ -18,6 +18,7 @@ from app.schemas.notifications import (
     ReadOut,
     ResolveOut,
 )
+from app.services.late_dose import CONFIRM_TAKEN, LATE_RELEASE
 
 Tab = Literal["ALL", "LATE_MISSED", "RESOLVED"]
 _LATE_MISSED = [NotificationType.DOSE_LATE.value, NotificationType.DOSE_MISSED.value]
@@ -32,6 +33,7 @@ def _base() -> Select[Any]:
             Device.device_nickname,
             TelemetryLog.slot_number,
             TelemetryLog.delay_minutes,
+            TelemetryLog.status,
         )
         .outerjoin(Elderly, Elderly.id == Notification.elderly_id)
         .outerjoin(Device, Device.id == Notification.device_id)
@@ -46,6 +48,7 @@ def _item(
     device: str | None,
     slot: int | None,
     delay: int | None,
+    dose_status: str | None,
 ) -> NotificationItem:
     return NotificationItem(
         id=n.id,
@@ -61,7 +64,19 @@ def _item(
         is_read=n.is_read,
         is_resolved=n.is_resolved,
         created_at=n.created_at,
+        actions=actions_for(n, dose_status),
     )
+
+
+def actions_for(n: Notification, dose_status: str | None) -> list[str]:
+    """See services/late_dose.py. The cutoff is checked when the action is used."""
+    if n.is_resolved or dose_status != DoseStatus.MISSED:
+        return []
+    if n.type == NotificationType.DOSE_MISSED:
+        return [LATE_RELEASE, CONFIRM_TAKEN]
+    if n.type == NotificationType.UNSCHEDULED_OPEN:
+        return [CONFIRM_TAKEN]  # forced open linked to a missed dose
+    return []
 
 
 async def list_feed(
@@ -84,7 +99,12 @@ async def list_feed(
     )
     total, unread = counts.one()
     rows = await session.execute(
-        _base().where(*conditions).order_by(Notification.created_at.desc()).offset(offset).limit(limit)
+        # id breaks ties like the app's feed order (Mobile/lib/feed.ts compareFeed).
+        _base()
+        .where(*conditions)
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+        .offset(offset)
+        .limit(limit)
     )
     return [_item(*row) for row in rows.all()], total, unread
 
@@ -108,8 +128,8 @@ async def detail(session: AsyncSession, user: User, notification_id: UUID) -> No
     ).first()
     if row is None:
         raise not_found(message="Notification not found")
-    n, nickname, full_name, device, slot, delay, resolver_name = row
-    item = _item(n, nickname, full_name, device, slot, delay)
+    n, nickname, full_name, device, slot, delay, dose_status, resolver_name = row
+    item = _item(n, nickname, full_name, device, slot, delay, dose_status)
     return NotificationDetail(
         **item.model_dump(),
         related_dose_log_id=n.telemetry_log_id,
@@ -156,3 +176,33 @@ async def resolve(session: AsyncSession, user: User, notification_id: UUID, note
     return ResolveOut(
         id=n.id, is_resolved=True, resolved_at=now, resolved_by_caregiver_name=user.full_name, note=note
     )
+
+
+async def delete_one(session: AsyncSession, user: User, notification_id: UUID) -> None:
+    """Deletes the caller's own copy only; other caregivers keep theirs of a shared incident."""
+    result = await session.execute(
+        delete(Notification)
+        .where(Notification.id == notification_id, Notification.user_id == user.id)
+        .returning(Notification.id)
+    )
+    if result.first() is None:
+        raise not_found(message="Notification not found")
+    await session.commit()
+
+
+async def delete_up_to(session: AsyncSession, user: User, up_to_created_at: datetime, up_to_id: UUID) -> int:
+    """ "Hapus semua": deletes the caller's notifications at or older than the newest one they saw
+    when confirming, so anything that arrived afterwards survives. Feed order is (created_at, id)
+    descending; created_at is compared to the millisecond because that is what the app holds."""
+    created_ms = func.date_trunc("milliseconds", Notification.created_at)
+    result = await session.execute(
+        delete(Notification)
+        .where(
+            Notification.user_id == user.id,
+            tuple_(created_ms, Notification.id) <= tuple_(up_to_created_at, up_to_id),
+        )
+        .returning(Notification.id)
+    )
+    deleted = len(result.all())
+    await session.commit()
+    return deleted

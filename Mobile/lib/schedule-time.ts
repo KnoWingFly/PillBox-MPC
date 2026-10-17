@@ -33,22 +33,45 @@ export function parseTimeInput(text: string): TimeParseResult {
   return { ok: true, minutes: hours * 60 + minutes };
 }
 
+/** Why two enabled slots cannot both ring: the same minute, or one's dose window (time +
+ * tolerance, while it may stay popped up) running into the other's. The pillbox opens one chamber at
+ * a time, so the later dose would wait in a queue and could be missed. `gapMinutes` is what the
+ * earlier slot needs before the next may start (its tolerance). */
+export type SlotConflict = { other: SlotId; kind: 'same_time' | 'too_close'; gapMinutes: number };
+
 /**
- * Another enabled slot of the same pillbox at exactly this minute, or null. Mirrors the backend's
- * WINDOW_OVERLAP rule for zero-length windows (Backend/app/services/schedules.py find_conflicts).
+ * The first enabled slot that conflicts with `slotId` at `minutes` with `toleranceMinutes`, or null.
+ * Mirrors the backend rule (Backend/app/services/schedules.py find_conflicts, SCHEDULE_TOO_CLOSE),
+ * including dose windows that run past midnight.
  */
-export function findDuplicateSlot(slots: Slot[], slotId: SlotId, minutes: number): SlotId | null {
-  const other = slots.find((s) => s.id !== slotId && s.enabled && s.timeMinutes === minutes);
-  return other?.id ?? null;
+export function findSlotConflict(
+  slots: Slot[],
+  slotId: SlotId,
+  minutes: number,
+  toleranceMinutes: number,
+): SlotConflict | null {
+  for (const other of slots) {
+    if (other.id === slotId || !other.enabled || other.timeMinutes === null) continue;
+    if (other.timeMinutes === minutes) return { other: other.id, kind: 'same_time', gapMinutes: 0 };
+    for (const shift of [-MINUTES_PER_DAY, 0, MINUTES_PER_DAY]) {
+      const otherStart = other.timeMinutes + shift;
+      const overlaps = minutes < otherStart + other.toleranceMinutes && otherStart < minutes + toleranceMinutes;
+      if (overlaps) {
+        const gapMinutes = minutes < otherStart ? toleranceMinutes : other.toleranceMinutes;
+        return { other: other.id, kind: 'too_close', gapMinutes };
+      }
+    }
+  }
+  return null;
 }
 
-/** Every enabled slot whose time is also used by another enabled slot, mapped to that other slot. */
-export function findAllDuplicates(slots: Slot[]): Map<SlotId, SlotId> {
-  const conflicts = new Map<SlotId, SlotId>();
+/** Every enabled slot that conflicts with another enabled slot, with the conflict. */
+export function findAllConflicts(slots: Slot[]): Map<SlotId, SlotConflict> {
+  const conflicts = new Map<SlotId, SlotConflict>();
   for (const slot of slots) {
     if (!slot.enabled || slot.timeMinutes === null) continue;
-    const other = findDuplicateSlot(slots, slot.id, slot.timeMinutes);
-    if (other) conflicts.set(slot.id, other);
+    const conflict = findSlotConflict(slots, slot.id, slot.timeMinutes, slot.toleranceMinutes);
+    if (conflict) conflicts.set(slot.id, conflict);
   }
   return conflicts;
 }

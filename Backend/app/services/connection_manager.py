@@ -33,6 +33,7 @@ class DeviceCommand(StrEnum):
     SCHEDULE_UPDATED = "schedule_updated"
     TIME_SYNC = "time_sync"
     REFILL_MODE = "refill_mode"
+    RELEASE_SLOT = "release_slot"
 
 
 class CommandError(Exception):

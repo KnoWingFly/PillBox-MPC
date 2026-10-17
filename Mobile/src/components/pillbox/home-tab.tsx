@@ -232,6 +232,7 @@ function RecentNotifications({
 
 export function HomeTab({
   now,
+  pillboxNow,
   device,
   deviceLoadError,
   onRetryDevice,
@@ -243,6 +244,8 @@ export function HomeTab({
   onOpenTab,
 }: {
   now: number;
+  /** Time on the pillbox clock: the day and the next dose follow it. */
+  pillboxNow: number;
   device: DeviceStatus | null;
   deviceLoadError: boolean;
   onRetryDevice: () => void;
@@ -265,12 +268,12 @@ export function HomeTab({
         />
       }>
       <ScreenHeader
-        eyebrow={formatJakartaDate(now)}
-        title={greeting(now)}
+        eyebrow={formatJakartaDate(pillboxNow)}
+        title={greeting(pillboxNow)}
         subtitle={api.USE_MOCK ? 'Mode uji · data tiruan' : 'Pantau obat lansia dari sini'}
       />
       <AdherenceHero summary={adherence} />
-      <NextDoseCard slots={savedSlots} now={now} onOpen={() => onOpenTab('schedule')} />
+      <NextDoseCard slots={savedSlots} now={pillboxNow} onOpen={() => onOpenTab('schedule')} />
       <DeviceSummary
         device={device}
         now={now}

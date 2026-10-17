@@ -5,7 +5,7 @@ import * as api from '@root/lib/api';
 import { formatJakartaTimestamp } from '@root/lib/schedule-time';
 import { SLOT_IDS, type DeviceStatus, type DoseEventType, type Slot, type SlotId } from '@root/lib/types';
 
-import { deviceLook, formatRelative, isSlotActive, LOW_BATTERY_PERCENT } from './helpers';
+import { deviceLook, formatRelative, isSlotActive, LOW_BATTERY_PERCENT, pillboxClockNote, pillboxNow } from './helpers';
 import { Button, Card, Chip, Divider, IconBadge, InfoRow, LoadErrorBox, ScreenHeader, StatusPill } from './ui';
 
 function ConnectionCard({
@@ -37,6 +37,8 @@ function ConnectionCard({
   const look = deviceLook(device, now);
   const lowBattery = device.batteryPercent <= LOW_BATTERY_PERCENT;
   const lastSync = `${formatJakartaTimestamp(device.lastSyncedAt, now)} WIB · ${formatRelative(device.lastSyncedAt, now)}`;
+  const clockNote = pillboxClockNote(device, now);
+  const pillboxTime = `${formatJakartaTimestamp(pillboxNow(device, now), now)} WIB${clockNote ? ` · ${clockNote}` : ''}`;
 
   return (
     <Card>
@@ -55,6 +57,9 @@ function ConnectionCard({
       <Divider />
       <View>
         <InfoRow icon="sync-outline" label="Sinkron" value={lastSync} valueClassName={look.tone === 'late' ? 'text-late-fg' : 'text-ink'} />
+        {device.clock && (
+          <InfoRow icon="time-outline" label="Jam Pillbox" value={pillboxTime} valueClassName={clockNote ? 'text-late-fg' : 'text-ink'} />
+        )}
         <InfoRow
           icon={lowBattery ? 'battery-dead-outline' : 'battery-half-outline'}
           label="Baterai"

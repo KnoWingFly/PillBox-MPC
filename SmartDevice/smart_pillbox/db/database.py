@@ -4,7 +4,9 @@ core/scheduler and tests never need a running PySide6 app to exercise it.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 import json
@@ -30,6 +32,19 @@ _DEFAULT_SCHEDULE = [
 ]
 
 
+def _locked(method):
+    """Runs the method while holding the connection lock. The GUI thread and the sync worker share
+    one connection; sqlite3 allows that (check_same_thread=False) but not using it at the same
+    moment, which fails with "InterfaceError: bad parameter or other API misuse"."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _event_types(schema_sql: str) -> list[str]:
     """The event types allowed by the events CHECK constraint in schema.sql."""
     code = "\n".join(line.split("--")[0] for line in schema_sql.splitlines())  # drop SQL comments first
@@ -42,6 +57,7 @@ class Database:
         self.db_path = str(db_path or config.DB_PATH)
         # check_same_thread=False: QTimer callbacks and any future sync
         # thread all share this single connection in the MVP.
+        self._lock = threading.RLock()  # see _locked
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -122,6 +138,7 @@ class Database:
         self._conn.commit()
 
     # -- compartments ----------------------------------------------------------
+    @_locked
     def get_compartments(self) -> list[Compartment]:
         rows = self._conn.execute(
             "SELECT * FROM compartments ORDER BY slot_number"
@@ -150,6 +167,7 @@ class Database:
             )
         return result
 
+    @_locked
     def update_stock(self, slot_number: int, delta: int) -> int:
         """Atomically increment or decrement stock_count for a slot, bounded between 0 and 30."""
         row = self._conn.execute(
@@ -166,6 +184,7 @@ class Database:
         self._conn.commit()
         return new_stock
 
+    @_locked
     def set_stock(self, slot_number: int, count: int) -> int:
         """Set stock_count directly, bounded between 0 and 30."""
         new_stock = max(0, min(30, count))
@@ -176,6 +195,7 @@ class Database:
         self._conn.commit()
         return new_stock
 
+    @_locked
     def update_schedules(self, schedules: list[dict]) -> None:
         self._conn.execute("UPDATE compartments SET is_active = 0")
         for s in schedules:
@@ -196,6 +216,7 @@ class Database:
         self._conn.commit()
 
     # -- events / telemetry buffer ----------------------------------------------
+    @_locked
     def log_event(self, compartment_id: int, slot_number: int, event_type: str, occurred_at: datetime, chime_count: int = 0) -> int:
         event_id = str(uuid.uuid4())
         cur = self._conn.execute(
@@ -205,6 +226,7 @@ class Database:
         self._conn.commit()
         return cur.lastrowid
 
+    @_locked
     def get_events_for_compartment_since(
         self, compartment_id: int, since: datetime
     ) -> list[sqlite3.Row]:
@@ -213,11 +235,22 @@ class Database:
             (compartment_id, since.isoformat()),
         ).fetchall()
 
+    @_locked
+    def get_events_between(self, start: datetime, end: datetime) -> list[sqlite3.Row]:
+        """Events with start <= occurred_at <= end, oldest first (timestamps are naive local ISO
+        strings, which sort chronologically)."""
+        return self._conn.execute(
+            "SELECT * FROM events WHERE occurred_at >= ? AND occurred_at <= ? ORDER BY occurred_at",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+    @_locked
     def get_unsynced_events(self) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM events WHERE synced = 0 ORDER BY occurred_at"
         ).fetchall()
 
+    @_locked
     def mark_synced(self, db_ids: list[int]) -> None:
         if not db_ids:
             return
@@ -228,10 +261,12 @@ class Database:
         self._conn.commit()
 
     # -- device state -----------------------------------------------------------
+    @_locked
     def get_device_state(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM device_state WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
+    @_locked
     def update_device_state(self, key: str, value: str) -> None:
         self._conn.execute(
             "INSERT INTO device_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -239,5 +274,6 @@ class Database:
         )
         self._conn.commit()
 
+    @_locked
     def close(self) -> None:
         self._conn.close()
