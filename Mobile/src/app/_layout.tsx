@@ -2,8 +2,10 @@ import { SplashScreen, Stack } from 'expo-router';
 import AuthProvider from '@root/context/auth-context';
 import { useAuth } from '@/hooks/use-auth';
 import '@root/global.css';
+import { perfLoginStep } from '@/lib/perf';
 
 SplashScreen.preventAutoHideAsync();
+perfLoginStep('app_start');
 
 // Keeps the native splash visible until the stored session has been restored.
 function SplashScreenController() {

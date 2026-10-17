@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -22,7 +23,8 @@ from app.api.routes import (
 from app.core.config import get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging, request_id_var
-from app.db.session import get_engine, get_sessionmaker
+from app.core.timing import correlation_id_var
+from app.db.session import get_engine, get_sessionmaker, warm_pool
 from app.services.background import start_background_tasks, stop_background_tasks
 
 settings = get_settings()  # only used to configure the app object itself
@@ -32,6 +34,7 @@ logger = logging.getLogger("app")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    await warm_pool()
     tasks = start_background_tasks(get_sessionmaker(), settings) if settings.enable_background_tasks else []
     logger.info("startup", extra={"background_tasks": len(tasks), "auth_mode": settings.auth_mode})
     try:
@@ -56,18 +59,22 @@ app.add_middleware(
 @app.middleware("http")
 async def request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    correlation_id = _safe_correlation_id(request.headers.get("x-correlation-id")) or request_id
     token = request_id_var.set(request_id)
+    correlation_token = correlation_id_var.set(correlation_id)
     started = time.perf_counter()
     try:
         response = await call_next(request)
     finally:
         request_id_var.reset(token)
+        correlation_id_var.reset(correlation_token)
     response.headers["X-Request-ID"] = request_id
     # Path only: query strings and headers (device keys, tokens) are never logged.
     logger.info(
         "http_request",
         extra={
             "request_id": request_id,
+            "correlation_id": correlation_id,
             "method": request.method,
             "path": request.url.path,
             "status": response.status_code,
@@ -75,6 +82,14 @@ async def request_logging(request: Request, call_next: Callable[[Request], Await
         },
     )
     return response
+
+
+_CORRELATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+def _safe_correlation_id(value: str | None) -> str | None:
+    """Client-supplied ids end up in logs, so only short opaque tokens are kept."""
+    return value if value and _CORRELATION_ID.match(value) else None
 
 
 app.include_router(health.router)

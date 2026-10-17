@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import threading
 import uuid
 from datetime import datetime
 
@@ -28,6 +29,18 @@ logger = logging.getLogger(__name__)
 
 # Backend accepts at most 500 events per telemetry batch.
 FLUSH_CHUNK_SIZE = 200
+
+
+_local = threading.local()
+
+
+def _http() -> requests.Session:
+    """One keep-alive session per thread (requests.Session is not thread-safe), so
+    each sync reuses its TCP connection instead of opening one per request."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = _local.session = requests.Session()
+    return session
 
 
 class RegistrationError(Exception):
@@ -72,7 +85,7 @@ def _pending_identity(db: Database) -> tuple[str, str]:
 
 def _server_accepts(code: str, secret: str) -> bool:
     try:
-        response = requests.get(
+        response = _http().get(
             f"{config.BACKEND_BASE_URL}/devices/{code}/config",
             headers={"X-Device-Key": secret},
             timeout=config.REGISTER_HTTP_TIMEOUT_SECONDS,
@@ -87,7 +100,7 @@ def register_device(db: Database, provisioning_token: str) -> str:
     its device_code + secret locally. Returns the device_code."""
     code, secret = _pending_identity(db)
     try:
-        response = requests.post(
+        response = _http().post(
             f"{config.BACKEND_BASE_URL}/admin/devices",
             json={"device_code": code, "device_secret": secret},
             headers={"X-Provisioning-Token": provisioning_token},
@@ -134,9 +147,10 @@ def _auth(db: Database) -> tuple[str, dict[str, str]] | None:
 
 # --- telemetry ------------------------------------------------------------------
 
-def flush_pending_events(db: Database) -> int:
+def flush_pending_events(db: Database, offline_flush: bool = False) -> int:
     """Sends unsynced events (oldest first, in chunks). Returns how many were
-    synced (0 if not registered or the backend is unreachable)."""
+    synced (0 if not registered or the backend is unreachable). offline_flush
+    marks the batches sent right after Wi-Fi returns (contract §2.4, §5.3)."""
     auth = _auth(db)
     if auth is None:
         return 0
@@ -148,6 +162,7 @@ def flush_pending_events(db: Database) -> int:
             return synced
         payload = {
             "batch_id": str(uuid.uuid4()),
+            "is_offline_flush": offline_flush,
             "events": [
                 {
                     "event_id": row["event_id"],
@@ -161,7 +176,7 @@ def flush_pending_events(db: Database) -> int:
             ],
         }
         try:
-            response = requests.post(
+            response = _http().post(
                 f"{config.BACKEND_BASE_URL}/devices/{code}/telemetry",
                 json=payload,
                 headers=headers,
@@ -212,7 +227,7 @@ def send_heartbeat(db: Database, current_time_str: str, battery_percent: int, is
     }
 
     try:
-        response = requests.post(
+        response = _http().post(
             f"{config.BACKEND_BASE_URL}/devices/{code}/heartbeat",
             json=payload,
             headers=headers,
@@ -242,7 +257,7 @@ def pull_latest_config(db: Database) -> None:
     code, headers = auth
     try:
         current_version = int(db.get_device_state("config_version") or "1")
-        response = requests.get(
+        response = _http().get(
             f"{config.BACKEND_BASE_URL}/devices/{code}/config?since_version={current_version}",
             headers=headers,
             timeout=config.SYNC_HTTP_TIMEOUT_SECONDS,
@@ -262,7 +277,7 @@ def pull_latest_config(db: Database) -> None:
                     "config_version": int(new_version),
                     "applied_at": datetime.now().isoformat(),
                 }
-                requests.post(
+                _http().post(
                     f"{config.BACKEND_BASE_URL}/devices/{code}/config-ack",
                     json=ack_payload,
                     headers=headers,

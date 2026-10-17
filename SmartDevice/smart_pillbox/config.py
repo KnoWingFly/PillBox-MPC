@@ -23,8 +23,19 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "db" / "schema.sql"
 
 # --- Backend sync --------------------------------------------------------------
 # Override with PILLCARE_BACKEND_URL (e.g. http://192.168.1.10:8000) when the backend runs elsewhere.
-BACKEND_BASE_URL = os.environ.get("PILLCARE_BACKEND_URL", "http://localhost:8000").rstrip("/") + "/api/v1"
+BACKEND_ROOT_URL = os.environ.get("PILLCARE_BACKEND_URL", "http://localhost:8000").rstrip("/")
+BACKEND_BASE_URL = BACKEND_ROOT_URL + "/api/v1"
+# Periodic heartbeat + retry. Events do not wait for it: logging one schedules a sync after
+# SYNC_DEBOUNCE_MS (so an open + close burst goes out as one batch).
 SYNC_INTERVAL_SECONDS = 15
+SYNC_DEBOUNCE_MS = 300
+# Command channel (docs/DEVICE_CONTRACT.md §3); reconnects with capped exponential backoff.
+WS_RECONNECT_MIN_MS = 1_000
+WS_RECONNECT_MAX_MS = 30_000
+
+
+def device_ws_url(device_code: str) -> str:
+    return BACKEND_ROOT_URL.replace("http", "ws", 1) + f"/ws/device/{device_code}"
 # Requests run in a worker thread, so generous timeouts never freeze the GUI. A remote
 # database (e.g. Supabase in another region, ~400 ms per round-trip) makes one heartbeat
 # take several seconds; a short timeout would drop responses the server already handled.

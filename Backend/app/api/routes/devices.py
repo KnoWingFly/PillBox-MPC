@@ -47,8 +47,8 @@ async def pairing_scan(body: PairingScanIn, _: CurrentUser, db: DbSession) -> Pa
 
 
 @router.post("", response_model=PairDeviceOut, status_code=status.HTTP_201_CREATED)
-async def pair_device(body: PairDeviceIn, user: CurrentUser, db: DbSession) -> PairDeviceOut:
-    return await svc.pair(db, user, body, datetime.now(UTC))
+async def pair_device(body: PairDeviceIn, user: CurrentUser, db: DbSession, settings: SettingsDep) -> PairDeviceOut:
+    return await svc.pair(db, user, body, settings, datetime.now(UTC))
 
 
 @router.get("", response_model=DeviceList)

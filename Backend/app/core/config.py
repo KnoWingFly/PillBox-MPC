@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # NullPool opens a fresh connection per session. Used by the test suite so
     # pooled asyncpg connections never cross event loops.
     db_use_null_pool: bool = False
+    # pre_ping costs THREE extra DB round trips on EVERY session checkout
+    # (each request and each background pass): SQLAlchemy's asyncpg dialect
+    # pings with BEGIN, "SELECT ;", ROLLBACK. On a remote database that is
+    # the single largest fixed cost. Turning it off is safe only together with a
+    # recycle age shorter than the pooler's idle timeout.
+    db_pool_pre_ping: bool = True
+    # Seconds after which a pooled connection is replaced on checkout; -1 = never.
+    db_pool_recycle_seconds: int = -1
 
     cors_origins: list[str] = ["http://localhost:8081"]
 
@@ -86,6 +94,12 @@ class Settings(BaseSettings):
 
     # --- Thresholds -----------------------------------------------------
     low_battery_threshold_percent: int = 20
+    # Battery must climb this far above the threshold before a new
+    # LOW_BATTERY notification can fire (prevents flapping around 20%).
+    low_battery_hysteresis_percent: int = 5
+    # wifi_rssi_dbm >= strong -> "KUAT", >= medium -> "SEDANG", else "LEMAH".
+    wifi_rssi_strong_dbm: int = -60
+    wifi_rssi_medium_dbm: int = -75
     low_stock_threshold_units: int = 3
     stock_capacity_per_slot: int = 30
     clock_drift_tolerance_seconds: int = 60
@@ -95,9 +109,17 @@ class Settings(BaseSettings):
     pin_max_attempts: int = 5
     pin_lockout_seconds: int = 300
 
+    # Used when pairing a device and neither the request nor the caregiver
+    # profile has a valid IANA timezone.
+    default_device_timezone: str = "Asia/Jakarta"
+
     enable_background_tasks: bool = True
     default_page_limit: int = 20
     max_page_limit: int = 100
+
+    # Structured "perf_timing" log lines with durations (core/timing.py).
+    # Off by default; when off the instrumentation is a single bool check.
+    perf_timing_logs: bool = False
 
     @field_validator("supabase_url")
     @classmethod

@@ -22,12 +22,14 @@ import logging
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import event, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session, SessionTransaction
 
 from app.core.config import Settings
 from app.models import Device, Elderly, Notification
 from app.models.enums import Connectivity, NotificationType, Severity
+from app.services.app_hub import queue_device_change
 from app.services.notifications import NotificationSpec, load_recipients, notify, ts_key
 from app.services.timeutil import zone
 
@@ -46,15 +48,33 @@ def offline_event_key(device_id: UUID, offline_since: datetime) -> str:
     return f"DEVICE_OFFLINE:{device_id}:{ts_key(offline_since)}"
 
 
+_LOCKED_DEVICE_KEY = "locked_device_id"
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _forget_row_lock(session: Session, transaction: SessionTransaction) -> None:
+    # The row lock ends with the outermost transaction.
+    if transaction.parent is None:
+        session.info.pop(_LOCKED_DEVICE_KEY, None)
+
+
+def mark_row_locked(session: AsyncSession, device: Device) -> None:
+    """Records that `device` was loaded FOR UPDATE in the current transaction."""
+    session.info[_LOCKED_DEVICE_KEY] = device.id
+
+
 async def mark_seen(session: AsyncSession, device: Device, now: datetime) -> bool:
     """Records a liveness signal. Returns True on an OFFLINE -> ONLINE transition.
-    Locks the device row; does not commit."""
-    await session.refresh(device, with_for_update=True)
+    Locks the device row (unless this transaction already did); does not commit."""
+    if session.info.get(_LOCKED_DEVICE_KEY) != device.id:
+        await session.refresh(device, with_for_update=True)
+        mark_row_locked(session, device)
     device.last_heartbeat = now
     if device.status == Connectivity.ONLINE:
         return False
 
     previous_offline_since = device.offline_since
+    queue_device_change(session, device.elderly_id, device.id)
     device.status = Connectivity.ONLINE.value
     device.online_since = now
     device.offline_since = None
@@ -92,13 +112,14 @@ async def mark_offline(session: AsyncSession, device_id: UUID, offline_since: da
         update(Device)
         .where(Device.id == device_id, Device.status == Connectivity.ONLINE.value)
         .values(status=Connectivity.OFFLINE.value, offline_since=offline_since, online_since=None)
-        .returning(Device.id)
+        .returning(Device.elderly_id)
         .execution_options(synchronize_session=False)
     )
-    flipped = result.scalar_one_or_none() is not None
-    if flipped:
+    row = result.one_or_none()
+    if row is not None:
         logger.info("device_offline", extra={"device_id": str(device_id), "reason": reason})
-    return flipped
+        queue_device_change(session, row.elderly_id, device_id)
+    return row is not None
 
 
 async def sweep(session: AsyncSession, now: datetime, settings: Settings) -> None:
@@ -113,11 +134,12 @@ async def sweep(session: AsyncSession, now: datetime, settings: Settings) -> Non
         )
         # offline_since = last real signal, not the moment we noticed.
         .values(status=Connectivity.OFFLINE.value, offline_since=Device.last_heartbeat, online_since=None)
-        .returning(Device.id)
+        .returning(Device.id, Device.elderly_id)
         .execution_options(synchronize_session=False)
     )
-    for device_id in timed_out.scalars().all():
+    for device_id, elderly_id in timed_out.all():
         logger.info("device_offline", extra={"device_id": str(device_id), "reason": "heartbeat_timeout"})
+        queue_device_change(session, elderly_id, device_id)
 
     global_grace = timedelta(seconds=settings.device_offline_notify_grace_seconds)
     candidates = await session.execute(

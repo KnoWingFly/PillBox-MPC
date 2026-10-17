@@ -190,7 +190,7 @@ Auth failure closes the socket with code **4401**. A newer connection for the sa
 
 **Server → device on connect:**
 ```json
-{"type": "welcome", "server_time": "…", "heartbeat_interval_seconds": 15, "latest_config_version": 4}
+{"type": "welcome", "server_time": "…", "timezone": "Asia/Jakarta", "heartbeat_interval_seconds": 15, "latest_config_version": 4}
 ```
 
 **Device → server heartbeat** (same body as REST 2.1 plus `type`). Send it every `heartbeat_interval_seconds`:

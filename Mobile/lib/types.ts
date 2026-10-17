@@ -24,6 +24,8 @@ export interface DeviceStatus {
   wifiLabel: string;
   /** Epoch milliseconds of the last successful sync. */
   lastSyncedAt: number;
+  /** Compartments whose door the pillbox last reported as open. */
+  openSlots: SlotId[];
 }
 
 export type NotificationType = 'on_time' | 'late' | 'missed' | 'system';

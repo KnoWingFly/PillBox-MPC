@@ -27,6 +27,7 @@ from app.schemas.stock import (
     StockAfter,
     StockOut,
 )
+from app.services import stock_cache
 from app.services.access import get_device_for_user
 from app.services.connection_manager import DeviceCommand, connection_manager
 from app.services.device_management import bump_config
@@ -106,6 +107,7 @@ async def record_refill(
                 set_={"remaining_units": value, "updated_at": now},
             )
         )
+    stock_cache.forget(device.id)  # the next heartbeat must write its counts again
     was_refill_mode = device.is_refill_mode
     device.is_refill_mode = False  # API List: recording a refill ends refill mode
     if was_refill_mode:

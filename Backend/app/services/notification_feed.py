@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -75,14 +75,14 @@ async def list_feed(
         conditions += [Notification.type.in_(_LATE_MISSED), Notification.is_resolved.is_(False)]
     elif tab == "RESOLVED":
         conditions.append(Notification.is_resolved.is_(True))
-    total = (await session.execute(select(func.count()).select_from(Notification).where(*conditions))).scalar_one()
-    unread = (
-        await session.execute(
-            select(func.count()).select_from(Notification).where(
-                Notification.user_id == user.id, Notification.is_read.is_(False)
-            )
-        )
-    ).scalar_one()
+    # Both counts in one round trip (the app polls this endpoint).
+    counts = await session.execute(
+        select(
+            func.count().filter(and_(*conditions)),
+            func.count().filter(Notification.is_read.is_(False)),
+        ).where(Notification.user_id == user.id)
+    )
+    total, unread = counts.one()
     rows = await session.execute(
         _base().where(*conditions).order_by(Notification.created_at.desc()).offset(offset).limit(limit)
     )

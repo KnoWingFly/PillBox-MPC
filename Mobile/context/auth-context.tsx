@@ -5,6 +5,7 @@ import { ApiError, onSessionExpired, type TokenResponse } from '@/lib/api/client
 import { settingApi } from '@/lib/api/setting';
 import { tokenStore } from '@/lib/api/token-store';
 import { getGoogleIdToken, googleSignOut } from '@/lib/google-signin';
+import { perfLoginStep } from '@/lib/perf';
 import { registerPushToken, unregisterPushToken } from '@/lib/push-token';
 import { getSupabase } from '@root/utils/supabase';
 
@@ -48,14 +49,20 @@ export default function AuthProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      perfLoginStep('session_restore_started');
       try {
-        if (!(await tokenStore.getRefreshToken())) return markSignedOut();
+        if (!(await tokenStore.getRefreshToken())) {
+          perfLoginStep('session_restored', { result: 'no_session' });
+          return markSignedOut();
+        }
         const setting = await settingApi.get();
         if (cancelled) return;
         setUser({ id: setting.id, full_name: setting.full_name, email: setting.email });
         setStatus('signedIn');
+        perfLoginStep('session_restored', { result: 'signed_in' });
       } catch (err) {
         if (cancelled) return;
+        perfLoginStep('session_restored', { result: 'error', code: err instanceof ApiError ? err.code : 'UNKNOWN' });
         if (err instanceof ApiError && err.code === 'NETWORK_ERROR') setStatus('signedIn');
         else {
           await tokenStore.clear();
@@ -79,7 +86,9 @@ export default function AuthProvider({ children }: PropsWithChildren) {
 
   const signIn = useCallback<AuthContextValue['signIn']>(
     async (email, password) => {
+      perfLoginStep('password_login_sent');
       const res = await authApi.login({ email, password });
+      perfLoginStep('password_login_returned');
       await startSession(res, { id: res.caregiver.id, full_name: res.caregiver.full_name, email });
     },
     [startSession],
@@ -94,17 +103,21 @@ export default function AuthProvider({ children }: PropsWithChildren) {
   );
 
   const signInWithGoogle = useCallback<AuthContextValue['signInWithGoogle']>(async () => {
+    perfLoginStep('google_sign_in_started');
     const idToken = await getGoogleIdToken();
     if (!idToken) return false; // cancelled: silent
+    perfLoginStep('google_sign_in_returned');
 
     const supabase = getSupabase();
     try {
       const { data, error } = await supabase.auth.signInWithIdToken({ provider: 'google', token: idToken });
       if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
+      perfLoginStep('supabase_session_ready');
       const res = await authApi.google({
         supabase_access_token: data.session.access_token,
         timezone: deviceTimezone(),
       });
+      perfLoginStep('google_exchange_returned');
       await startSession(res, res.caregiver);
       return true;
     } finally {

@@ -16,6 +16,8 @@ import {
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { AppConfig } from '@/config';
+import { perfLog, perfLoginStep } from '@/lib/perf';
 import * as api from '@root/lib/api';
 import {
   SLOT_IDS,
@@ -34,8 +36,6 @@ import {
 // ---------------------------------------------------------------------------
 
 const PRIMARY = '#00539B';
-// Placeholder only; replace with the elder's real number once profiles exist.
-const ELDER_PHONE = '+620000000000';
 const TOAST_DURATION_MS = 3000;
 const TIME_STEP_MINUTES = 5;
 const MINUTES_PER_DAY = 24 * 60;
@@ -347,6 +347,10 @@ function ConnectionCard({
         <InfoRow label="Baterai" value={`${device.batteryPercent}%`} />
         <InfoRow label="Wi-Fi" value={device.online ? device.wifiLabel : 'Tidak terhubung'} />
         <InfoRow label="Sinkron terakhir" value={formatRelative(device.lastSyncedAt, now)} />
+        <InfoRow
+          label="Pintu bilik"
+          value={device.openSlots.length ? `Terbuka: ${device.openSlots.join(', ')}` : 'Semua tertutup'}
+        />
       </View>
       {/* With the real backend, connectivity comes from the device itself (emulator Wi-Fi toggle). */}
       {api.USE_MOCK && (
@@ -701,7 +705,9 @@ function SlotEditor({
 
   const shiftTime = (delta: number) => {
     if (slot.timeMinutes === null) {
-      onChange({ timeMinutes: defaultTime });
+      // Giving an empty slot a time creates a schedule, so turn it on too (like the switch does);
+      // otherwise it is saved inactive and the pillbox ignores it.
+      onChange({ timeMinutes: defaultTime, enabled: true });
       return;
     }
     const next = (((slot.timeMinutes + delta) % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
@@ -892,6 +898,7 @@ export default function PillboxTestScreen() {
         setDevice(status);
         setSavedSlots(slots);
         setDraftSlots(slots);
+        perfLoginStep('first_screen_data_loaded');
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -911,6 +918,7 @@ export default function PillboxTestScreen() {
   useEffect(
     () =>
       api.subscribeToNotifications((n) => {
+        perfLog('iot_to_app', 'shown_on_screen', { notification_id: n.id });
         setNotifications((prev) => [n, ...prev]);
         setToast(makeToast(n.slotId ? `${n.title} · ${n.slotId}` : n.title, NOTIFICATION_STYLE[n.type].tone));
         setNow(Date.now());
@@ -918,17 +926,48 @@ export default function PillboxTestScreen() {
     [],
   );
 
-  // Backend mode: online/offline, battery and last sync change on the device side, so poll them.
+  // Backend mode: online/offline, battery and last sync change on the device side. The backend
+  // pushes a hint when they change; the interval is the fallback when the socket is down.
   useEffect(() => {
     if (api.USE_MOCK || needsPairing) return;
-    const timer = setInterval(() => {
+    const refresh = () => {
       api.getDeviceStatus().then(setDevice).catch(() => undefined);
-    }, 10_000);
-    return () => clearInterval(timer);
+    };
+    const timer = setInterval(refresh, AppConfig.deviceStatusPollMs);
+    // Stock changes on the pillbox (refill, a sachet taken) arrive with the same heartbeat as the
+    // status, but are not part of the pushed status: fetch them on each push. Only the stock field
+    // is touched, so unsaved schedule edits survive. One request at a time.
+    let stockInFlight = false;
+    const refreshStock = () => {
+      if (stockInFlight) return;
+      stockInFlight = true;
+      api
+        .getStock()
+        .then((stock) => {
+          const apply = (slots: Slot[]) => slots.map((s) => (stock[s.id] === undefined ? s : { ...s, stock: stock[s.id]! }));
+          setSavedSlots(apply);
+          setDraftSlots(apply);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          stockInFlight = false;
+        });
+    };
+    // Pushed values are applied directly; without them, refetch.
+    const unsubscribe = api.subscribeToDeviceChanges((status) => {
+      if (status) setDevice((prev) => (prev ? { ...prev, ...status } : prev));
+      else refresh();
+      refreshStock();
+    });
+    return () => {
+      clearInterval(timer);
+      unsubscribe();
+    };
   }, [needsPairing]);
 
   const handleConnected = (result: api.ConnectPillboxResult) => {
     showToast(result.joined ? 'Bergabung ke pillbox (mode pemantau)' : 'Pillbox berhasil dihubungkan', 'success');
+    api.resubscribeRealtime();
     setReloadKey((k) => k + 1);
   };
 
@@ -975,7 +1014,7 @@ export default function PillboxTestScreen() {
   const handleCall = async (n: AppNotification) => {
     markRead(n.id);
     try {
-      await Linking.openURL(`tel:${ELDER_PHONE}`);
+      await Linking.openURL(`tel:${AppConfig.elderPhone}`);
     } catch {
       showToast('Tidak dapat membuka aplikasi telepon', 'error');
     }

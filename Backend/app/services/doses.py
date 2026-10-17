@@ -6,6 +6,7 @@ ingestion and the rules engine can both "get or create" it safely.
 """
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -13,10 +14,10 @@ from sqlalchemy import Executable, and_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Elderly, Notification, Schedule, TelemetryLog
+from app.models import Notification, Schedule, TelemetryLog
 from app.models.enums import DoseStatus, NotificationType, Severity
 from app.services.adherence import DoseInstants
-from app.services.notifications import NotificationSpec, notify
+from app.services.notifications import NotificationSpec, load_recipients, notify
 from app.services.slots import slot_layout
 
 _DOSE_KEY_WHERE = and_(TelemetryLog.schedule_id.is_not(None), TelemetryLog.scheduled_for.is_not(None))
@@ -45,28 +46,34 @@ def period_label(slot_number: int) -> dict[str, str]:
     }
 
 
-def dose_insert_stmt(
+def pending_dose_row(
     device_id: UUID,
     elderly_id: UUID | None,
     schedule: Schedule,
     inst: DoseInstants,
     event_type: str,
-) -> Executable:
-    """INSERT ... ON CONFLICT DO NOTHING for a PENDING dose row."""
+) -> dict[str, Any]:
+    """Column values of a PENDING dose row."""
+    return {
+        "device_id": device_id,
+        "elderly_id": elderly_id,
+        "schedule_id": schedule.id,
+        "slot_number": schedule.slot_number,
+        "event_type": event_type,
+        "status": DoseStatus.PENDING.value,
+        "scheduled_date": inst.scheduled_date,
+        "scheduled_for": inst.scheduled_for,
+        "deadline_at": inst.deadline_at,
+        "recorded_at": inst.scheduled_for,
+    }
+
+
+def pending_doses_insert_stmt(rows: list[dict[str, Any]]) -> Executable:
+    """Multi-row INSERT ... ON CONFLICT DO NOTHING RETURNING id for PENDING
+    dose rows (rows from pending_dose_row). Only newly created ids come back."""
     return (
         insert(TelemetryLog)
-        .values(
-            device_id=device_id,
-            elderly_id=elderly_id,
-            schedule_id=schedule.id,
-            slot_number=schedule.slot_number,
-            event_type=event_type,
-            status=DoseStatus.PENDING.value,
-            scheduled_date=inst.scheduled_date,
-            scheduled_for=inst.scheduled_for,
-            deadline_at=inst.deadline_at,
-            recorded_at=inst.scheduled_for,
-        )
+        .values(rows)
         .on_conflict_do_nothing(
             index_elements=[TelemetryLog.schedule_id, TelemetryLog.scheduled_for],
             index_where=_DOSE_KEY_WHERE,
@@ -83,24 +90,22 @@ async def get_or_create_dose(
     inst: DoseInstants,
     event_type: str,
 ) -> TelemetryLog:
-    """Returns the dose row, locked FOR UPDATE for the rest of the transaction."""
-    await session.execute(dose_insert_stmt(device_id, elderly_id, schedule, inst, event_type))
+    """Returns the dose row, locked for the rest of the transaction.
+
+    One round trip: INSERT ... ON CONFLICT DO UPDATE locks and returns the
+    existing row (the no-op SET only exists to make RETURNING yield it),
+    exactly like the former INSERT followed by SELECT ... FOR UPDATE."""
+    row_values = pending_dose_row(device_id, elderly_id, schedule, inst, event_type)
+    stmt = insert(TelemetryLog).values(row_values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[TelemetryLog.schedule_id, TelemetryLog.scheduled_for],
+        index_where=_DOSE_KEY_WHERE,
+        set_={"schedule_id": stmt.excluded.schedule_id},
+    ).returning(TelemetryLog)
     row = await session.execute(
-        select(TelemetryLog)
-        .where(TelemetryLog.schedule_id == schedule.id, TelemetryLog.scheduled_for == inst.scheduled_for)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+        select(TelemetryLog).from_statement(stmt).execution_options(populate_existing=True)
     )
     return row.scalar_one()
-
-
-async def elderly_display_name(session: AsyncSession, elderly_id: UUID) -> str:
-    row = await session.execute(select(Elderly.nickname, Elderly.full_name).where(Elderly.id == elderly_id))
-    found = row.first()
-    if found is None:
-        return "-"
-    nickname, full_name = found
-    return nickname or full_name
 
 
 async def notify_dose(
@@ -113,6 +118,9 @@ async def notify_dose(
         NotificationType.DOSE_LATE: Severity.WARNING,
         NotificationType.DOSE_TAKEN: Severity.INFO,
     }[ntype]
+    recipients = await load_recipients(session, log.elderly_id)
+    if not recipients:
+        return []
     scheduled = log.scheduled_for.astimezone(tz).strftime("%H:%M") if log.scheduled_for else "-"
     return await notify(
         session,
@@ -127,10 +135,13 @@ async def notify_dose(
                 "slot": slot_label(log.slot_number),
                 "period": period_label(log.slot_number),
                 "time": scheduled,
-                "elderly": await elderly_display_name(session, log.elderly_id),
+                "elderly": recipients[0].elderly_name,
                 "delay": log.delay_minutes or 0,
             },
+            slot_number=log.slot_number,
+            delay_minutes=log.delay_minutes,
         ),
+        recipients=recipients,
     )
 
 

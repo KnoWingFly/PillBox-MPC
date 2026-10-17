@@ -60,17 +60,23 @@ def match_dose(
     days_of_week: Iterable[int],
     tz: ZoneInfo,
     early_accept_minutes: int,
+    late_grace: timedelta = timedelta(0),
 ) -> DoseInstants | None:
     """Finds the dose (today or yesterday, local) whose acceptance window
-    [scheduled_for - early, deadline_at] contains occurred_at. Yesterday is
-    checked because deadline_at can cross midnight."""
+    [scheduled_for - early, deadline_at + late_grace] contains occurred_at.
+    Yesterday is checked because deadline_at can cross midnight.
+
+    late_grace exists for ALARM_TIMEOUT: the device counts its tolerance from
+    the moment the chamber popped up (scheduler.py _check_tolerance), which is
+    always at or after scheduled_for (1 s tick, queued chambers), so its
+    timeout lands after deadline_at and would otherwise never match."""
     local_day = occurred_at.astimezone(tz).date()
     days = list(days_of_week)
     for day in (local_day, local_day - timedelta(days=1)):
         if not is_scheduled_on(days, day):
             continue
         inst = dose_instants(day, window_start, window_end, tolerance_minutes, tz)
-        if inst.scheduled_for - timedelta(minutes=early_accept_minutes) <= occurred_at <= inst.deadline_at:
+        if inst.scheduled_for - timedelta(minutes=early_accept_minutes) <= occurred_at <= inst.deadline_at + late_grace:
             return inst
     return None
 

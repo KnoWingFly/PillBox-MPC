@@ -30,10 +30,11 @@ from datetime import datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import timing
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.models import Device, DeviceEvent, Schedule, TelemetryLog
@@ -51,8 +52,9 @@ from app.schemas.device_protocol import (
     TelemetryRequest,
     TelemetryResponse,
 )
+from app.services.app_hub import queue_device_change
 from app.services.adherence import DoseInstants, delay_minutes_for, match_dose
-from app.services.device_protocol import is_fresh
+from app.services.device_protocol import is_fresh, status_builder
 from app.services.doses import auto_resolve_missed, get_or_create_dose, notify_dose, slot_label
 from app.services.notifications import NotificationSpec, notify
 from app.services.presence import device_label, mark_seen
@@ -100,6 +102,7 @@ async def ingest_batch(
             details={"max_batch_size": settings.telemetry_max_batch_size},
         )
 
+    started = timing.now_ms()
     # Any authenticated request proves the device is alive. This also locks the
     # device row, so batches from one device are applied one at a time.
     await mark_seen(session, device, now)
@@ -113,14 +116,9 @@ async def ingest_batch(
         else:
             first_index[ev.event_id] = i
 
-    existing = await session.execute(
-        select(DeviceEvent).where(
-            DeviceEvent.device_id == device.id, DeviceEvent.event_id.in_(list(first_index))
-        )
-    )
-    for stored in existing.scalars().all():
-        results[first_index.pop(stored.event_id)] = _duplicate_result(stored)
-
+    # No up-front "already stored?" query: the claim's ON CONFLICT DO NOTHING
+    # detects re-sent events, and only those pay a lookup (one round trip
+    # saved on the normal, all-new path).
     prepared = []
     for i in first_index.values():
         ev = req.events[i]
@@ -128,27 +126,59 @@ async def ingest_batch(
         prepared.append(_Prepared(i, ev, occurred, _validate(ev, occurred, now, settings)))
     prepared.sort(key=lambda p: (p.occurred_at, p.event.event_id))
 
+    log_links: list[dict[str, UUID]] = []  # device_events.id -> telemetry_logs.id
     for item in prepared:
-        claimed = await _claim(session, device, req.batch_id, item)
-        if not claimed:
-            # Same event_id committed concurrently by another request.
-            results[item.index] = EventResult(event_id=item.event.event_id, status="duplicate")
+        if timing.enabled():
+            timing.log_timing(
+                "iot_to_app", "backend_received", correlation_id=item.event.event_id,
+                event_type=item.event.event_type, offline_flush=req.is_offline_flush,
+                # Device clock vs server clock: meaningful only with a real-time RTC.
+                lag_ms=round((now - item.occurred_at).total_seconds() * 1000),
+            )
+        claimed_id = await _claim(session, device, req.batch_id, item)
+        if claimed_id is None:
+            stored = (
+                await session.execute(
+                    select(DeviceEvent).where(
+                        DeviceEvent.device_id == device.id, DeviceEvent.event_id == item.event.event_id
+                    )
+                )
+            ).scalar_one_or_none()
+            results[item.index] = (
+                _duplicate_result(stored)
+                if stored is not None
+                else EventResult(event_id=item.event.event_id, status="duplicate")
+            )
             continue
         if item.reject_reason is not None:
             results[item.index] = EventResult(
                 event_id=item.event.event_id, status="rejected", reason=item.reject_reason
             )
             continue
-        log_id = await _apply(session, device, item.event, item.occurred_at, tz, now, settings)
+        token = timing.correlation_id_var.set(item.event.event_id)
+        try:
+            log_id = await _apply(session, device, item.event, item.occurred_at, tz, now, settings)
+        finally:
+            timing.correlation_id_var.reset(token)
         if log_id is not None:
-            claimed.telemetry_log_id = log_id
+            log_links.append({"id": claimed_id, "telemetry_log_id": log_id})
         results[item.index] = EventResult(
             event_id=item.event.event_id,
             status="accepted",
             telemetry_log_id=str(log_id) if log_id else None,
         )
 
+    if log_links:
+        # One executemany instead of loading each claim row back (ORM bulk
+        # UPDATE by primary key).
+        await session.execute(update(DeviceEvent), log_links)
+    queue_device_change(session, device.elderly_id, device.id, status=status_builder(device, settings))
     await session.commit()
+    timing.log_timing(
+        "iot_to_app", "db_committed",
+        correlation_id=req.batch_id, event_ids=[p.event.event_id for p in prepared],
+        batch_ms=timing.since_ms(started),
+    )
 
     final = [r for r in results if r is not None]
     accepted = sum(1 for r in final if r.status == "accepted")
@@ -182,7 +212,9 @@ def _duplicate_result(stored: DeviceEvent) -> EventResult:
 
 async def _claim(
     session: AsyncSession, device: Device, batch_id: str | None, item: _Prepared
-) -> DeviceEvent | None:
+) -> UUID | None:
+    """Inserts the idempotency claim. Returns its id, or None if the event_id
+    was already claimed."""
     ev = item.event
     stmt = (
         insert(DeviceEvent)
@@ -202,10 +234,7 @@ async def _claim(
         .on_conflict_do_nothing(index_elements=[DeviceEvent.device_id, DeviceEvent.event_id])
         .returning(DeviceEvent.id)
     )
-    new_id = (await session.execute(stmt)).scalar_one_or_none()
-    if new_id is None:
-        return None
-    return await session.get(DeviceEvent, new_id)
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def _apply(
@@ -275,6 +304,13 @@ async def _apply_dose_event(
     if schedule is None:
         logger.info("dose_event_without_schedule", extra={"device_id": str(device.id), "slot": ev.slot_number})
         return None
+    # A device timeout may arrive up to one tolerance late (chamber queued behind
+    # another, see adherence.match_dose); it only ever turns a PENDING dose MISSED.
+    late_grace = (
+        timedelta(minutes=schedule.tolerance_minutes, seconds=settings.missed_decision_grace_seconds)
+        if etype is DeviceEventType.ALARM_TIMEOUT
+        else timedelta(0)
+    )
     inst = match_dose(
         occurred_at,
         schedule.window_start,
@@ -283,6 +319,7 @@ async def _apply_dose_event(
         schedule.days_of_week,
         tz,
         settings.dose_early_accept_minutes,
+        late_grace,
     )
     if inst is None:
         logger.info(
@@ -392,6 +429,7 @@ async def _apply_unscheduled_open(
                     "device": device_label(device),
                     "time": occurred_at.astimezone(tz).strftime("%H:%M"),
                 },
+                slot_number=ev.slot_number,
             ),
         )
     return log.id

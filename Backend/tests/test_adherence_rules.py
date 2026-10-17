@@ -1,6 +1,6 @@
 """Pure adherence rules (no database)."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from app.models.enums import JournalStatus
@@ -61,3 +61,12 @@ def test_summary_rates() -> None:
     assert s.compliance_rate == round(100 * 2 / 3, 1)
     assert s.avg_delay_minutes == 10.0
     assert journal_status("TAKEN", 3) is JournalStatus.TAKEN_LATE
+
+
+def test_match_dose_late_grace_accepts_device_timeout_after_deadline() -> None:
+    # Device pops up on the first tick after 20:05 and times out 45 min later: just past 20:50.
+    timeout_at = datetime(2026, 9, 28, 20, 50, 0, 700_000, tzinfo=JKT)
+    args = (time(20, 5), time(20, 5), 45, ALL_DAYS, JKT, 15)
+    assert match_dose(timeout_at, *args) is None
+    inst = match_dose(timeout_at, *args, timedelta(minutes=45, seconds=60))
+    assert inst is not None and inst.scheduled_for == datetime(2026, 9, 28, 20, 5, tzinfo=JKT)

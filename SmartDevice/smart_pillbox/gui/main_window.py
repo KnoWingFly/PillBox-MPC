@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PySide6.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, Signal
 from PySide6.QtGui import QFont
@@ -16,6 +17,7 @@ from smart_pillbox.core.rtc import SimulatedClock
 from smart_pillbox.core.scheduler import PillboxScheduler
 from smart_pillbox.core.audio import play_chime
 from smart_pillbox.core import sync
+from smart_pillbox.core.ws_client import DeviceSocket
 from smart_pillbox.db.database import Database
 from smart_pillbox.gui.compartment_widget import CompartmentWidget
 from smart_pillbox.gui.lcd_widget import LcdDisplay
@@ -34,12 +36,14 @@ class SyncSignals(QObject):
 class SyncWorker(QRunnable):
     """Background worker to execute telemetry sync without blocking the Qt GUI thread."""
 
-    def __init__(self, db: Database, now_str: str, battery: int, is_online: bool):
+    def __init__(self, db: Database, now_str: str, battery: int, is_online: bool, after_reconnect: bool = False):
         super().__init__()
         self.db = db
         self.now_str = now_str
         self.battery = battery
         self.is_online = is_online
+        # Contract §5.3: right after Wi-Fi returns, heartbeat first, then flush the buffer.
+        self.after_reconnect = after_reconnect
         self.signals = SyncSignals()
 
     def run(self):
@@ -50,8 +54,13 @@ class SyncWorker(QRunnable):
                 pass
             return
         try:
-            sync.send_heartbeat(self.db, self.now_str, self.battery, self.is_online)
-            synced_count = sync.flush_pending_events(self.db)
+            if self.after_reconnect:
+                sync.send_heartbeat(self.db, self.now_str, self.battery, self.is_online)
+                synced_count = sync.flush_pending_events(self.db, offline_flush=True)
+            else:
+                # Events first: they are what the caregiver is waiting for.
+                synced_count = sync.flush_pending_events(self.db)
+                sync.send_heartbeat(self.db, self.now_str, self.battery, self.is_online)
             try:
                 if synced_count > 0:
                     self.signals.finished.emit(synced_count, f"Synced {synced_count} event(s) to backend.")
@@ -101,10 +110,14 @@ class MainWindow(QMainWindow):
         self.scheduler.on_activated.append(self._on_state_changed)
         self.scheduler.on_missed.append(self._on_state_changed)
         self.scheduler.on_taken.append(self._on_state_changed)
+        for hook in (self.scheduler.on_activated, self.scheduler.on_missed, self.scheduler.on_taken):
+            hook.append(lambda _compartment: self._request_sync())
 
         self._widgets: dict[int, CompartmentWidget] = {}
         self._is_online = True
         self._is_syncing = False
+        self._sync_again = False  # a sync was requested while one was running
+        self._reconnected = False  # next sync is the first after Wi-Fi returned
         self._is_registering = False
         self._battery_percent = 100
         self._config_version_seen = self.db.get_device_state("config_version")
@@ -122,6 +135,20 @@ class MainWindow(QMainWindow):
         self._sync_timer.setInterval(config.SYNC_INTERVAL_SECONDS * 1000)
         self._sync_timer.timeout.connect(self._on_sync_tick)
         self._sync_timer.start()
+
+        # Events are sent right away instead of waiting up to SYNC_INTERVAL_SECONDS;
+        # the short debounce sends a burst (e.g. open + close) as one batch.
+        self._flush_soon = QTimer(self)
+        self._flush_soon.setSingleShot(True)
+        self._flush_soon.setInterval(config.SYNC_DEBOUNCE_MS)
+        self._flush_soon.timeout.connect(self._on_sync_tick)
+
+        self._socket = DeviceSocket(self)
+        self._socket.command_received.connect(self._on_device_command)
+        self._socket.welcome_received.connect(self._on_welcome)
+        # Backend reachable again: send anything buffered now, not on the next tick.
+        self._socket.connected_changed.connect(lambda ok: ok and self._request_sync())
+        self._refresh_socket()
 
     # -- UI construction ---------------------------------------------------
     def _build_ui(self) -> None:
@@ -227,9 +254,16 @@ class MainWindow(QMainWindow):
         time_inner_layout.addWidget(btn_jump)
         time_layout.addLayout(time_inner_layout)
         
+        time_buttons = QHBoxLayout()
         btn_reset = QPushButton("Reset Day to IDLE")
         btn_reset.clicked.connect(self._on_reset_day)
-        time_layout.addWidget(btn_reset)
+        time_buttons.addWidget(btn_reset)
+        # The backend judges on-time / late / missed against ITS clock; after "+1 Hour"
+        # or a fast speed the device events no longer line up with the schedule.
+        btn_real_time = QPushButton("Sync Jam Nyata")
+        btn_real_time.clicked.connect(self._on_sync_real_time)
+        time_buttons.addWidget(btn_real_time)
+        time_layout.addLayout(time_buttons)
         lab_layout.addWidget(time_group)
 
         # Network Controls
@@ -307,16 +341,27 @@ class MainWindow(QMainWindow):
             return
 
         if self._is_syncing:
-            return  # Prior sync request still in progress; skip to avoid thread congestion
+            # One sync at a time; run again as soon as this one finishes so new
+            # events never wait for the next interval.
+            self._sync_again = True
+            return
 
         self._is_syncing = True
         now_str = self.clock.now().isoformat()
-        worker = SyncWorker(self.db, now_str, self._battery_percent, self._is_online)
+        worker = SyncWorker(self.db, now_str, self._battery_percent, self._is_online, after_reconnect=self._reconnected)
+        self._reconnected = False
         worker.signals.finished.connect(self._on_sync_finished)
         QThreadPool.globalInstance().start(worker)
 
+    def _request_sync(self) -> None:
+        """Something worth reporting happened: sync after a short debounce."""
+        self._flush_soon.start()
+
     def _on_sync_finished(self, synced_count: int, message: str) -> None:
         self._is_syncing = False
+        if self._sync_again:
+            self._sync_again = False
+            self._request_sync()
         self.statusBar().showMessage(message, 3000)
         # A new config from the app was pulled during this sync: apply it live.
         version = self.db.get_device_state("config_version")
@@ -377,6 +422,7 @@ class MainWindow(QMainWindow):
         self._is_registering = False
         self._config_version_seen = self.db.get_device_state("config_version")
         self._refresh_connection_panel()
+        self._refresh_socket()
         if ok:
             QApplication.clipboard().setText(message)
             QMessageBox.information(
@@ -399,6 +445,7 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Yes:
             sync.forget_identity(self.db)
             self._refresh_connection_panel()
+            self._refresh_socket()
 
     def _on_widget_interacted(self, compartment_id: int, is_forced: bool = False) -> None:
         compartment = self.scheduler.compartments[compartment_id]
@@ -429,11 +476,20 @@ class MainWindow(QMainWindow):
 
         self._refresh_widget(compartment)
         self._refresh_lcd()
+        self._request_sync()
 
     def _on_jump_hour(self) -> None:
         self.clock.jump(timedelta(hours=1))
         self.scheduler.tick()
         self._refresh_lcd()
+
+    def _on_sync_real_time(self) -> None:
+        """Back to wall-clock time at 1.0x, so device events match the backend's schedule windows."""
+        self._speed_combo.setCurrentIndex(0)  # 1.0x (re-anchors via set_speed)
+        self.clock.set_time(datetime.now())
+        self.scheduler.tick()
+        self._refresh_lcd()
+        self.statusBar().showMessage("Jam perangkat disamakan dengan jam nyata (1.0x).", 4000)
 
     def _on_reset_day(self) -> None:
         self.scheduler.reset_day()
@@ -452,6 +508,7 @@ class MainWindow(QMainWindow):
         compartment = self.scheduler.compartments.get(slot_number)
         stock = compartment.stock_count if compartment else "?"
         self.statusBar().showMessage(f"Sachet loaded to Slot {slot_number} (Stock: {stock} pcs)", 3000)
+        self._request_sync()
         
     def _on_sachet_consumed(self, slot_number: int, medication_name: str) -> None:
         self.statusBar().showMessage(f"Patient consumed medication from Slot {slot_number}: {medication_name}", 3000)
@@ -460,6 +517,7 @@ class MainWindow(QMainWindow):
         for widget in self._widgets.values():
             widget.refresh()
         self.statusBar().showMessage(f"All slots set to {count} sachet(s)", 3000)
+        self._request_sync()
 
     def _toggle_wifi(self) -> None:
         self._is_online = not self._is_online
@@ -470,6 +528,11 @@ class MainWindow(QMainWindow):
             self._btn_wifi.setText("Wi-Fi: Offline")
             self._btn_wifi.setStyleSheet("background-color: #7F1D1D; color: white; font-weight: bold;")
         self._refresh_lcd()
+        self._refresh_socket()
+        if self._is_online:
+            # Contract §5.3: report back immediately (heartbeat, then the buffered events).
+            self._reconnected = True
+            self._on_sync_tick()
 
     def _toggle_refill_mode(self) -> None:
         self.scheduler.is_refill_mode = not self.scheduler.is_refill_mode
@@ -486,13 +549,15 @@ class MainWindow(QMainWindow):
             self._btn_refill.setText("Toggle Refill Mode")
             self._btn_refill.setStyleSheet("background-color: #334155; color: white; font-weight: bold;")
             self.statusBar().showMessage("Refill Mode closed: Compartment lids locked.", 4000)
-            
+
         self._refresh_lcd()
+        self._request_sync()
 
     def _on_battery_changed(self, value: int) -> None:
         self._battery_percent = value
         self._batt_label.setText(f"Battery: {value}%")
         self._refresh_lcd()
+        self._request_sync()  # the debounce waits until the slider stops moving
 
 
     # -- helpers -----------------------------------------------------------
@@ -536,7 +601,78 @@ class MainWindow(QMainWindow):
             is_refill_mode=self.scheduler.is_refill_mode,
         )
 
+    # -- command channel (backend -> device) ---------------------------------------
+    def _refresh_socket(self) -> None:
+        """Keeps the command channel open while registered and online."""
+        code, key = sync.get_identity(self.db)
+        if self._is_online and code and key:
+            self._socket.start(code, key)
+        else:
+            self._socket.stop()
+
+    @staticmethod
+    def _server_local_time(server_time: object, timezone: object) -> datetime:
+        """Server UTC instant -> naive local time, as the simulated RTC keeps it.
+        Raises ValueError / ZoneInfoNotFoundError on a bad payload."""
+        instant = datetime.fromisoformat(str(server_time))
+        return instant.astimezone(ZoneInfo(str(timezone or "Asia/Jakarta"))).replace(tzinfo=None)
+
+    def _on_welcome(self, message: dict) -> None:
+        """Command channel connected: correct the RTC from the server clock (a real
+        device would use NTP). Skipped while the lab clock runs fast on purpose."""
+        if self.clock.speed != 1.0:
+            return
+        try:
+            server_now = self._server_local_time(message["server_time"], message.get("timezone"))
+        except (KeyError, ValueError, ZoneInfoNotFoundError):
+            return
+        drift = (self.clock.now() - server_now).total_seconds()
+        if abs(drift) < 30:
+            return
+        self.clock.set_time(server_now)
+        self._refresh_lcd()
+        logger.info("RTC corrected from server time (was %+.0f s off).", drift)
+        self.statusBar().showMessage(f"Jam perangkat disinkronkan dengan server (selisih {drift:+.0f} detik).", 5000)
+
+    def _on_device_command(self, command_id: str, command: str, payload: dict) -> None:
+        """Handles a command from the app (contract §3) and acks it right away:
+        the caregiver's request waits for this ack."""
+        if command == "trigger_alarm":
+            slot = payload.get("slot_number")
+            compartment = next((c for c in self.scheduler.compartments.values() if c.slot_number == slot), None)
+            if compartment is not None:
+                self.db.log_event(compartment.id, compartment.slot_number, "ALARM_STARTED", self.clock.now())
+                self._request_sync()
+            play_chime()
+            where = f"Slot {slot}" if slot else "semua slot"
+            self.statusBar().showMessage(f"🔔 Alarm dari aplikasi ({where})", 5000)
+            self._socket.send_ack(command_id, True, {"ringing": True})
+        elif command == "schedule_updated":
+            self._socket.send_ack(command_id, True)
+            self._request_sync()  # pulls the new config now instead of on the next heartbeat
+        elif command == "refill_mode":
+            enabled = bool(payload.get("enabled"))
+            if enabled != self.scheduler.is_refill_mode:
+                self._toggle_refill_mode()
+            self._socket.send_ack(command_id, True, {"is_refill_mode": self.scheduler.is_refill_mode})
+        elif command == "time_sync":
+            before = self.clock.now()
+            try:
+                local = self._server_local_time(payload["server_time"], payload.get("timezone"))
+            except (KeyError, ValueError, ZoneInfoNotFoundError) as exc:
+                self._socket.send_ack(command_id, False, error=f"invalid time_sync payload: {exc}")
+                return
+            self.clock.set_time(local)
+            self._refresh_lcd()
+            self._socket.send_ack(
+                command_id, True,
+                {"device_time_before": before.isoformat(), "device_time_after": self.clock.now().isoformat()},
+            )
+        else:
+            self._socket.send_ack(command_id, False, error=f"unsupported command {command!r}")
+
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        self._socket.stop()
         QThreadPool.globalInstance().waitForDone(500)
         self.db.close()
         super().closeEvent(event)

@@ -23,6 +23,8 @@ from uuid import UUID, uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from app.core import timing
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,12 +141,14 @@ class ConnectionManager:
         self.history.append(record)
         future: asyncio.Future[CommandAck] = asyncio.get_running_loop().create_future()
         self._pending[command_id] = _Pending(device_id, command.value, future)
+        started = timing.now_ms()
         try:
             try:
                 await self._send(conn, message)
             except (WebSocketDisconnect, RuntimeError, OSError) as exc:
                 record.status = "DISCONNECTED"
                 raise DeviceDisconnectedError(command_id) from exc
+            timing.log_timing("app_to_iot", "ws_command_sent", command=command.value, send_ms=timing.since_ms(started))
             try:
                 ack = await asyncio.wait_for(future, timeout=timeout)
             except TimeoutError as exc:
@@ -158,6 +162,10 @@ class ConnectionManager:
             return ack
         finally:
             self._pending.pop(command_id, None)
+            timing.log_timing(
+                "app_to_iot", "device_ack_received", command=command.value,
+                status=record.status, ack_wait_ms=timing.since_ms(started),
+            )
             logger.info(
                 "device_command",
                 extra={"device_id": str(device_id), "command": command.value,

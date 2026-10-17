@@ -1,3 +1,5 @@
+import { AppConfig } from '@/config';
+
 import { apiFetch, type TokenResponse } from './client';
 
 export type Caregiver = { id: string; full_name: string; email?: string };
@@ -43,5 +45,5 @@ export const authApi = {
 };
 
 export function deviceTimezone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Jakarta';
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || AppConfig.fallbackTimezone;
 }

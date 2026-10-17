@@ -1,4 +1,4 @@
-"""Device WebSocket: /ws/device/{device_code}
+"""Device WebSocket: /ws/device/{device_code}  (app WebSocket /ws/app: see app_socket)
 
 Auth: header `X-Device-Key: <secret>` on the upgrade request, or (for clients
 that cannot set headers) a first message {"type": "auth", "device_key": "..."}
@@ -14,15 +14,20 @@ import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import user_from_token
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.db.session import get_sessionmaker
-from app.models import Device
+from app.models import Device, UserElderlyRole
 from app.schemas.device_protocol import HeartbeatRequest
+from app.services.app_hub import AppConnection, app_hub
 from app.services.connection_manager import DeviceCommand, DeviceConnection, connection_manager
 from app.services.device_protocol import authenticate_device, process_heartbeat
 from app.services.presence import mark_offline, mark_seen
@@ -86,9 +91,12 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
             await session.commit()
             latest = fresh.config_version
             applied = fresh.config_version_applied or 0
+            device_tz = fresh.timezone
         await _send(conn, {
             "type": "welcome",
             "server_time": datetime.now(UTC).isoformat(),
+            # Lets the device set its clock to local time (no NTP on the emulator).
+            "timezone": device_tz,
             "heartbeat_interval_seconds": settings.device_heartbeat_interval_seconds,
             "latest_config_version": latest,
         })
@@ -139,3 +147,68 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
             async with sessionmaker() as session:
                 await mark_offline(session, device.id, datetime.now(UTC), reason="ws_disconnect")
                 await session.commit()
+
+
+async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUID]] | None:
+    """First message must be {"type": "auth", "token": "<access token>"}."""
+    try:
+        first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=timeout))
+    except (TimeoutError, ValueError, WebSocketDisconnect):
+        return None
+    token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
+    if not isinstance(token, str):
+        return None
+    async with get_sessionmaker()() as session:
+        try:
+            user = await user_from_token(token, get_settings(), session)
+        except AppError:
+            return None
+        return user.id, await _elderly_ids(session, user.id)
+
+
+async def _elderly_ids(session: AsyncSession, user_id: UUID) -> set[UUID]:
+    rows = await session.execute(select(UserElderlyRole.elderly_id).where(UserElderlyRole.user_id == user_id))
+    return set(rows.scalars().all())
+
+
+@router.websocket("/ws/app")
+async def app_socket(websocket: WebSocket) -> None:
+    """Caregiver app: receives "refetch" hints (services/app_hub.py).
+
+    App -> server:  auth (first, within WS_AUTH_TIMEOUT_SECONDS) | ping | resubscribe
+    Server -> app:  ready | notifications | device | pong
+    `resubscribe` reloads the elderly the user follows (send it after pairing).
+    The token is checked once, at connect; the socket carries no data, only
+    hints to call the authenticated REST endpoints.
+    """
+    settings = get_settings()
+    await websocket.accept()
+    auth = await _app_user(websocket, settings.ws_auth_timeout_seconds)
+    if auth is None:
+        await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="authentication failed")
+        return
+    user_id, elderly_ids = auth
+    conn = AppConnection(user_id, elderly_ids, websocket)
+    app_hub.register(conn)
+    logger.info("app_ws_connected", extra={"user_id": str(user_id), "elderly_count": len(elderly_ids)})
+    try:
+        await websocket.send_json({"type": "ready"})
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                kind = json.loads(raw).get("type")
+            except (ValueError, AttributeError):
+                continue
+            if kind == "ping":
+                async with conn.send_lock:
+                    await websocket.send_json({"type": "pong"})
+            elif kind == "resubscribe":
+                async with get_sessionmaker()() as session:
+                    conn.elderly_ids = await _elderly_ids(session, user_id)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("app_ws_error", extra={"user_id": str(user_id)})
+    finally:
+        app_hub.unregister(conn)
+        logger.info("app_ws_disconnected", extra={"user_id": str(user_id)})
