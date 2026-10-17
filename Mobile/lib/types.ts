@@ -30,9 +30,14 @@ export type NotificationType = 'on_time' | 'late' | 'missed' | 'system';
 
 export type DoseEventType = Exclude<NotificationType, 'system'>;
 
+/** Mirrors the backend `severity` column. `critical` system alerts (e.g. a compartment opened
+ * outside its schedule) stay under the "Sistem" filter but are styled as urgent. */
+export type NotificationSeverity = 'info' | 'warning' | 'critical';
+
 export interface AppNotification {
   id: string;
   type: NotificationType;
+  severity: NotificationSeverity;
   slotId: SlotId | null;
   title: string;
   message: string;

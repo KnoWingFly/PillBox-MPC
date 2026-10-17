@@ -1,4 +1,5 @@
 import { SplashScreen, Stack } from 'expo-router';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import AuthProvider from '@root/context/auth-context';
 import { useAuth } from '@/hooks/use-auth';
 import '@root/global.css';
@@ -34,9 +35,12 @@ function RootNavigator() {
 
 export default function RootLayout() {
   return (
-    <AuthProvider>
-      <SplashScreenController />
-      <RootNavigator />
-    </AuthProvider>
+    // Required by react-native-gesture-handler (swipe-to-delete on notifications).
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AuthProvider>
+        <SplashScreenController />
+        <RootNavigator />
+      </AuthProvider>
+    </GestureHandlerRootView>
   );
 }

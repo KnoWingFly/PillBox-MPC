@@ -3,6 +3,7 @@
 // screen works without the IoT simulator or the FastAPI backend.
 
 import type {
+  AdherenceSummary,
   AppNotification,
   DeviceStatus,
   DoseEventType,
@@ -105,6 +106,20 @@ export type NotificationListener = (notification: AppNotification) => void;
 const listeners = new Set<NotificationListener>();
 let notificationSeq = 0;
 
+/** Mock "server" table of notifications, newest first. Read and changed only via lib/notifications.ts. */
+let mockNotifications: AppNotification[] = [];
+
+export function getMockNotifications(): readonly AppNotification[] {
+  return mockNotifications;
+}
+
+export function setMockNotifications(next: AppNotification[]): void {
+  mockNotifications = next;
+}
+
+/** Mock dose log, kept apart from notifications so deleting notifications never changes adherence. */
+const mockDoseLog: { type: DoseEventType; minutesLate: number }[] = [];
+
 /** Registers a listener and returns an unsubscribe function. */
 export function subscribeToNotifications(listener: NotificationListener): () => void {
   listeners.add(listener);
@@ -115,12 +130,18 @@ export function subscribeToNotifications(listener: NotificationListener): () => 
 
 function emitNotification(input: Omit<AppNotification, 'id' | 'createdAt' | 'read'>): AppNotification {
   notificationSeq += 1;
+  const createdAt = Date.now();
   const notification: AppNotification = {
     ...input,
-    id: `n-${Date.now()}-${notificationSeq}`,
-    createdAt: Date.now(),
+    // Zero-padded so ids sort in creation order; they break ties between equal createdAt values.
+    id: `n-${createdAt}-${String(notificationSeq).padStart(6, '0')}`,
+    createdAt,
     read: false,
   };
+  mockNotifications = [notification, ...mockNotifications];
+  if (input.type !== 'system') {
+    mockDoseLog.push({ type: input.type, minutesLate: input.minutesLate ?? 0 });
+  }
   listeners.forEach((listener) => listener(notification));
   return notification;
 }
@@ -128,6 +149,67 @@ function emitNotification(input: Omit<AppNotification, 'id' | 'createdAt' | 'rea
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * Mock only: adds `count` past notifications (one every 30 min, going back from the oldest one
+ * stored) so pagination can be tested. Not pushed to listeners: pull to refresh to see them.
+ */
+export async function seedMockHistory(count = 45): Promise<void> {
+  if (!USE_MOCK) return notImplemented('seedMockHistory');
+  await delay();
+  const oldest = mockNotifications.reduce((min, n) => Math.min(min, n.createdAt), Date.now());
+  const kinds: DoseEventType[] = ['on_time', 'late', 'missed', 'on_time', 'late'];
+  const seeded: AppNotification[] = [];
+  for (let i = 1; i <= count; i += 1) {
+    notificationSeq += 1;
+    const type = kinds[i % kinds.length];
+    const slotId = mockSchedules.find((s) => s.timeMinutes !== null && s.enabled)?.id ?? 'A1';
+    const createdAt = oldest - i * 30 * 60 * 1000;
+    const minutesLate = type === 'late' ? 10 + (i % 4) * 5 : undefined;
+    seeded.push({
+      id: `n-${createdAt}-${String(notificationSeq).padStart(6, '0')}`,
+      type,
+      severity: type === 'missed' ? 'critical' : type === 'late' ? 'warning' : 'info',
+      slotId,
+      title: { on_time: 'Obat Diminum Tepat Waktu', late: 'Obat Diminum Terlambat', missed: 'Dosis Terlewat' }[type],
+      message: `Riwayat contoh #${i} untuk slot ${slotId}.`,
+      createdAt,
+      read: i > 3,
+      ...(minutesLate !== undefined ? { minutesLate } : {}),
+    });
+    mockDoseLog.push({ type, minutesLate: minutesLate ?? 0 });
+  }
+  mockNotifications = [...mockNotifications, ...seeded];
+}
+
+/**
+ * Dose adherence for the dashboard card. Independent of the notification list.
+ * TODO(backend): GET /elderly/{elderly_id}/journal/summary?start=&end= (taken_on_time, taken_late, missed).
+ */
+export async function getAdherenceSummary(): Promise<AdherenceSummary> {
+  if (!USE_MOCK) return notImplemented('getAdherenceSummary');
+  let onTime = 0;
+  let late = 0;
+  let missed = 0;
+  let delaySum = 0;
+  for (const dose of mockDoseLog) {
+    if (dose.type === 'on_time') onTime += 1;
+    else if (dose.type === 'late') {
+      late += 1;
+      delaySum += dose.minutesLate;
+    } else missed += 1;
+  }
+  const total = onTime + late + missed;
+  const taken = onTime + late;
+  return {
+    totalDoses: total,
+    onTimeDoses: onTime,
+    lateDoses: late,
+    missedDoses: missed,
+    adherencePercent: total > 0 ? Math.round((onTime / total) * 100) : null,
+    averageDelayMinutes: taken > 0 ? Math.round(delaySum / taken) : null,
+  };
+}
 
 export async function getDeviceStatus(): Promise<DeviceStatus> {
   if (!USE_MOCK) return notImplemented('getDeviceStatus');
@@ -148,12 +230,14 @@ export async function setDeviceConnection(online: boolean): Promise<DeviceStatus
     online
       ? {
           type: 'system',
+          severity: 'info',
           slotId: null,
           title: 'Sistem Terkoneksi',
           message: `${mockDevice.deviceName} kembali online dan jadwal tersinkron.`,
         }
       : {
           type: 'system',
+          severity: 'warning',
           slotId: null,
           title: 'Perangkat Terputus',
           message: `${mockDevice.deviceName} tidak terhubung. Periksa daya dan Wi-Fi.`,
@@ -212,6 +296,7 @@ export async function simulateDoseEvent(input: SimulateDoseInput): Promise<AppNo
     case 'on_time':
       return emitNotification({
         type: 'on_time',
+        severity: 'info',
         slotId: input.slotId,
         title: 'Obat Diminum Tepat Waktu',
         message: `Obat ${where} diminum sesuai jadwal ${time}.`,
@@ -220,6 +305,7 @@ export async function simulateDoseEvent(input: SimulateDoseInput): Promise<AppNo
       const minutesLate = Math.max(1, input.minutesLate ?? 0);
       return emitNotification({
         type: 'late',
+        severity: 'warning',
         slotId: input.slotId,
         title: 'Obat Diminum Terlambat',
         message: `Obat ${where} diminum terlambat ${minutesLate} menit dari jadwal ${time}.`,
@@ -229,6 +315,7 @@ export async function simulateDoseEvent(input: SimulateDoseInput): Promise<AppNo
     case 'missed':
       return emitNotification({
         type: 'missed',
+        severity: 'critical',
         slotId: input.slotId,
         title: 'Dosis Terlewat',
         message: `Dosis ${where} jadwal ${time} tidak diminum. Segera hubungi lansia.`,
