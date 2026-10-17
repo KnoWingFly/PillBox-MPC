@@ -107,7 +107,7 @@ class NotificationPreferencesIO(BaseModel):
     channels: Channels = Field(default_factory=Channels)
     whatsapp_number: str | None = None
     notify_on_missed: bool = True
-    notify_on_taken: bool = False
+    notify_on_taken: bool = True  # matches services/notifications.py Preferences
     notify_on_device_offline: bool = True
     device_offline_after_minutes: int = Field(10, ge=1, le=1440)
     notify_on_low_battery: bool = True

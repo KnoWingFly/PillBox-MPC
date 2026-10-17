@@ -4,3 +4,4 @@ allowBuilds:
   esbuild: true
   prisma: true
   workerd: true
+  unrs-resolver: false

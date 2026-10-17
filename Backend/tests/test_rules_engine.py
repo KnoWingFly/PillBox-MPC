@@ -80,7 +80,7 @@ async def test_offline_device_is_not_marked_missed_until_flush(
     assert overdue >= 2
     assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED'") == 0
 
-    # Wi-Fi returns: the device flushes yesterday's dose (taken late at 08:40).
+    # Wi-Fi returns: the device flushes yesterday's dose (opened at 08:40, 10 min after window_end).
     yesterday = (datetime.now(ZoneInfo("Asia/Jakarta")).date() - timedelta(days=1)).isoformat()
     res = await send_telemetry(
         client, device, [event("ev-y", "COMPARTMENT_OPENED", f"{yesterday}T08:40:00+07:00")], is_offline_flush=True
@@ -94,7 +94,8 @@ async def test_offline_device_is_not_marked_missed_until_flush(
     # After the flush wait the remaining doses are decided; the flushed one stays TAKEN.
     await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0))
     taken = await db.fetch("SELECT delay_minutes FROM telemetry_logs WHERE status = 'TAKEN'")
-    assert len(taken) == 1 and taken[0]["delay_minutes"] == 10
+    # 10 minutes is within the default on-time grace, so the flushed dose counts as on time.
+    assert len(taken) == 1 and taken[0]["delay_minutes"] == 0
     assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED'") == overdue - 1
 
 

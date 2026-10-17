@@ -8,6 +8,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 import json
+import re
 import uuid
 
 from smart_pillbox import config
@@ -29,6 +30,13 @@ _DEFAULT_SCHEDULE = [
 ]
 
 
+def _event_types(schema_sql: str) -> list[str]:
+    """The event types allowed by the events CHECK constraint in schema.sql."""
+    code = "\n".join(line.split("--")[0] for line in schema_sql.splitlines())  # drop SQL comments first
+    start = code.index("event_type IN (")
+    return re.findall(r"'([A-Z_]+)'", code[start : code.index(")", start)])
+
+
 class Database:
     def __init__(self, db_path: str | Path | None = None):
         self.db_path = str(db_path or config.DB_PATH)
@@ -42,7 +50,9 @@ class Database:
     # -- setup ---------------------------------------------------------------
     def _init_schema(self) -> None:
         sql = config.SCHEMA_PATH.read_text()
+        self._retire_stale_events_table()
         self._conn.executescript(sql)
+        self._restore_retired_events()
         self._conn.commit()
         # Handle migration for existing databases smoothly
         try:
@@ -58,6 +68,48 @@ class Database:
             self._conn.execute("ALTER TABLE compartments ADD COLUMN days_of_week TEXT NOT NULL DEFAULT '[1, 2, 3, 4, 5, 6, 7]'")
         except sqlite3.OperationalError:
             pass
+
+    def _retire_stale_events_table(self) -> None:
+        """SQLite cannot alter a CHECK constraint, so a database created before an event type was
+        added keeps rejecting it (IntegrityError on insert). Move such a table aside; the schema
+        script then creates the current one and _restore_retired_events copies the rows back."""
+        row = self._conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").fetchone()
+        if row is None:
+            return
+        required = config.SCHEMA_PATH.read_text()
+        # Stale = the stored definition lacks an event type the current schema allows.
+        if all(t in row["sql"] for t in _event_types(required)):
+            return
+        self._conn.executescript(
+            """
+            BEGIN;
+            DROP TABLE IF EXISTS events_retired;
+            ALTER TABLE events RENAME TO events_retired;
+            DROP INDEX IF EXISTS idx_events_unsynced;
+            DROP INDEX IF EXISTS idx_events_compartment;
+            COMMIT;
+            """
+        )
+
+    def _restore_retired_events(self) -> None:
+        """Copies rows (including unsynced ones) from a retired table, then drops it. Also finishes
+        the job if the app was closed between the two steps."""
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events_retired'"
+        ).fetchone()
+        if exists is None:
+            return
+        self._conn.executescript(
+            """
+            BEGIN;
+            INSERT OR IGNORE INTO events
+                (id, event_id, compartment_id, slot_number, event_type, occurred_at, chime_count, synced, created_at)
+                SELECT id, event_id, compartment_id, slot_number, event_type, occurred_at, chime_count, synced, created_at
+                FROM events_retired;
+            DROP TABLE events_retired;
+            COMMIT;
+            """
+        )
 
     def _seed_default_compartments_if_empty(self) -> None:
         count = self._conn.execute("SELECT COUNT(*) FROM compartments").fetchone()[0]

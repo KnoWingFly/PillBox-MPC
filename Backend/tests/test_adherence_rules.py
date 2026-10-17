@@ -1,6 +1,6 @@
 """Pure adherence rules (no database)."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from app.models.enums import JournalStatus
@@ -10,6 +10,7 @@ from app.services.adherence import (
     dose_instants,
     journal_status,
     match_dose,
+    on_time_grace,
 )
 
 JKT = ZoneInfo("Asia/Jakarta")
@@ -26,6 +27,36 @@ def test_on_time_within_window_has_zero_delay() -> None:
     end = datetime(2026, 9, 28, 7, 30, tzinfo=JKT)
     assert delay_minutes_for(datetime(2026, 9, 28, 7, 29, tzinfo=JKT), end) == 0
     assert delay_minutes_for(datetime(2026, 9, 28, 7, 30, 59, tzinfo=JKT), end) == 0
+
+
+def test_delay_within_on_time_grace_counts_as_on_time() -> None:
+    end = datetime(2026, 9, 28, 7, 0, tzinfo=JKT)
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 2, tzinfo=JKT), end, 10) == 0
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 10, 59, tzinfo=JKT), end, 10) == 0  # still 10 whole minutes
+    assert journal_status("TAKEN", delay_minutes_for(datetime(2026, 9, 28, 7, 2, tzinfo=JKT), end, 10)) is (
+        JournalStatus.TAKEN_ON_TIME
+    )
+
+
+def test_delay_beyond_on_time_grace_reports_the_real_delay() -> None:
+    end = datetime(2026, 9, 28, 7, 0, tzinfo=JKT)
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 11, 0, tzinfo=JKT), end, 10) == 11  # not 11 - 10
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 25, tzinfo=JKT), end, 10) == 25
+
+
+def test_zero_grace_keeps_the_old_strict_behaviour() -> None:
+    end = datetime(2026, 9, 28, 7, 0, tzinfo=JKT)
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 0, 59, tzinfo=JKT), end, 0) == 0
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 1, tzinfo=JKT), end, 0) == 1
+    assert delay_minutes_for(datetime(2026, 9, 28, 7, 1, tzinfo=JKT), end) == 1  # default argument
+
+
+def test_on_time_grace_never_swallows_the_whole_tolerance() -> None:
+    assert on_time_grace(30, 10) == 10
+    assert on_time_grace(15, 10) == 10
+    assert on_time_grace(15, 30) == 14  # a slot always keeps a late zone
+    assert on_time_grace(30, 0) == 0
+    assert on_time_grace(15, 60) == 14
 
 
 def test_late_delay_counts_whole_minutes_after_window_end() -> None:
@@ -61,3 +92,12 @@ def test_summary_rates() -> None:
     assert s.compliance_rate == round(100 * 2 / 3, 1)
     assert s.avg_delay_minutes == 10.0
     assert journal_status("TAKEN", 3) is JournalStatus.TAKEN_LATE
+
+
+def test_match_dose_late_grace_accepts_device_timeout_after_deadline() -> None:
+    # Device pops up on the first tick after 20:05 and times out 45 min later: just past 20:50.
+    timeout_at = datetime(2026, 9, 28, 20, 50, 0, 700_000, tzinfo=JKT)
+    args = (time(20, 5), time(20, 5), 45, ALL_DAYS, JKT, 15)
+    assert match_dose(timeout_at, *args) is None
+    inst = match_dose(timeout_at, *args, timedelta(minutes=45, seconds=60))
+    assert inst is not None and inst.scheduled_for == datetime(2026, 9, 28, 20, 5, tzinfo=JKT)

@@ -71,6 +71,49 @@ async def test_on_time_classification(client: httpx.AsyncClient, db: asyncpg.Con
     assert day["adherence_rate"] == 100.0 and day["avg_delay_minutes"] == 0.0
 
 
+async def test_small_delay_is_on_time_not_late(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """The mobile app saves one time per slot (window_start == window_end). An elderly person who opens
+    the lid 2 minutes after it must not be reported as late."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, start="07:00", end="07:00", tolerance=30)
+    await send_telemetry(client, device, [event("ev-1", "COMPARTMENT_OPENED", f"{DAY}T07:02:00+07:00")])
+
+    rows = await _dose_rows(db, device.id)
+    assert rows[0]["status"] == "TAKEN" and rows[0]["delay_minutes"] == 0
+    assert rows[0]["actual_open_time"] is not None  # the real moment is still recorded
+    assert await db.fetchval("SELECT count(*) FROM notifications WHERE type = 'DOSE_TAKEN'") == 1
+    assert await db.fetchval("SELECT count(*) FROM notifications WHERE type = 'DOSE_LATE'") == 0
+
+    day = (await client.get(f"{API}/elderly/{device.elderly_id}/journal/{DAY}", headers=owner.headers)).json()
+    assert day["doses"][0]["status"] == "TAKEN_ON_TIME"
+    assert day["adherence_rate"] == 100.0 and day["avg_delay_minutes"] == 0.0
+
+
+async def test_on_time_grace_boundary_and_real_delay_after_it(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, slot=1, start="07:00", end="07:00", tolerance=30)
+    await create_schedule(client, owner, device, slot=2, start="12:00", end="12:00", tolerance=30)
+    # Default grace is 10 whole minutes: 07:10:59 is still on time ...
+    await send_telemetry(client, device, [event("ev-1", "COMPARTMENT_OPENED", f"{DAY}T07:10:59+07:00", slot=1)])
+    # ... and 12:11:00 is late, reported with its real delay (11), not 11 - grace.
+    await send_telemetry(client, device, [event("ev-2", "COMPARTMENT_OPENED", f"{DAY}T12:11:00+07:00", slot=2)])
+
+    rows = {r["slot_number"]: r for r in await _dose_rows(db, device.id)}
+    assert rows[1]["delay_minutes"] == 0
+    assert rows[2]["delay_minutes"] == 11
+    types = [r["type"] for r in await db.fetch("SELECT type FROM notifications ORDER BY created_at")]
+    assert sorted(types) == ["DOSE_LATE", "DOSE_TAKEN"]
+
+    day = (await client.get(f"{API}/elderly/{device.elderly_id}/journal/{DAY}", headers=owner.headers)).json()
+    by_slot = {d["slot_number"]: d for d in day["doses"]}
+    assert by_slot[1]["status"] == "TAKEN_ON_TIME" and by_slot[2]["status"] == "TAKEN_LATE"
+    assert by_slot[2]["delay_minutes"] == 11
+
+
 async def test_late_classification_stores_minutes_late(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
     owner = await create_caregiver(db, "Owner")
     device = await paired_device(client, owner)

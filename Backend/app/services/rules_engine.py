@@ -29,6 +29,7 @@ TAKEN and auto-resolves the DOSE_MISSED notifications.
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -44,10 +45,13 @@ from app.models.enums import (
     NotificationType,
 )
 from app.services.adherence import dose_instants, is_scheduled_on
-from app.services.doses import dose_insert_stmt, notify_dose
+from app.services.doses import notify_dose, pending_dose_row, pending_doses_insert_stmt
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
+
+# 10 columns per row; keeps each statement far below Postgres' 32767 bind-parameter limit.
+_INSERT_CHUNK_ROWS = 1000
 
 
 def can_decide_missed(device: Device, deadline_at: datetime, now: datetime, settings: Settings) -> bool:
@@ -71,7 +75,7 @@ async def materialize_due_doses(session: AsyncSession, now: datetime, settings: 
             Elderly.deleted_at.is_(None),
         )
     )
-    created = 0
+    due: list[dict[str, Any]] = []
     for schedule, device in rows.all():
         tz = zone(device.timezone)
         today = now.astimezone(tz).date()
@@ -83,11 +87,13 @@ async def materialize_due_doses(session: AsyncSession, now: datetime, settings: 
             inst = dose_instants(day, schedule.window_start, schedule.window_end, schedule.tolerance_minutes, tz)
             if inst.scheduled_for > now or inst.scheduled_for < not_before:
                 continue
-            result = await session.execute(
-                dose_insert_stmt(device.id, device.elderly_id, schedule, inst, EVENT_SCHEDULE_DUE)
-            )
-            if result.scalar_one_or_none() is not None:
-                created += 1
+            due.append(pending_dose_row(device.id, device.elderly_id, schedule, inst, EVENT_SCHEDULE_DUE))
+    # A few multi-row statements instead of one round trip per (schedule, day):
+    # every pass re-offers all due doses and ON CONFLICT skips existing ones.
+    created = 0
+    for start in range(0, len(due), _INSERT_CHUNK_ROWS):
+        result = await session.execute(pending_doses_insert_stmt(due[start:start + _INSERT_CHUNK_ROWS]))
+        created += len(result.scalars().all())
     await session.commit()
     return created
 

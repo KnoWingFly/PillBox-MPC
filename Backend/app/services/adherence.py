@@ -6,9 +6,9 @@ Dose timeline for a schedule on local date D (device timezone):
     window_end_at = D @ window_end
     deadline_at   = window_end_at + tolerance_minutes
 
-- taken at t <= window_end_at                 -> TAKEN, delay_minutes = 0 (on time)
-- window_end_at < t <= deadline_at            -> TAKEN, delay_minutes = whole minutes
-                                                 after window_end (late)
+- taken at t <= window_end_at + on-time grace -> TAKEN, delay_minutes = 0 (on time)
+- on-time grace < t <= deadline_at            -> TAKEN, delay_minutes = whole minutes
+                                                 after window_end (late; the real delay)
 - nothing by deadline_at (+ grace, see rules_engine) -> MISSED
 
 ASSUMPTION: "late" is measured from window_end, not window_start. When the
@@ -16,6 +16,11 @@ mobile app/emulator use a single time (window_end == window_start) this is
 exactly "window_start + tolerance" as in the project brief. A taken dose with
 delay_minutes == 0 is TAKEN_ON_TIME, > 0 is TAKEN_LATE (the ERD has no LATE
 status, only TAKEN + delay_minutes).
+
+The on-time grace (settings.on_time_grace_minutes) is applied once, in delay_minutes_for, when
+the dose is recorded. Everything downstream (notification type, journal status, adherence rate)
+keeps reading `delay_minutes > 0`, so they can never disagree. The exact moment the lid opened
+is still stored in telemetry_logs.actual_open_time.
 """
 
 from collections.abc import Iterable
@@ -60,24 +65,38 @@ def match_dose(
     days_of_week: Iterable[int],
     tz: ZoneInfo,
     early_accept_minutes: int,
+    late_grace: timedelta = timedelta(0),
 ) -> DoseInstants | None:
     """Finds the dose (today or yesterday, local) whose acceptance window
-    [scheduled_for - early, deadline_at] contains occurred_at. Yesterday is
-    checked because deadline_at can cross midnight."""
+    [scheduled_for - early, deadline_at + late_grace] contains occurred_at.
+    Yesterday is checked because deadline_at can cross midnight.
+
+    late_grace exists for ALARM_TIMEOUT: the device counts its tolerance from
+    the moment the chamber popped up (scheduler.py _check_tolerance), which is
+    always at or after scheduled_for (1 s tick, queued chambers), so its
+    timeout lands after deadline_at and would otherwise never match."""
     local_day = occurred_at.astimezone(tz).date()
     days = list(days_of_week)
     for day in (local_day, local_day - timedelta(days=1)):
         if not is_scheduled_on(days, day):
             continue
         inst = dose_instants(day, window_start, window_end, tolerance_minutes, tz)
-        if inst.scheduled_for - timedelta(minutes=early_accept_minutes) <= occurred_at <= inst.deadline_at:
+        if inst.scheduled_for - timedelta(minutes=early_accept_minutes) <= occurred_at <= inst.deadline_at + late_grace:
             return inst
     return None
 
 
-def delay_minutes_for(taken_at: datetime, window_end_at: datetime) -> int:
+def on_time_grace(tolerance_minutes: int, configured_minutes: int) -> int:
+    """The grace that applies to a schedule: the configured one, but always at least one minute
+    shorter than the slot's tolerance, so a slot never loses its "late" zone entirely."""
+    return max(0, min(configured_minutes, tolerance_minutes - 1))
+
+
+def delay_minutes_for(taken_at: datetime, window_end_at: datetime, grace_minutes: int = 0) -> int:
+    """Whole minutes after window_end, or 0 when within the on-time grace (counts as on time)."""
     seconds_late = (taken_at - window_end_at).total_seconds()
-    return max(0, int(seconds_late // 60))
+    minutes_late = max(0, int(seconds_late // 60))
+    return 0 if minutes_late <= grace_minutes else minutes_late
 
 
 def journal_status(status: str | None, delay_minutes: int | None) -> JournalStatus | None:

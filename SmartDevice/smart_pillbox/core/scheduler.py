@@ -45,12 +45,27 @@ class PillboxScheduler:
     def reload_schedules(self) -> None:
         """Applies a freshly pulled config (schedule time, tolerance, days,
         active flag) to the live chambers without losing their runtime state
-        (an alarm that is ringing keeps ringing)."""
+        (an alarm that is ringing keeps ringing).
+
+        A chamber whose timing changed is re-armed for today: otherwise a slot
+        that was already TAKEN/MISSED today would ignore its new time until
+        tomorrow, and the caregiver's change would look like it did nothing."""
         for fresh in self.db.get_compartments():
             current = self.compartments.get(fresh.id)
             if current is None:
                 self.compartments[fresh.id] = fresh
                 continue
+            timing_changed = (
+                current.schedule_time != fresh.schedule_time
+                or current.days_of_week != fresh.days_of_week
+                or current.is_active != fresh.is_active
+            )
+            if timing_changed and current.state != ChamberState.ACTIVE:
+                current.state = ChamberState.IDLE
+                current.activated_at = None
+                self._actioned_today = {key for key in self._actioned_today if key[0] != current.id}
+                if current.id in self._queue:
+                    self._queue.remove(current.id)
             current.schedule_time = fresh.schedule_time
             current.tolerance_minutes = fresh.tolerance_minutes
             current.medication_name = fresh.medication_name

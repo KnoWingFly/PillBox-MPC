@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { HttpError, validationError } from './errors';
+import { timed } from './perf';
 
 type Handler<P> = (request: Request, params: P) => Promise<Response>;
 
@@ -21,7 +22,7 @@ export function errorResponse(status: number, code: string, message: string, det
 export function route<P = Record<string, string>>(handler: Handler<P>): Handler<P> {
   return async (request, params) => {
     try {
-      return await handler(request, params);
+      return await timed(request, 'api_route_total', () => handler(request, params));
     } catch (err) {
       if (err instanceof HttpError) return errorResponse(err.status, err.code, err.message, err.details);
       console.error('[api] unexpected error', request.method, new URL(request.url).pathname, err);

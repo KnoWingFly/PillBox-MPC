@@ -48,7 +48,7 @@ uv sync                       # installs runtime + dev dependencies
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-Use **one worker**. Device WebSockets and pending command acks live in process memory, so a command handled by worker A cannot reach a socket held by worker B. The DB-side rules (missed doses, notifications) are idempotent and safe with several workers, but commands are not.
+Use **one worker**. Device WebSockets, app WebSockets (`/ws/app`) and pending command acks live in process memory, so a command handled by worker A cannot reach a socket held by worker B. The DB-side rules (missed doses, notifications) are idempotent and safe with several workers, but commands are not.
 
 ## Tests
 
@@ -75,7 +75,7 @@ uv run python -m scripts.fake_device --device-code PB-XXXXXXXX --device-key '<se
 uv run python -m scripts.fake_device --device-code PB-XXXXXXXX --device-key '<secret>' --wifi-off-at 20 --wifi-off-for 90
 ```
 
-Type `open 1`, `close 1`, `wifi off`, `wifi on`, `status`, `help` while it runs. `--transport rest` behaves like the PySide6 emulator (REST heartbeats only, no commands).
+Type `open 1`, `close 1`, `wifi off`, `wifi on`, `status`, `help` while it runs. `--transport rest` sends REST heartbeats only and receives no commands. The PySide6 emulator uses REST for heartbeats and telemetry plus the WebSocket for commands.
 
 ## API overview (prefix `/api/v1`)
 
@@ -88,6 +88,7 @@ Type `open 1`, `close 1`, `wifi off`, `wifi on`, `status`, `help` while it runs.
 | Elderly | `POST/GET /elderly`, `GET/PUT/DELETE /elderly/{id}`, `POST/GET /elderly/{id}/caregivers`, `DELETE /elderly/{id}/caregivers/{caregiver_id}`, `POST /elderly/{id}/transfer-ownership`, `GET/PUT /elderly/{id}/notification-preferences` |
 | Journal | `GET /elderly/{id}/journal/calendar?month=YYYY-MM`, `GET /elderly/{id}/journal/{YYYY-MM-DD}`, `GET /elderly/{id}/journal/summary?start&end`, `PUT /journal/dose-logs/{id}/manual-confirmation` |
 | Notifications | `GET /notifications?tab=ALL\|LATE_MISSED\|RESOLVED&elderly_id&page&limit`, `GET /notifications/{id}`, `PUT /notifications/{id}/read`, `PUT /notifications/read-all`, `PUT /notifications/{id}/resolve` |
+| App push (no prefix) | WS `/ws/app`: first message `{"type":"auth","token":"<access token>"}`, then right after each commit the server sends `{"type":"notifications","items":[…]}` (the new rows, as in `GET /notifications`) or `{"type":"device","device_id","status":{…}}` (the `GET /devices/{id}/status` body), so the app updates without refetching. Polling stays as the fallback (`app/services/app_hub.py`) |
 | Admin | `POST /admin/devices`, `POST /admin/devices/{code}/rotate-secret` (X-Provisioning-Token) |
 | Misc | `GET /me`, `GET /health`, `GET /health/db` |
 

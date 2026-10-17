@@ -96,3 +96,36 @@ def test_interact_ignored_when_not_active(tmp_path):
 
     assert compartment.state == ChamberState.IDLE
     assert scheduler.db.get_unsynced_events() == []
+
+
+def _take_slot_one_at_seven(tmp_path):
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 59))
+    compartment = next(c for c in scheduler.compartments.values() if c.slot_number == 1)
+    compartment.schedule_time = "07:00"  # same as the seeded DB row for slot 1
+    scheduler.clock.jump(timedelta(minutes=2))
+    scheduler.tick()
+    scheduler.interact(compartment.id)
+    assert compartment.state == ChamberState.TAKEN
+    return scheduler, compartment
+
+
+def test_reload_rearms_a_taken_slot_whose_time_changed(tmp_path):
+    scheduler, compartment = _take_slot_one_at_seven(tmp_path)
+
+    # The caregiver moves the dose to 07:30 in the app; the device pulls the config.
+    scheduler.db.update_schedules([{"slot_number": 1, "window_start": "07:30", "tolerance_minutes": 30}])
+    scheduler.reload_schedules()
+    assert compartment.state == ChamberState.IDLE
+
+    scheduler.clock.jump(timedelta(minutes=30))  # ~07:31
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+
+
+def test_reload_keeps_state_when_timing_is_unchanged(tmp_path):
+    scheduler, compartment = _take_slot_one_at_seven(tmp_path)
+
+    scheduler.db.update_schedules([{"slot_number": 1, "window_start": "07:00", "tolerance_minutes": 30}])
+    scheduler.reload_schedules()
+    scheduler.tick()
+    assert compartment.state == ChamberState.TAKEN  # no second pop-up for the same dose

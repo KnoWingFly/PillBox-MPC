@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "dependencies": {
     "@expo/ui": "~57.0.20",
+    "@expo/vector-icons": "^15.1.1",
     "@prisma/client": "6.19.3",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-google-signin/google-signin": "^16.1.5",
@@ -42,6 +43,8 @@
   "devDependencies": {
     "@types/react": "~19.2.2",
     "dotenv": "^18.0.4",
+    "eslint": "^9.39.5",
+    "eslint-config-expo": "~57.0.2",
     "prisma": "6.19.3",
     "tsx": "^4.23.15",
     "typescript": "~6.0.3"

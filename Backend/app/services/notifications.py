@@ -19,6 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import timing
+from app.services.app_hub import queue_notifications
 from app.models import Elderly, Notification, NotificationPreference, User, UserElderlyRole
 from app.models.enums import NotificationType, Severity
 
@@ -27,12 +29,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Preferences:
-    """Effective preferences. Defaults mirror the column defaults in
-    migrations/0001 and apply when a caregiver never saved preferences."""
+    """Effective preferences when a caregiver never saved preferences.
+    Mirrors the column defaults in migrations/0001, except notify_on_taken:
+    the app has no preferences screen yet, so a FALSE default meant on-time
+    doses were never reported at all (PUT /notification-preferences still
+    turns it off)."""
 
     push_enabled: bool = True
     notify_on_missed: bool = True
-    notify_on_taken: bool = False
+    notify_on_taken: bool = True
     notify_on_device_offline: bool = True
     device_offline_after_minutes: int = 10
     notify_on_low_battery: bool = True
@@ -56,6 +61,9 @@ class Recipient:
     user_id: UUID
     language: str  # "ID" | "EN"
     prefs: Preferences
+    # Display name of the elderly being notified about (nickname or full name).
+    # Loaded in the same query so dose messages need no extra round trip.
+    elderly_name: str
 
 
 def wants(prefs: Preferences, ntype: NotificationType) -> bool:
@@ -79,7 +87,7 @@ def wants(prefs: Preferences, ntype: NotificationType) -> bool:
 
 async def load_recipients(session: AsyncSession, elderly_id: UUID) -> list[Recipient]:
     rows = await session.execute(
-        select(User.id, User.interface_language, NotificationPreference)
+        select(User.id, User.interface_language, NotificationPreference, Elderly.nickname, Elderly.full_name)
         .join(UserElderlyRole, UserElderlyRole.user_id == User.id)
         .join(Elderly, Elderly.id == UserElderlyRole.elderly_id)
         .outerjoin(
@@ -90,8 +98,13 @@ async def load_recipients(session: AsyncSession, elderly_id: UUID) -> list[Recip
         .where(UserElderlyRole.elderly_id == elderly_id, Elderly.deleted_at.is_(None))
     )
     return [
-        Recipient(user_id=uid, language=(lang or "ID").upper(), prefs=Preferences.from_row(pref))
-        for uid, lang, pref in rows.all()
+        Recipient(
+            user_id=uid,
+            language=(lang or "ID").upper(),
+            prefs=Preferences.from_row(pref),
+            elderly_name=nickname or full_name,
+        )
+        for uid, lang, pref, nickname, full_name in rows.all()
     ]
 
 
@@ -156,6 +169,10 @@ class NotificationSpec:
     device_id: UUID | None = None
     telemetry_log_id: UUID | None = None
     params: dict[str, Any] = field(default_factory=dict)
+    # Not stored on the notification: the feed joins them from telemetry_logs.
+    # Set them when known so the pushed item (app_hub) matches the feed.
+    slot_number: int | None = None
+    delay_minutes: int | None = None
 
 
 async def notify(
@@ -195,7 +212,7 @@ async def notify(
             index_elements=[Notification.event_key, Notification.user_id],
             index_where=Notification.event_key.is_not(None),
         )
-        .returning(Notification.id, Notification.user_id)
+        .returning(Notification.id, Notification.user_id, Notification.created_at)
     )
     inserted = (await session.execute(stmt)).all()
     if inserted:
@@ -203,11 +220,37 @@ async def notify(
             "notifications_created",
             extra={"type": spec.type.value, "event_key": spec.event_key, "count": len(inserted)},
         )
+        # Correlation id here is the device event_id (set by telemetry ingestion)
+        # or the rules-engine/presence pass; the app logs these notification ids.
+        timing.log_timing(
+            "iot_to_app", "notification_rows_created",
+            type=spec.type.value, notification_ids=[str(nid) for nid, _, _ in inserted],
+        )
+        # Open app sockets receive the new rows right after commit.
+        messages = {r.user_id: v["message"] for r, v in zip(targets, values, strict=True)}
+        items: dict[UUID, list[dict[str, Any]]] = {}
+        for nid, uid, created_at in inserted:
+            items.setdefault(uid, []).append(
+                {
+                    "id": str(nid),
+                    "type": spec.type.value,
+                    "severity": spec.severity.value,
+                    "elderly_id": str(spec.elderly_id),
+                    "device_id": str(spec.device_id) if spec.device_id else None,
+                    "slot_number": spec.slot_number,
+                    "delay_minutes": spec.delay_minutes,
+                    "message": messages[uid],
+                    "is_read": False,
+                    "is_resolved": False,
+                    "created_at": created_at.isoformat(),
+                }
+            )
+        queue_notifications(session, items)
         push_targets = {r.user_id for r in targets if r.prefs.push_enabled}
         await dispatch_push(
-            session, [(nid, uid) for nid, uid in inserted if uid in push_targets]
+            session, [(nid, uid) for nid, uid, _ in inserted if uid in push_targets]
         )
-    return [nid for nid, _ in inserted]
+    return [nid for nid, _, _ in inserted]
 
 
 async def dispatch_push(session: AsyncSession, notifications: list[tuple[UUID, UUID]]) -> None:

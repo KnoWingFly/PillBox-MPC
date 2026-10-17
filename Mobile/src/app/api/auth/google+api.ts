@@ -5,6 +5,7 @@ import { HttpError, unauthorized } from '@/server/errors';
 import { json, parseBody, route, userAgent } from '@/server/http';
 import { googleSchema } from '@/server/schemas';
 import { supabaseAdmin } from '@/server/supabase-admin';
+import { timed } from '@/server/perf';
 import { issueTokens, toTokenResponse } from '@/server/tokens';
 import { isUniqueViolation } from '@/server/users';
 
@@ -90,14 +91,17 @@ async function resolveUser(profile: GoogleProfile, timezone: string) {
 export const POST = route(async (request) => {
   const body = await parseBody(request, googleSchema);
 
-  const { data, error } = await supabaseAdmin().auth.getUser(body.supabase_access_token);
+  // Network call to Supabase Auth (not a local JWT check).
+  const { data, error } = await timed(request, 'supabase_get_user', () =>
+    supabaseAdmin().auth.getUser(body.supabase_access_token),
+  );
   if (error || !data.user) throw invalidToken();
   const profile = extractGoogleProfile(data.user);
   if (!profile) throw invalidToken();
 
   let resolved;
   try {
-    resolved = await resolveUser(profile, body.timezone);
+    resolved = await timed(request, 'resolve_user', () => resolveUser(profile, body.timezone));
   } catch (err) {
     // A concurrent first sign-in created the same user/identity; the retry finds it.
     if (!isUniqueViolation(err)) throw err;
@@ -105,7 +109,7 @@ export const POST = route(async (request) => {
   }
 
   const { user, isNew } = resolved;
-  const tokens = await issueTokens(user.id, { userAgent: userAgent(request) });
+  const tokens = await timed(request, 'issue_tokens', () => issueTokens(user.id, { userAgent: userAgent(request) }));
   return json({
     ...toTokenResponse(tokens),
     caregiver: { id: user.id, full_name: user.fullName, email: user.email, google_linked: true },

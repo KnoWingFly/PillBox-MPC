@@ -14,6 +14,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import timing
 from app.core.config import Settings
 from app.core.errors import AppError, conflict, not_found, unprocessable
 from app.core.security import hash_pin, verify_pin
@@ -36,6 +37,7 @@ from app.schemas.devices import (
     PairingScanOut,
     SlotLayoutOut,
 )
+from app.services import stock_cache
 from app.services.access import get_device_for_user, require_role
 from app.services.connection_manager import (
     CommandAck,
@@ -53,7 +55,6 @@ from app.services.timeutil import as_aware, is_valid_timezone, zone
 logger = logging.getLogger(__name__)
 
 _PIN = re.compile(r"^\d{4}$")
-DEFAULT_TIMEZONE = "Asia/Jakarta"
 
 
 # --- helpers ------------------------------------------------------------------
@@ -88,12 +89,12 @@ def check_pin_format(pin: str) -> None:
         raise unprocessable("DEVICE_PIN_INVALID", "Device PIN must be exactly 4 digits")
 
 
-def wifi_strength(rssi: int | None) -> Literal["LEMAH", "SEDANG", "KUAT"] | None:
+def wifi_strength(rssi: int | None, settings: Settings) -> Literal["LEMAH", "SEDANG", "KUAT"] | None:
     if rssi is None:
         return None
-    if rssi >= -60:
+    if rssi >= settings.wifi_rssi_strong_dbm:
         return "KUAT"
-    if rssi >= -75:
+    if rssi >= settings.wifi_rssi_medium_dbm:
         return "SEDANG"
     return "LEMAH"
 
@@ -178,6 +179,7 @@ async def drop_undecided_doses(session: AsyncSession, *, device_id: UUID | None 
 
 async def unpair(session: AsyncSession, device: Device, now: datetime) -> None:
     """Releases the device so it can be paired again (does not commit)."""
+    stock_cache.forget(device.id)
     await session.execute(
         update(Schedule)
         .where(Schedule.device_id == device.id, Schedule.deleted_at.is_(None))
@@ -210,7 +212,9 @@ async def scan(session: AsyncSession, raw_payload: str) -> PairingScanOut:
     )
 
 
-async def pair(session: AsyncSession, user: User, body: PairDeviceIn, now: datetime) -> PairDeviceOut:
+async def pair(
+    session: AsyncSession, user: User, body: PairDeviceIn, settings: Settings, now: datetime
+) -> PairDeviceOut:
     check_pin_format(body.device_pin)
     code = parse_qr_payload(body.device_qr_payload)
     device = (
@@ -224,7 +228,8 @@ async def pair(session: AsyncSession, user: User, body: PairDeviceIn, now: datet
     # (roles are elderly-level; the elderly creator is already its OWNER).
     await require_role(session, user.id, body.elderly_id, EDITOR_ROLES)
 
-    timezone = body.timezone or (user.timezone if is_valid_timezone(user.timezone) else DEFAULT_TIMEZONE)
+    profile_tz = user.timezone if is_valid_timezone(user.timezone) else settings.default_device_timezone
+    timezone = body.timezone or profile_tz
     device.elderly_id = body.elderly_id
     device.device_nickname = body.device_nickname
     device.timezone = timezone
@@ -233,6 +238,7 @@ async def pair(session: AsyncSession, user: User, body: PairDeviceIn, now: datet
     device.paired_at = now
     device.is_refill_mode = False
     version = await bump_config(session, device)
+    stock_cache.forget(device.id)
     await session.execute(
         insert(DeviceStock)
         .values([{"device_id": device.id, "slot_number": n, "remaining_units": 0} for n in SLOT_NUMBERS])
@@ -404,6 +410,12 @@ async def remove(session: AsyncSession, user: User, device_id: UUID, now: dateti
 
 async def status(session: AsyncSession, user: User, device_id: UUID, settings: Settings) -> DeviceStatusOut:
     device, _ = await get_device_for_user(session, user.id, device_id, ALL_ROLES)
+    return build_status(device, settings)
+
+
+def build_status(device: Device, settings: Settings) -> DeviceStatusOut:
+    """GET /devices/{id}/status body from an already-loaded row (no DB access);
+    also pushed to app sockets after a device change (services/app_hub.py)."""
     doors = device.chamber_doors or []
     return DeviceStatusOut(
         device_id=device.id,
@@ -411,7 +423,7 @@ async def status(session: AsyncSession, user: User, device_id: UUID, settings: S
         last_seen_at=device.last_heartbeat,
         online_since=device.online_since,
         offline_since=device.offline_since,
-        wifi_strength=wifi_strength(device.wifi_rssi_dbm),
+        wifi_strength=wifi_strength(device.wifi_rssi_dbm, settings),
         wifi_rssi_dbm=device.wifi_rssi_dbm,
         battery_percent=device.battery_percentage,
         estimated_battery_days_remaining=battery_days(device, settings),
@@ -471,8 +483,11 @@ async def calibrate(
 async def trigger_alarm(
     session: AsyncSession, user: User, device_id: UUID, slot_number: int | None, duration_seconds: int, settings: Settings
 ) -> CommandResultOut:
+    started = timing.now_ms()
+    timing.log_timing("app_to_iot", "backend_received", command=DeviceCommand.TRIGGER_ALARM.value)
     device, _ = await get_device_for_user(session, user.id, device_id, EDITOR_ROLES)
     await session.commit()  # do not hold a transaction while waiting for the ack
+    timing.log_timing("app_to_iot", "access_checked", db_ms=timing.since_ms(started))
     ack = await send_command_or_raise(
         device,
         DeviceCommand.TRIGGER_ALARM,

@@ -4,30 +4,34 @@
 // Mock mode: when that variable is unset, everything is served from in-memory state with an
 // artificial delay, so the screen works without the smart device or the backend.
 
-import { settingApi } from '@/lib/api/setting';
+import { AppConfig } from '@/config';
+import {
+  ApiError,
+  expireSession,
+  fetchWithTimeout,
+  getFreshAccessToken,
+  refreshAccessToken,
+  tokenExpiresAtMs,
+} from '@/lib/api/client';
 import { tokenStore } from '@/lib/api/token-store';
+import { newCorrelationId, perfEnabled, perfLog } from '@/lib/perf';
 
 import { SLOT_IDS } from './types';
 import type {
+  AdherenceSummary,
   AppNotification,
   DeviceStatus,
   DoseEventType,
+  NotificationSeverity,
   NotificationType,
   Slot,
   SlotId,
   ToleranceMinutes,
 } from './types';
 
-export const BASE_URL = (process.env.EXPO_PUBLIC_PILLBOX_API_URL ?? '').replace(/\/+$/, '');
+export const BASE_URL = AppConfig.pillboxApiUrl;
 
 export const USE_MOCK = BASE_URL === '';
-
-// Optional: pin the dashboard to one device id. Unset = the first device the caregiver can see.
-const PINNED_DEVICE_ID = process.env.EXPO_PUBLIC_PILLBOX_DEVICE_ID || null;
-
-/** Sachet capacity per compartment (backend STOCK_CAPACITY_PER_SLOT default). */
-const SLOT_CAPACITY = 30;
-const NOTIFICATION_POLL_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Helpers shared with the UI
@@ -90,6 +94,7 @@ let mockDevice: DeviceStatus = {
   batteryPercent: 86,
   wifiLabel: 'Rumah_WiFi',
   lastSyncedAt: Date.now() - 2 * 60 * 1000,
+  openSlots: [],
 };
 
 function delay(): Promise<void> {
@@ -125,12 +130,21 @@ export class BackendError extends Error {
 
 type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
-async function send(path: string, method: Method, body: unknown, token: string | null): Promise<Response> {
+type SendOptions = { correlationId?: string };
+
+async function send(
+  path: string,
+  method: Method,
+  body: unknown,
+  token: string | null,
+  opts: SendOptions,
+): Promise<Response> {
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (token) headers.Authorization = `Bearer ${token}`;
+  if (opts.correlationId) headers['X-Correlation-ID'] = opts.correlationId;
   try {
-    return await fetch(`${BASE_URL}/api/v1${path}`, {
+    return await fetchWithTimeout(`${BASE_URL}/api/v1${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -140,45 +154,72 @@ async function send(path: string, method: Method, body: unknown, token: string |
   }
 }
 
-async function backend<T>(path: string, method: Method = 'GET', body?: unknown): Promise<T> {
-  let res = await send(path, method, body, await tokenStore.getAccessToken());
-  if (res.status === 401) {
-    // The backend verifies the same access token the app's own API issues. When it has
-    // expired, any authenticated call to the app's API rotates it (src/lib/api/client.ts),
-    // then the request is retried once with the new token.
-    await settingApi.get();
-    res = await send(path, method, body, await tokenStore.getAccessToken());
-  }
-  if (!res.ok) {
-    let code = 'HTTP_ERROR';
-    let message = `Backend request failed (${res.status})`;
-    try {
-      const err = (await res.json()) as { error?: { code?: string; message?: string } };
-      code = err.error?.code ?? code;
-      message = err.error?.message ?? message;
-    } catch {
-      // non-JSON error body
+/** Access token for the backend; it verifies the same tokens the app's own API issues. */
+async function accessToken(): Promise<string | null> {
+  try {
+    return await getFreshAccessToken();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'UNAUTHORIZED') {
+      throw new BackendError(401, 'UNAUTHORIZED', 'Session expired');
     }
-    throw new BackendError(res.status, code, message);
+    // Refresh endpoint unreachable: try the stored token; the backend decides.
+    return tokenStore.getAccessToken();
   }
+}
+
+async function toBackendError(res: Response): Promise<BackendError> {
+  let code = 'HTTP_ERROR';
+  let message = `Backend request failed (${res.status})`;
+  try {
+    const err = (await res.json()) as { error?: { code?: string; message?: string } };
+    code = err.error?.code ?? code;
+    message = err.error?.message ?? message;
+  } catch {
+    // non-JSON error body
+  }
+  return new BackendError(res.status, code, message);
+}
+
+async function backend<T>(path: string, method: Method = 'GET', body?: unknown, opts: SendOptions = {}): Promise<T> {
+  let res = await send(path, method, body, await accessToken(), opts);
+  if (res.status === 401) {
+    // Only an invalid/expired token is retried. Other 401s (e.g. DEVICE_PIN_INCORRECT) are final:
+    // retrying them would replay the request and count a wrong PIN twice against the lockout.
+    const err = await toBackendError(res);
+    if (err.code !== 'UNAUTHORIZED') throw err;
+    let fresh: string | null;
+    try {
+      fresh = await refreshAccessToken();
+    } catch {
+      throw new BackendError(0, 'NETWORK_ERROR', 'Cannot refresh the session');
+    }
+    if (!fresh) {
+      await expireSession();
+      throw err;
+    }
+    res = await send(path, method, body, fresh, opts);
+  }
+  if (!res.ok) throw await toBackendError(res);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
 // --- backend response shapes (subset of what the API returns) ---------------
 
-type BackendDeviceList = { data: { id: string; device_nickname: string | null }[]; total: number };
+type BackendDeviceList = { data: { id: string; device_nickname: string | null; elderly_id: string }[]; total: number };
 type BackendDeviceDetail = { id: string; device_nickname: string | null; device_code: string };
 type BackendStatus = {
   connectivity: 'ONLINE' | 'OFFLINE';
   last_seen_at: string | null;
   wifi_strength: 'LEMAH' | 'SEDANG' | 'KUAT' | null;
   battery_percent: number | null;
+  chambers?: { slot_number: number; door: 'OPEN' | 'CLOSED' }[];
 };
 type BackendSlotSchedule = {
   id: string | null;
   slot_number: number;
   window_start: string | null;
+  window_end: string | null;
   tolerance_minutes: number | null;
   active: boolean;
   is_empty: boolean;
@@ -187,15 +228,43 @@ type BackendStock = { slot_number: number; remaining_units: number };
 type BackendNotification = {
   id: string;
   type: 'DOSE_TAKEN' | 'DOSE_LATE' | 'DOSE_MISSED' | 'DEVICE_OFFLINE' | 'DEVICE_ONLINE' | 'LOW_BATTERY' | 'UNSCHEDULED_OPEN';
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
   slot_number: number | null;
   delay_minutes: number | null;
   message: string;
   is_read: boolean;
   created_at: string;
 };
-type BackendNotificationPage = { data: BackendNotification[] };
 
-let cachedDeviceId: string | null = PINNED_DEVICE_ID;
+const SEVERITY: Record<BackendNotification['severity'], NotificationSeverity> = {
+  INFO: 'info',
+  WARNING: 'warning',
+  CRITICAL: 'critical',
+};
+type BackendNotificationPage = { data: BackendNotification[]; unread_count: number; total: number };
+type BackendJournalSummary = {
+  total_scheduled: number;
+  taken_on_time: number;
+  taken_late: number;
+  missed: number;
+  /** Percent of decided doses that were taken (late counts as taken). */
+  compliance_rate: number | null;
+  avg_delay_minutes: number | null;
+};
+
+let cachedDeviceId: string | null = AppConfig.pinnedDeviceId;
+let cachedElderlyId: string | null = null;
+
+/** The elderly person the dashboard's pillbox belongs to. */
+async function elderlyId(): Promise<string> {
+  if (cachedElderlyId) return cachedElderlyId;
+  const id = await deviceId();
+  const list = await backend<BackendDeviceList>('/devices');
+  const found = list.data.find((d) => d.id === id);
+  if (!found) throw new BackendError(404, 'NO_DEVICE', 'The selected pillbox is no longer paired.');
+  cachedElderlyId = found.elderly_id;
+  return cachedElderlyId;
+}
 
 async function deviceId(): Promise<string> {
   if (cachedDeviceId) return cachedDeviceId;
@@ -250,6 +319,7 @@ export async function connectPillbox(input: ConnectPillboxInput): Promise<Connec
     });
   }
   cachedDeviceId = scan.device_id;
+  cachedElderlyId = null;
   return { deviceId: scan.device_id, joined: scan.is_registered };
 }
 
@@ -277,16 +347,30 @@ async function backendDeviceStatus(): Promise<DeviceStatus> {
     backend<BackendDeviceDetail>(`/devices/${id}`),
     backend<BackendStatus>(`/devices/${id}/status`),
   ]);
+  return { deviceName: detail.device_nickname ?? detail.device_code, ...toStatusFields(status) };
+}
+
+/** Everything in DeviceStatus except the name; also used for statuses pushed over /ws/app. */
+export type DeviceStatusFields = Omit<DeviceStatus, 'deviceName'>;
+
+function toStatusFields(status: BackendStatus): DeviceStatusFields {
   return {
-    deviceName: detail.device_nickname ?? detail.device_code,
     online: status.connectivity === 'ONLINE',
     batteryPercent: status.battery_percent ?? 0,
     wifiLabel: status.wifi_strength ? `Sinyal ${status.wifi_strength.toLowerCase()}` : '-',
     lastSyncedAt: status.last_seen_at ? Date.parse(status.last_seen_at) : 0,
+    openSlots: (status.chambers ?? []).filter((c) => c.door === 'OPEN').map((c) => slotIdOf(c.slot_number)),
   };
 }
 
-async function backendSchedules(): Promise<{ slots: Slot[]; scheduleIds: Map<SlotId, string> }> {
+type ScheduleState = {
+  slots: Slot[];
+  scheduleIds: Map<SlotId, string>;
+  /** Backend rows by slot, to skip writes that would change nothing. */
+  rows: Map<SlotId, BackendSlotSchedule>;
+};
+
+async function backendSchedules(): Promise<ScheduleState> {
   const id = await deviceId();
   const [schedules, stock] = await Promise.all([
     backend<BackendSlotSchedule[]>(`/devices/${id}/schedules`),
@@ -294,8 +378,10 @@ async function backendSchedules(): Promise<{ slots: Slot[]; scheduleIds: Map<Slo
   ]);
   const stockBySlot = new Map(stock.map((s) => [s.slot_number, s.remaining_units]));
   const scheduleIds = new Map<SlotId, string>();
+  const rows = new Map<SlotId, BackendSlotSchedule>();
   const slots = schedules.map((s): Slot => {
     const slotId = slotIdOf(s.slot_number);
+    rows.set(slotId, s);
     if (s.id) scheduleIds.set(slotId, s.id);
     return {
       id: slotId,
@@ -303,15 +389,34 @@ async function backendSchedules(): Promise<{ slots: Slot[]; scheduleIds: Map<Slo
       enabled: !s.is_empty && s.active,
       toleranceMinutes: toTolerance(s.tolerance_minutes),
       stock: stockBySlot.get(s.slot_number) ?? 0,
-      capacity: SLOT_CAPACITY,
+      capacity: AppConfig.slotCapacity,
     };
   });
-  return { slots, scheduleIds };
+  return { slots, scheduleIds, rows };
+}
+
+/** Sachets per slot as last reported by the pillbox (heartbeat), without the schedules. */
+export async function getStock(): Promise<Partial<Record<SlotId, number>>> {
+  if (USE_MOCK) return Object.fromEntries(mockSchedules.map((s) => [s.id, s.stock]));
+  const stock = await backend<BackendStock[]>(`/devices/${await deviceId()}/stock`);
+  return Object.fromEntries(stock.map((s) => [slotIdOf(s.slot_number), s.remaining_units]));
+}
+
+/** True when PUT-ing these fields would leave the backend row exactly as it is. */
+function isUnchanged(row: BackendSlotSchedule | undefined, fields: { window_start: string; window_end: string; tolerance_minutes: number; active: boolean }): boolean {
+  return (
+    row !== undefined &&
+    !row.is_empty &&
+    row.window_start === fields.window_start &&
+    row.window_end === fields.window_end &&
+    row.tolerance_minutes === fields.tolerance_minutes &&
+    row.active === fields.active
+  );
 }
 
 async function backendSaveSchedule(slots: Slot[]): Promise<Slot[]> {
   const id = await deviceId();
-  const { scheduleIds } = await backendSchedules();
+  const { scheduleIds, rows } = await backendSchedules();
   // Clear/deactivate first so moving a time from one slot to another never trips the
   // backend's WINDOW_OVERLAP check halfway through.
   const ordered = [...slots].sort((a, b) => Number(a.enabled && a.timeMinutes !== null) - Number(b.enabled && b.timeMinutes !== null));
@@ -331,6 +436,9 @@ async function backendSaveSchedule(slots: Slot[]): Promise<Slot[]> {
       active: slot.enabled,
     };
     if (existing) {
+      // Every PUT bumps the device config version and makes the device pull its config again, so
+      // untouched slots are skipped. Writes stay sequential: their order avoids WINDOW_OVERLAP.
+      if (isUnchanged(rows.get(slot.id), fields)) continue;
       await backend(`/devices/${id}/schedules/${existing}`, 'PUT', fields);
     } else {
       await backend(`/devices/${id}/schedules`, 'POST', {
@@ -344,11 +452,23 @@ async function backendSaveSchedule(slots: Slot[]): Promise<Slot[]> {
 }
 
 async function backendAlarm(slotId: SlotId | null, durationSeconds: number): Promise<void> {
+  const correlationId = perfEnabled() ? newCorrelationId() : undefined;
+  const tappedAt = Date.now();
+  perfLog('app_to_iot', 'app_button_tap', { correlation_id: correlationId });
   const id = await deviceId();
-  await backend(`/devices/${id}/alarm`, 'POST', {
-    slot_number: slotId ? slotNumberOf(slotId) : null,
-    duration_seconds: durationSeconds,
-  });
+  try {
+    await backend(
+      `/devices/${id}/alarm`,
+      'POST',
+      { slot_number: slotId ? slotNumberOf(slotId) : null, duration_seconds: durationSeconds },
+      { correlationId },
+    );
+    perfLog('app_to_iot', 'app_response_received', { correlation_id: correlationId, ok: true, ms: Date.now() - tappedAt });
+  } catch (err) {
+    const code = err instanceof BackendError ? err.code : 'UNKNOWN';
+    perfLog('app_to_iot', 'app_response_received', { correlation_id: correlationId, ok: false, code, ms: Date.now() - tappedAt });
+    throw err;
+  }
 }
 
 const NOTIFICATION_TITLES: Record<BackendNotification['type'], string> = {
@@ -371,6 +491,7 @@ function toAppNotification(n: BackendNotification): AppNotification {
   return {
     id: n.id,
     type,
+    severity: SEVERITY[n.severity] ?? 'info',
     slotId: n.slot_number ? slotIdOf(n.slot_number) : null,
     title: NOTIFICATION_TITLES[n.type],
     message: n.message,
@@ -380,34 +501,209 @@ function toAppNotification(n: BackendNotification): AppNotification {
   };
 }
 
-// Notifications are written by the backend (telemetry, rules engine, presence monitor);
-// the dashboard receives them by polling while at least one listener is subscribed.
+// Notifications are written by the backend (telemetry, rules engine, presence monitor). The
+// backend's /ws/app socket hints "refetch now" right after each commit (see the push section
+// below); polling while at least one listener is subscribed is the fallback. Worst-case added
+// delay without a socket = AppConfig.notificationPollMs + one request.
 const seenNotificationIds = new Set<string>();
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+/** false until the first poll after (re)subscribing: that one only loads history. */
+let historyLoaded = false;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let pollActive = false;
+let pollGeneration = 0;
 
 async function pollNotifications(): Promise<void> {
+  const startedAt = Date.now();
   try {
-    const page = await backend<BackendNotificationPage>('/notifications?limit=50');
-    const fresh = page.data.filter((n) => !seenNotificationIds.has(n.id)).reverse(); // oldest first
-    for (const n of fresh) {
-      seenNotificationIds.add(n.id);
-      const app = toAppNotification(n);
-      listeners.forEach((listener) => listener(app));
-    }
+    const page = await backend<BackendNotificationPage>(`/notifications?limit=${AppConfig.notificationPageSize}`);
+    applyNotifications([...page.data].reverse(), 'app_fetched', startedAt); // oldest first
+    historyLoaded = true;
   } catch (err) {
     console.warn('[pillbox] notification poll failed', err);
   }
 }
 
+/** Shows notifications not seen yet (from a poll or a push), oldest first. */
+function applyNotifications(items: BackendNotification[], step: 'app_fetched' | 'app_pushed', startedAt: number): void {
+  for (const n of items) {
+    if (seenNotificationIds.has(n.id)) continue;
+    seenNotificationIds.add(n.id);
+    // The first poll after subscribing only learns what already exists: the list loads history
+    // itself (lib/notifications.ts), so replaying it here would re-toast and double-count unread.
+    if (!historyLoaded && step === 'app_fetched') continue;
+    if (historyLoaded || step === 'app_pushed') {
+      perfLog('iot_to_app', step, {
+        notification_id: n.id,
+        ms: Date.now() - startedAt,
+        // Phone clock vs server clock; compare with the backend log for exact numbers.
+        created_to_shown_ms: Date.now() - Date.parse(n.created_at),
+      });
+    }
+    const app = toAppNotification(n);
+    listeners.forEach((listener) => listener(app));
+  }
+}
+
+// A setTimeout chain instead of setInterval, so a slow poll never overlaps the next one.
+// The generation check ends an old loop when polling is stopped and restarted mid-request.
 function startPolling(): void {
-  if (pollTimer) return;
-  void pollNotifications();
-  pollTimer = setInterval(() => void pollNotifications(), NOTIFICATION_POLL_MS);
+  if (pollActive) return;
+  pollActive = true;
+  const generation = ++pollGeneration;
+  const loop = async () => {
+    await pollNotifications();
+    if (pollActive && generation === pollGeneration) {
+      pollTimer = setTimeout(() => void loop(), AppConfig.notificationPollMs);
+    }
+  };
+  void loop();
 }
 
 function stopPolling(): void {
-  if (pollTimer) clearInterval(pollTimer);
+  pollActive = false;
+  if (pollTimer) clearTimeout(pollTimer);
   pollTimer = null;
+}
+
+// ---------------------------------------------------------------------------
+// Push hints (Backend /ws/app, Backend/app/services/app_hub.py)
+// The backend sends {"type":"notifications"} or {"type":"device"} right after a DB commit, so the
+// dashboard refetches at once instead of on the next poll. The socket carries no data: the
+// refetch goes through the normal authenticated endpoints. Polling keeps running as the fallback
+// (socket down, hint lost).
+// ---------------------------------------------------------------------------
+
+/** status = new values pushed by the backend; null = something changed, refetch. */
+export type DeviceChangeListener = (status: DeviceStatusFields | null) => void;
+
+const deviceListeners = new Set<DeviceChangeListener>();
+
+/** Called when the backend reports a change to the device (status, battery, doors, stock). */
+export function subscribeToDeviceChanges(listener: DeviceChangeListener): () => void {
+  deviceListeners.add(listener);
+  return () => {
+    deviceListeners.delete(listener);
+  };
+}
+
+type PushMessage = {
+  type?: string;
+  items?: BackendNotification[];
+  device_id?: string;
+  status?: BackendStatus;
+};
+
+const RECONNECT_MIN_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+
+let socket: WebSocket | null = null;
+let socketWanted = false;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelayMs = RECONNECT_MIN_MS;
+
+function appSocketUrl(): string {
+  return `${BASE_URL.replace(/^http/, 'ws')}/ws/app`;
+}
+
+async function openSocket(): Promise<void> {
+  if (!socketWanted || socket) return;
+  let token: string | null = null;
+  try {
+    token = await accessToken();
+  } catch {
+    // session expired: the auth provider signs out; retry in case it was transient
+  }
+  if (!socketWanted || socket) return; // stopped, or opened by another call, while awaiting
+  if (!token) {
+    scheduleReconnect();
+    return;
+  }
+  const ws = new WebSocket(appSocketUrl());
+  socket = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
+  ws.onmessage = (e) => {
+    let message: PushMessage;
+    try {
+      message = JSON.parse(String(e.data)) as PushMessage;
+    } catch {
+      return;
+    }
+    const type = message.type;
+    if (type === 'ready') {
+      if (__DEV__) console.info('[pillbox] live updates connected');
+      reconnectDelayMs = RECONNECT_MIN_MS;
+      void pollNotifications(); // catch up on anything sent while disconnected
+    } else if (type === 'notifications') {
+      // The rows come with the message; an older backend sends none, so fetch them.
+      if (message.items?.length) applyNotifications(message.items, 'app_pushed', Date.now());
+      else void pollNotifications();
+    } else if (type === 'device') {
+      // Another device the user follows: this dashboard shows only cachedDeviceId.
+      if (message.device_id && cachedDeviceId && message.device_id !== cachedDeviceId) return;
+      if (__DEV__) console.info('[pillbox] device update pushed');
+      const status = message.status ? toStatusFields(message.status) : null;
+      deviceListeners.forEach((listener) => listener(status));
+    }
+  };
+  ws.onclose = (e) => {
+    if (socket === ws) socket = null;
+    if (__DEV__ && socketWanted) console.info(`[pillbox] live updates disconnected (code ${e.code}), retrying`);
+    scheduleReconnect();
+  };
+  // onerror is always followed by onclose, which reconnects.
+}
+
+function scheduleReconnect(): void {
+  if (!socketWanted || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void openSocket();
+  }, reconnectDelayMs);
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
+}
+
+function startSocket(): void {
+  socketWanted = true;
+  void openSocket();
+}
+
+function stopSocket(): void {
+  socketWanted = false;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectDelayMs = RECONNECT_MIN_MS;
+  const ws = socket;
+  socket = null;
+  ws?.close();
+}
+
+/** Call after pairing or joining a pillbox, so the socket also covers the new device. */
+export function resubscribeRealtime(): void {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'resubscribe' }));
+}
+
+// Refreshes the access token shortly before it expires, so a push-triggered refetch never waits
+// for an inline refresh (getFreshAccessToken refreshes once less than tokenRefreshSkewMs is left).
+let tokenTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function scheduleTokenRefresh(): Promise<void> {
+  if (tokenTimer) clearTimeout(tokenTimer);
+  tokenTimer = null;
+  const token = await tokenStore.getAccessToken();
+  const expiresAt = token ? tokenExpiresAtMs(token) : null;
+  if (expiresAt === null || !socketWanted) return;
+  const dueInMs = Math.max(expiresAt - AppConfig.tokenRefreshSkewMs + 1_000 - Date.now(), 1_000);
+  tokenTimer = setTimeout(() => {
+    tokenTimer = null;
+    getFreshAccessToken()
+      .catch(() => undefined) // offline or session over: the next request handles it
+      .finally(() => void scheduleTokenRefresh());
+  }, dueInMs);
+}
+
+function stopTokenRefresh(): void {
+  if (tokenTimer) clearTimeout(tokenTimer);
+  tokenTimer = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,28 +717,55 @@ export type NotificationListener = (notification: AppNotification) => void;
 const listeners = new Set<NotificationListener>();
 let notificationSeq = 0;
 
+/** Mock "server" table of notifications, newest first. Read and changed only via lib/notifications.ts. */
+let mockNotifications: AppNotification[] = [];
+
+export function getMockNotifications(): readonly AppNotification[] {
+  return mockNotifications;
+}
+
+export function setMockNotifications(next: AppNotification[]): void {
+  mockNotifications = next;
+}
+
+/** Mock dose log, kept apart from notifications so deleting notifications never changes adherence. */
+const mockDoseLog: { type: DoseEventType; minutesLate: number }[] = [];
+
 /** Registers a listener and returns an unsubscribe function. */
 export function subscribeToNotifications(listener: NotificationListener): () => void {
   listeners.add(listener);
   if (!USE_MOCK) {
     // A new subscriber (e.g. a remounted screen) gets the recent history again.
     seenNotificationIds.clear();
+    historyLoaded = false;
     startPolling();
+    startSocket();
+    void scheduleTokenRefresh();
   }
   return () => {
     listeners.delete(listener);
-    if (!USE_MOCK && listeners.size === 0) stopPolling();
+    if (!USE_MOCK && listeners.size === 0) {
+      stopPolling();
+      stopSocket();
+      stopTokenRefresh();
+    }
   };
 }
 
 function emitNotification(input: Omit<AppNotification, 'id' | 'createdAt' | 'read'>): AppNotification {
   notificationSeq += 1;
+  const createdAt = Date.now();
   const notification: AppNotification = {
     ...input,
-    id: `n-${Date.now()}-${notificationSeq}`,
-    createdAt: Date.now(),
+    // Zero-padded so ids sort in creation order; they break ties between equal createdAt values.
+    id: `n-${createdAt}-${String(notificationSeq).padStart(6, '0')}`,
+    createdAt,
     read: false,
   };
+  mockNotifications = [notification, ...mockNotifications];
+  if (input.type !== 'system') {
+    mockDoseLog.push({ type: input.type, minutesLate: input.minutesLate ?? 0 });
+  }
   listeners.forEach((listener) => listener(notification));
   return notification;
 }
@@ -450,6 +773,107 @@ function emitNotification(input: Omit<AppNotification, 'id' | 'createdAt' | 'rea
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * Mock only: adds `count` past notifications (one every 30 min, going back from the oldest one
+ * stored) so pagination can be tested. Not pushed to listeners: pull to refresh to see them.
+ */
+export async function seedMockHistory(count = 45): Promise<void> {
+  if (!USE_MOCK) return mockOnly('seedMockHistory');
+  await delay();
+  const oldest = mockNotifications.reduce((min, n) => Math.min(min, n.createdAt), Date.now());
+  const kinds: DoseEventType[] = ['on_time', 'late', 'missed', 'on_time', 'late'];
+  const seeded: AppNotification[] = [];
+  for (let i = 1; i <= count; i += 1) {
+    notificationSeq += 1;
+    const type = kinds[i % kinds.length];
+    const slotId = mockSchedules.find((s) => s.timeMinutes !== null && s.enabled)?.id ?? 'A1';
+    const createdAt = oldest - i * 30 * 60 * 1000;
+    const minutesLate = type === 'late' ? 10 + (i % 4) * 5 : undefined;
+    seeded.push({
+      id: `n-${createdAt}-${String(notificationSeq).padStart(6, '0')}`,
+      type,
+      severity: type === 'missed' ? 'critical' : type === 'late' ? 'warning' : 'info',
+      slotId,
+      title: { on_time: 'Obat Diminum Tepat Waktu', late: 'Obat Diminum Terlambat', missed: 'Dosis Terlewat' }[type],
+      message: `Riwayat contoh #${i} untuk slot ${slotId}.`,
+      createdAt,
+      read: i > 3,
+      ...(minutesLate !== undefined ? { minutesLate } : {}),
+    });
+    mockDoseLog.push({ type, minutesLate: minutesLate ?? 0 });
+  }
+  mockNotifications = [...mockNotifications, ...seeded];
+}
+
+/** Backend tabs of GET /notifications (Backend/app/services/notification_feed.py). */
+export type BackendFeedTab = 'ALL' | 'LATE_MISSED';
+
+/** One page of the caregiver's notification feed from the backend, newest first. */
+export async function fetchBackendNotifications(
+  tab: BackendFeedTab,
+  page: number,
+  limit: number,
+): Promise<{ items: AppNotification[]; total: number; unreadCount: number }> {
+  const res = await backend<BackendNotificationPage>(`/notifications?tab=${tab}&page=${page}&limit=${limit}`);
+  return { items: res.data.map(toAppNotification), total: res.total, unreadCount: res.unread_count };
+}
+
+export async function markBackendNotificationRead(id: string): Promise<void> {
+  await backend(`/notifications/${id}/read`, 'PUT');
+}
+
+/** Days covered by the adherence card in backend mode (today included, WIB). */
+const ADHERENCE_DAYS = 30;
+
+/** "YYYY-MM-DD" in Asia/Jakarta (UTC+7, no DST), `daysAgo` days before today. */
+function jakartaDate(daysAgo: number): string {
+  return new Date(Date.now() + 7 * 3600_000 - daysAgo * 86_400_000).toISOString().slice(0, 10);
+}
+
+/**
+ * Dose adherence for the dashboard card. Independent of the notification list.
+ * Backend: GET /elderly/{elderly_id}/journal/summary for the last 30 days.
+ */
+export async function getAdherenceSummary(): Promise<AdherenceSummary> {
+  if (!USE_MOCK) {
+    const id = await elderlyId();
+    const s = await backend<BackendJournalSummary>(
+      `/elderly/${id}/journal/summary?start=${jakartaDate(ADHERENCE_DAYS - 1)}&end=${jakartaDate(0)}`,
+    );
+    return {
+      totalDoses: s.taken_on_time + s.taken_late + s.missed,
+      onTimeDoses: s.taken_on_time,
+      lateDoses: s.taken_late,
+      missedDoses: s.missed,
+      adherencePercent: s.compliance_rate === null ? null : Math.round(s.compliance_rate),
+      averageDelayMinutes: s.avg_delay_minutes === null ? null : Math.round(s.avg_delay_minutes),
+      periodLabel: `${ADHERENCE_DAYS} hari terakhir`,
+    };
+  }
+  let onTime = 0;
+  let late = 0;
+  let missed = 0;
+  let delaySum = 0;
+  for (const dose of mockDoseLog) {
+    if (dose.type === 'on_time') onTime += 1;
+    else if (dose.type === 'late') {
+      late += 1;
+      delaySum += dose.minutesLate;
+    } else missed += 1;
+  }
+  const total = onTime + late + missed;
+  const taken = onTime + late;
+  return {
+    totalDoses: total,
+    onTimeDoses: onTime,
+    lateDoses: late,
+    missedDoses: missed,
+    // Same definition as the backend's compliance_rate: taken (on time or late) / decided doses.
+    adherencePercent: total > 0 ? Math.round((taken / total) * 100) : null,
+    averageDelayMinutes: taken > 0 ? Math.round(delaySum / taken) : null,
+  };
+}
 
 export async function getDeviceStatus(): Promise<DeviceStatus> {
   if (!USE_MOCK) return backendDeviceStatus();
@@ -470,12 +894,14 @@ export async function setDeviceConnection(online: boolean): Promise<DeviceStatus
     online
       ? {
           type: 'system',
+          severity: 'info',
           slotId: null,
           title: 'Sistem Terkoneksi',
           message: `${mockDevice.deviceName} kembali online dan jadwal tersinkron.`,
         }
       : {
           type: 'system',
+          severity: 'warning',
           slotId: null,
           title: 'Perangkat Terputus',
           message: `${mockDevice.deviceName} tidak terhubung. Periksa daya dan Wi-Fi.`,
@@ -540,6 +966,7 @@ export async function simulateDoseEvent(input: SimulateDoseInput): Promise<AppNo
     case 'on_time':
       return emitNotification({
         type: 'on_time',
+        severity: 'info',
         slotId: input.slotId,
         title: 'Obat Diminum Tepat Waktu',
         message: `Obat ${where} diminum sesuai jadwal ${time}.`,
@@ -548,6 +975,7 @@ export async function simulateDoseEvent(input: SimulateDoseInput): Promise<AppNo
       const minutesLate = Math.max(1, input.minutesLate ?? 0);
       return emitNotification({
         type: 'late',
+        severity: 'warning',
         slotId: input.slotId,
         title: 'Obat Diminum Terlambat',
         message: `Obat ${where} diminum terlambat ${minutesLate} menit dari jadwal ${time}.`,
@@ -557,6 +985,7 @@ export async function simulateDoseEvent(input: SimulateDoseInput): Promise<AppNo
     case 'missed':
       return emitNotification({
         type: 'missed',
+        severity: 'critical',
         slotId: input.slotId,
         title: 'Dosis Terlewat',
         message: `Dosis ${where} jadwal ${time} tidak diminum. Segera hubungi lansia.`,

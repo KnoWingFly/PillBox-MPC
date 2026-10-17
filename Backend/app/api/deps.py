@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import timing
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError, unauthorized
 from app.core.security import TokenConfigError, verify_app_token, verify_supabase_token
@@ -38,8 +39,14 @@ async def get_current_user(
 ) -> User:
     if credentials is None:
         raise unauthorized()
+    return await user_from_token(credentials.credentials, settings, db)
+
+
+async def user_from_token(token: str, settings: Settings, db: AsyncSession) -> User:
+    """Verifies a caregiver access token and loads its user (REST and the app WebSocket)."""
+    started = timing.now_ms()
     try:
-        claims = await _claims(credentials.credentials, settings)
+        claims = await _claims(token, settings)
     except TokenConfigError:
         logger.error("auth_misconfigured", extra={"auth_mode": settings.auth_mode})
         raise AppError(500, "AUTH_MISCONFIGURED", "Server authentication is not configured") from None
@@ -52,6 +59,7 @@ async def get_current_user(
         subject = UUID(str(claims["sub"]))
     except (KeyError, ValueError):
         raise unauthorized() from None
+    verified_ms = timing.since_ms(started)
 
     if settings.auth_mode == "app_jwt":
         user = await db.get(User, subject)
@@ -67,6 +75,11 @@ async def get_current_user(
         # Token for a deleted (or never-synced) account is treated as invalid,
         # same as Mobile/src/server/users.ts getAuthedUser().
         raise unauthorized()
+    # The first DB query of a request also pays for pool checkout (pre-ping) and BEGIN.
+    timing.log_timing(
+        "login", "backend_token_verified",
+        verify_ms=verified_ms, user_lookup_ms=round(timing.since_ms(started) - verified_ms, 1),
+    )
     return user
 
 
@@ -79,8 +92,9 @@ async def get_authenticated_device(
     x_device_key: Annotated[str | None, Header(alias="X-Device-Key")] = None,
 ) -> Device:
     """Device routes: path {device_id} is the device_code (or the device UUID),
-    X-Device-Key is the per-device secret issued at provisioning."""
-    return await authenticate_device(db, device_id, x_device_key)
+    X-Device-Key is the per-device secret issued at provisioning. The row is
+    locked here because every device route marks the device seen next."""
+    return await authenticate_device(db, device_id, x_device_key, lock=True)
 
 
 AuthenticatedDevice = Annotated[Device, Depends(get_authenticated_device)]

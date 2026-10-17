@@ -24,15 +24,22 @@ export interface DeviceStatus {
   wifiLabel: string;
   /** Epoch milliseconds of the last successful sync. */
   lastSyncedAt: number;
+  /** Compartments whose door the pillbox last reported as open. */
+  openSlots: SlotId[];
 }
 
 export type NotificationType = 'on_time' | 'late' | 'missed' | 'system';
 
 export type DoseEventType = Exclude<NotificationType, 'system'>;
 
+/** Mirrors the backend `severity` column. `critical` system alerts (e.g. a compartment opened
+ * outside its schedule) stay under the "Sistem" filter but are styled as urgent. */
+export type NotificationSeverity = 'info' | 'warning' | 'critical';
+
 export interface AppNotification {
   id: string;
   type: NotificationType;
+  severity: NotificationSeverity;
   slotId: SlotId | null;
   title: string;
   message: string;
@@ -48,8 +55,10 @@ export interface AdherenceSummary {
   onTimeDoses: number;
   lateDoses: number;
   missedDoses: number;
-  /** null when no doses have been recorded yet. */
+  /** Taken doses (on time or late) / decided doses, in percent; null when none are recorded yet. */
   adherencePercent: number | null;
   /** Average delay across taken doses (on-time counts as 0); null when none were taken. */
   averageDelayMinutes: number | null;
+  /** Period the numbers cover, e.g. "30 hari terakhir"; undefined = everything recorded. */
+  periodLabel?: string;
 }

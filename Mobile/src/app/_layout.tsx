@@ -1,9 +1,12 @@
 import { SplashScreen, Stack } from 'expo-router';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import AuthProvider from '@root/context/auth-context';
 import { useAuth } from '@/hooks/use-auth';
 import '@root/global.css';
+import { perfLoginStep } from '@/lib/perf';
 
 SplashScreen.preventAutoHideAsync();
+perfLoginStep('app_start');
 
 // Keeps the native splash visible until the stored session has been restored.
 function SplashScreenController() {
@@ -34,9 +37,12 @@ function RootNavigator() {
 
 export default function RootLayout() {
   return (
-    <AuthProvider>
-      <SplashScreenController />
-      <RootNavigator />
-    </AuthProvider>
+    // Required by react-native-gesture-handler (swipe-to-delete on notifications).
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AuthProvider>
+        <SplashScreenController />
+        <RootNavigator />
+      </AuthProvider>
+    </GestureHandlerRootView>
   );
 }

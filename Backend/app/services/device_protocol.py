@@ -1,7 +1,9 @@
 """Device-side REST/WS protocol: authentication, heartbeat, config pull and ack."""
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, time, timedelta
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -20,31 +22,43 @@ from app.schemas.device_protocol import (
     HeartbeatResponse,
     ScheduleConfig,
 )
+from app.services import stock_cache
+from app.services.app_hub import queue_device_change
+from app.services.device_management import build_status
 from app.services.notifications import NotificationSpec, notify, ts_key
-from app.services.presence import device_label, mark_seen
+from app.services.presence import device_label, mark_row_locked, mark_seen
 from app.services.timeutil import as_aware, zone
 
 logger = logging.getLogger(__name__)
-
-_LOW_BATTERY_HYSTERESIS = 5
 
 
 def device_key_invalid() -> AppError:
     return AppError(401, "DEVICE_KEY_INVALID", "Device key is missing or invalid")
 
 
-async def find_device(session: AsyncSession, device_ref: str) -> Device | None:
-    """device_ref is a device_code (what the device knows) or the device UUID."""
+async def find_device(session: AsyncSession, device_ref: str, *, lock: bool = False) -> Device | None:
+    """device_ref is a device_code (what the device knows) or the device UUID.
+    lock=True loads the row FOR UPDATE (fresh values, held until commit)."""
     try:
         as_uuid = UUID(device_ref)
     except ValueError:
         as_uuid = None
     stmt = select(Device).where(Device.id == as_uuid) if as_uuid else select(Device).where(Device.device_code == device_ref)
-    return (await session.execute(stmt)).scalar_one_or_none()
+    if lock:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    device = (await session.execute(stmt)).scalar_one_or_none()
+    if lock and device is not None:
+        mark_row_locked(session, device)
+    return device
 
 
-async def authenticate_device(session: AsyncSession, device_ref: str, secret: str | None) -> Device:
-    device = await find_device(session, device_ref)
+async def authenticate_device(
+    session: AsyncSession, device_ref: str, secret: str | None, *, lock: bool = False
+) -> Device:
+    """lock=True: REST device routes, which all call mark_seen() next. Locking
+    here saves mark_seen() its own SELECT ... FOR UPDATE round trip. Never lock
+    from a long-lived session (the WebSocket handler)."""
+    device = await find_device(session, device_ref, lock=lock)
     # verify_device_secret runs in constant time and also when device is None.
     if not verify_device_secret(secret, device.device_secret_hash if device else None) or device is None:
         logger.warning("device_auth_failed", extra={"device_ref": device_ref})
@@ -78,7 +92,9 @@ async def process_heartbeat(
         {"device_id": device.id, "slot_number": slot, "remaining_units": count}
         for slot, count in latest_count.items()
     ]
-    if stocks:
+    counts = tuple(sorted(latest_count.items()))
+    unchanged = stock_cache.is_current(device.id, counts)  # skips a round trip when nothing changed
+    if stocks and not unchanged:
         stmt = insert(DeviceStock).values(stocks)
         await session.execute(
             stmt.on_conflict_do_update(
@@ -88,7 +104,11 @@ async def process_heartbeat(
         )
 
     await _check_low_battery(session, device, now, settings)
+    # Battery, doors, last seen: pushed to app sockets after commit.
+    queue_device_change(session, device.elderly_id, device.id, status=status_builder(device, settings))
     await session.commit()
+    if stocks and not unchanged:
+        stock_cache.remember(device.id, counts)
 
     applied = device.config_version_applied or 0
     return HeartbeatResponse(
@@ -100,12 +120,17 @@ async def process_heartbeat(
     )
 
 
+def status_builder(device: Device, settings: Settings) -> Callable[[], dict[str, Any]]:
+    """Builds the pushed status after commit (services/app_hub.py)."""
+    return lambda: build_status(device, settings).model_dump(mode="json")
+
+
 async def _check_low_battery(session: AsyncSession, device: Device, now: datetime, settings: Settings) -> None:
     battery = device.battery_percentage
     if battery is None:
         return
     threshold = settings.low_battery_threshold_percent
-    if battery >= threshold + _LOW_BATTERY_HYSTERESIS:
+    if battery >= threshold + settings.low_battery_hysteresis_percent:
         device.low_battery_notified_at = None  # recovered; next drop notifies again
         return
     if battery > threshold or device.low_battery_notified_at is not None or device.elderly_id is None:
