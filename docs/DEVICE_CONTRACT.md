@@ -255,7 +255,7 @@ The app's request waits up to `COMMAND_ACK_TIMEOUT_SECONDS` (default 10 s) for t
 4. Remove an event from the buffer only after it appears in `results` (accepted, duplicate or rejected). On a timeout or 5xx, retry the same events with the same `event_id`s.
 5. The backend processes each batch in `occurred_at` order, so arrival order does not matter.
 
-**How the backend decides "missed" while you were offline.** A dose is due at `window_start`. It is on time until `window_end` and late until `window_end + tolerance_minutes` (the deadline). After the deadline the backend marks it `MISSED` **only if** one of these holds:
+**How the backend decides "missed" while you were offline.** A dose is due at `window_start`. It is on time until `window_end` plus the on-time grace (`ON_TIME_GRACE_MINUTES`, default 10, always at least 1 minute below the slot's tolerance), and late until `window_end + tolerance_minutes` (the deadline). A dose taken within the grace is stored with `delay_minutes = 0`; a later one stores its real delay after `window_end`. The exact lid-open time is always kept in `actual_open_time`. After the deadline the backend marks it `MISSED` **only if** one of these holds:
 - the device is online and has been online for `OFFLINE_FLUSH_WAIT_SECONDS` (60 s), which gives your flush time to arrive, or
 - the deadline passed more than `OFFLINE_MAX_WAIT_MINUTES` ago (6 h). The device is presumed gone, and caregivers must be told.
 

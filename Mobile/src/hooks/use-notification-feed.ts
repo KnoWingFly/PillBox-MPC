@@ -8,6 +8,7 @@ import {
   fetchNotificationPage,
   markNotificationRead,
   matchesFilter,
+  type FeedCursor,
   type FeedPosition,
   type NotificationFilter,
 } from '@root/lib/notifications';
@@ -27,8 +28,8 @@ function newer(a: FeedPosition | null, b: FeedPosition | null): FeedPosition | n
  *
  * Invariants:
  * - `items` is de-duplicated by id and always in feed order (merge, never append blindly).
- * - The cursor is the last item of the last fetched page, stored apart from `items`, so deleting
- *   or receiving items never moves it.
+ * - The cursor (opaque, from the service) marks where the next page starts. It is stored apart
+ *   from `items`, so deleting or receiving items never moves it.
  * - Every reset (filter change, refresh, clear) bumps `generation`; responses from an older
  *   generation are dropped, and only one request per generation is in flight.
  * - Ids being deleted are skipped when pages come back, so a slow page can't resurrect them.
@@ -44,7 +45,7 @@ export function useNotificationFeed({ onArrive }: { onArrive?: (n: AppNotificati
   const [clearing, setClearing] = useState(false);
 
   const filterRef = useRef<NotificationFilter>('all');
-  const cursorRef = useRef<FeedPosition | null>(null);
+  const cursorRef = useRef<FeedCursor | null>(null);
   const generationRef = useRef(0);
   const inFlightRef = useRef<number | null>(null);
   const deletedIdsRef = useRef(new Set<string>());
@@ -207,7 +208,8 @@ export function useNotificationFeed({ onArrive }: { onArrive?: (n: AppNotificati
     if (!target || target.read) return;
     setItems((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
     setUnreadCount((c) => Math.max(0, c - 1));
-    void markNotificationRead(id);
+    // Optimistic; if the server call fails, the next refresh shows the real state.
+    markNotificationRead(id).catch(() => undefined);
   };
 
   return {

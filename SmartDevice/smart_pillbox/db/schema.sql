@@ -32,12 +32,17 @@ CREATE TABLE IF NOT EXISTS events (
     slot_number INTEGER NOT NULL,
     event_type TEXT NOT NULL CHECK (
         event_type IN (
-            'POPUP_ACTIVATED', 
-            'COMPARTMENT_OPENED', 
-            'COMPARTMENT_CLOSED', 
-            'ALARM_TIMEOUT', 
+            'POPUP_ACTIVATED',
+            'COMPARTMENT_OPENED',
+            'COMPARTMENT_CLOSED',
+            'ALARM_TIMEOUT',
             'UNSCHEDULED_OPEN',
-            'REFILL_MAINTENANCE'
+            'REFILL_MAINTENANCE',
+            -- Backend device contract (docs/DEVICE_CONTRACT.md, event types table)
+            'ALARM_STARTED',
+            'ALARM_STOPPED',
+            'BATTERY_STATUS',
+            'NETWORK_RECOVERED'
         )
     ),
     occurred_at TEXT NOT NULL,

@@ -106,11 +106,6 @@ function cloneSlots(slots: Slot[]): Slot[] {
   return slots.map((s) => ({ ...s }));
 }
 
-/** Not wired to the backend yet; see the TODO(backend) next to the caller. */
-function notImplemented(name: string): never {
-  throw new Error(`${name}: not available with the real backend yet`);
-}
-
 function mockOnly(name: string): never {
   throw new Error(
     `${name} only exists in mock mode. With the real backend, use the smart device emulator ` +
@@ -211,7 +206,7 @@ async function backend<T>(path: string, method: Method = 'GET', body?: unknown, 
 
 // --- backend response shapes (subset of what the API returns) ---------------
 
-type BackendDeviceList = { data: { id: string; device_nickname: string | null }[]; total: number };
+type BackendDeviceList = { data: { id: string; device_nickname: string | null; elderly_id: string }[]; total: number };
 type BackendDeviceDetail = { id: string; device_nickname: string | null; device_code: string };
 type BackendStatus = {
   connectivity: 'ONLINE' | 'OFFLINE';
@@ -246,9 +241,30 @@ const SEVERITY: Record<BackendNotification['severity'], NotificationSeverity> = 
   WARNING: 'warning',
   CRITICAL: 'critical',
 };
-type BackendNotificationPage = { data: BackendNotification[] };
+type BackendNotificationPage = { data: BackendNotification[]; unread_count: number; total: number };
+type BackendJournalSummary = {
+  total_scheduled: number;
+  taken_on_time: number;
+  taken_late: number;
+  missed: number;
+  /** Percent of decided doses that were taken (late counts as taken). */
+  compliance_rate: number | null;
+  avg_delay_minutes: number | null;
+};
 
 let cachedDeviceId: string | null = AppConfig.pinnedDeviceId;
+let cachedElderlyId: string | null = null;
+
+/** The elderly person the dashboard's pillbox belongs to. */
+async function elderlyId(): Promise<string> {
+  if (cachedElderlyId) return cachedElderlyId;
+  const id = await deviceId();
+  const list = await backend<BackendDeviceList>('/devices');
+  const found = list.data.find((d) => d.id === id);
+  if (!found) throw new BackendError(404, 'NO_DEVICE', 'The selected pillbox is no longer paired.');
+  cachedElderlyId = found.elderly_id;
+  return cachedElderlyId;
+}
 
 async function deviceId(): Promise<string> {
   if (cachedDeviceId) return cachedDeviceId;
@@ -303,6 +319,7 @@ export async function connectPillbox(input: ConnectPillboxInput): Promise<Connec
     });
   }
   cachedDeviceId = scan.device_id;
+  cachedElderlyId = null;
   return { deviceId: scan.device_id, joined: scan.is_registered };
 }
 
@@ -511,6 +528,9 @@ function applyNotifications(items: BackendNotification[], step: 'app_fetched' | 
   for (const n of items) {
     if (seenNotificationIds.has(n.id)) continue;
     seenNotificationIds.add(n.id);
+    // The first poll after subscribing only learns what already exists: the list loads history
+    // itself (lib/notifications.ts), so replaying it here would re-toast and double-count unread.
+    if (!historyLoaded && step === 'app_fetched') continue;
     if (historyLoaded || step === 'app_pushed') {
       perfLog('iot_to_app', step, {
         notification_id: n.id,
@@ -786,12 +806,51 @@ export async function seedMockHistory(count = 45): Promise<void> {
   mockNotifications = [...mockNotifications, ...seeded];
 }
 
+/** Backend tabs of GET /notifications (Backend/app/services/notification_feed.py). */
+export type BackendFeedTab = 'ALL' | 'LATE_MISSED';
+
+/** One page of the caregiver's notification feed from the backend, newest first. */
+export async function fetchBackendNotifications(
+  tab: BackendFeedTab,
+  page: number,
+  limit: number,
+): Promise<{ items: AppNotification[]; total: number; unreadCount: number }> {
+  const res = await backend<BackendNotificationPage>(`/notifications?tab=${tab}&page=${page}&limit=${limit}`);
+  return { items: res.data.map(toAppNotification), total: res.total, unreadCount: res.unread_count };
+}
+
+export async function markBackendNotificationRead(id: string): Promise<void> {
+  await backend(`/notifications/${id}/read`, 'PUT');
+}
+
+/** Days covered by the adherence card in backend mode (today included, WIB). */
+const ADHERENCE_DAYS = 30;
+
+/** "YYYY-MM-DD" in Asia/Jakarta (UTC+7, no DST), `daysAgo` days before today. */
+function jakartaDate(daysAgo: number): string {
+  return new Date(Date.now() + 7 * 3600_000 - daysAgo * 86_400_000).toISOString().slice(0, 10);
+}
+
 /**
  * Dose adherence for the dashboard card. Independent of the notification list.
- * TODO(backend): GET /elderly/{elderly_id}/journal/summary?start=&end= (taken_on_time, taken_late, missed).
+ * Backend: GET /elderly/{elderly_id}/journal/summary for the last 30 days.
  */
 export async function getAdherenceSummary(): Promise<AdherenceSummary> {
-  if (!USE_MOCK) return notImplemented('getAdherenceSummary');
+  if (!USE_MOCK) {
+    const id = await elderlyId();
+    const s = await backend<BackendJournalSummary>(
+      `/elderly/${id}/journal/summary?start=${jakartaDate(ADHERENCE_DAYS - 1)}&end=${jakartaDate(0)}`,
+    );
+    return {
+      totalDoses: s.taken_on_time + s.taken_late + s.missed,
+      onTimeDoses: s.taken_on_time,
+      lateDoses: s.taken_late,
+      missedDoses: s.missed,
+      adherencePercent: s.compliance_rate === null ? null : Math.round(s.compliance_rate),
+      averageDelayMinutes: s.avg_delay_minutes === null ? null : Math.round(s.avg_delay_minutes),
+      periodLabel: `${ADHERENCE_DAYS} hari terakhir`,
+    };
+  }
   let onTime = 0;
   let late = 0;
   let missed = 0;
@@ -810,7 +869,8 @@ export async function getAdherenceSummary(): Promise<AdherenceSummary> {
     onTimeDoses: onTime,
     lateDoses: late,
     missedDoses: missed,
-    adherencePercent: total > 0 ? Math.round((onTime / total) * 100) : null,
+    // Same definition as the backend's compliance_rate: taken (on time or late) / decided doses.
+    adherencePercent: total > 0 ? Math.round((taken / total) * 100) : null,
     averageDelayMinutes: taken > 0 ? Math.round(delaySum / taken) : null,
   };
 }

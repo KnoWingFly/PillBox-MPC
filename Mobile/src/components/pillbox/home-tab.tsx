@@ -46,7 +46,11 @@ function AdherenceHero({ summary }: { summary: AdherenceSummary | null }) {
             {summary?.adherencePercent == null ? '–' : `${summary.adherencePercent}%`}
           </Text>
           <Text className="text-body-sm text-white">
-            {total > 0 ? `dari ${total} dosis tercatat` : summary ? 'Belum ada dosis tercatat' : 'Data kepatuhan belum tersedia'}
+            {total > 0
+              ? `dari ${total} dosis tercatat${summary?.periodLabel ? ` · ${summary.periodLabel}` : ''}`
+              : summary
+                ? `Belum ada dosis tercatat${summary.periodLabel ? ` · ${summary.periodLabel}` : ''}`
+                : 'Data kepatuhan belum tersedia'}
           </Text>
         </View>
         <View className="items-end gap-1 rounded-2xl bg-primary-pressed px-4 py-3">

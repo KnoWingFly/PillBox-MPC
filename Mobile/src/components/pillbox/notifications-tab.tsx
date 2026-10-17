@@ -26,7 +26,8 @@ function NotificationItem({
   onPress: () => void;
   onCall: () => void;
   onAlarm: () => void;
-  onDelete: () => void;
+  /** Omitted when deleting is not supported. */
+  onDelete?: () => void;
 }) {
   const look = notificationLook(notification);
   // Only a missed dose needs the caregiver to act; a late dose was still taken.
@@ -49,10 +50,12 @@ function NotificationItem({
         accessibilityLabel={`${notification.read ? '' : 'Belum dibaca. '}${look.label}. ${notification.title}. ${
           notification.message
         } ${when}.`}
-        accessibilityHint="Ketuk untuk menandai sudah dibaca. Geser ke kiri untuk menghapus."
-        accessibilityActions={[{ name: 'delete', label: 'Hapus notifikasi' }]}
+        accessibilityHint={
+          onDelete ? 'Ketuk untuk menandai sudah dibaca. Geser ke kiri untuk menghapus.' : 'Ketuk untuk menandai sudah dibaca.'
+        }
+        accessibilityActions={onDelete ? [{ name: 'delete', label: 'Hapus notifikasi' }] : undefined}
         onAccessibilityAction={(e) => {
-          if (e.nativeEvent.actionName === 'delete') onDelete();
+          if (e.nativeEvent.actionName === 'delete') onDelete?.();
         }}
         onPress={onPress}
         className="flex-row gap-3 p-4 active:opacity-80">
@@ -89,12 +92,15 @@ function NotificationItem({
 function FilterBar({
   filter,
   onFilter,
+  canDelete,
   canClear,
   clearing,
   onClearAll,
 }: {
   filter: NotificationFilter;
   onFilter: (filter: NotificationFilter) => void;
+  /** False while the backend cannot delete: the button is hidden. */
+  canDelete: boolean;
   canClear: boolean;
   clearing: boolean;
   onClearAll: () => void;
@@ -106,17 +112,19 @@ function FilterBar({
           <Chip key={f.key} label={f.label} selected={filter === f.key} onPress={() => onFilter(f.key)} />
         ))}
       </ScrollView>
-      <View className="flex-row justify-end px-4">
-        <Button
-          label="Hapus semua"
-          icon="trash-outline"
-          variant="danger-soft"
-          size="sm"
-          loading={clearing}
-          disabled={!canClear}
-          onPress={onClearAll}
-        />
-      </View>
+      {canDelete && (
+        <View className="flex-row justify-end px-4">
+          <Button
+            label="Hapus semua"
+            icon="trash-outline"
+            variant="danger-soft"
+            size="sm"
+            loading={clearing}
+            disabled={!canClear}
+            onPress={onClearAll}
+          />
+        </View>
+      )}
     </View>
   );
 }
@@ -169,6 +177,7 @@ const FILTER_ROW: Row = { kind: 'filters' };
 
 export function NotificationsTab({
   feed,
+  canDelete,
   now,
   alarmBusyId,
   refreshing,
@@ -192,6 +201,8 @@ export function NotificationsTab({
     loadMore: () => Promise<void>;
     retry: () => Promise<void>;
   };
+  /** False while the backend has no delete endpoint: swipe and "Hapus semua" are hidden. */
+  canDelete: boolean;
   now: number;
   alarmBusyId: string | null;
   refreshing: boolean;
@@ -221,6 +232,7 @@ export function NotificationsTab({
         <FilterBar
           filter={feed.filter}
           onFilter={feed.setFilter}
+          canDelete={canDelete}
           canClear={feed.hasAny}
           clearing={feed.clearing}
           onClearAll={onClearAll}
@@ -228,19 +240,20 @@ export function NotificationsTab({
       );
     }
     const n = item.notification;
+    const card = (
+      <NotificationItem
+        notification={n}
+        now={now}
+        alarmBusy={alarmBusyId === n.id}
+        onPress={() => onMarkRead(n.id)}
+        onCall={() => onCall(n)}
+        onAlarm={() => onAlarm(n)}
+        onDelete={canDelete ? () => onDelete(n) : undefined}
+      />
+    );
     return (
       <View className="px-4 pb-3">
-        <SwipeToDelete onDelete={() => onDelete(n)}>
-          <NotificationItem
-            notification={n}
-            now={now}
-            alarmBusy={alarmBusyId === n.id}
-            onPress={() => onMarkRead(n.id)}
-            onCall={() => onCall(n)}
-            onAlarm={() => onAlarm(n)}
-            onDelete={() => onDelete(n)}
-          />
-        </SwipeToDelete>
+        {canDelete ? <SwipeToDelete onDelete={() => onDelete(n)}>{card}</SwipeToDelete> : card}
       </View>
     );
   };

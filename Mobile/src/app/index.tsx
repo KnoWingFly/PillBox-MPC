@@ -21,7 +21,7 @@ import { makeToast, Toast, type ToastData } from '@/components/pillbox/toast';
 import { useNotificationFeed } from '@/hooks/use-notification-feed';
 import { perfLog, perfLoginStep } from '@/lib/perf';
 import * as api from '@root/lib/api';
-import { fetchNotificationPage } from '@root/lib/notifications';
+import { fetchNotificationPage, NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
 import { findAllDuplicates } from '@root/lib/schedule-time';
 import type { AdherenceSummary, AppNotification, DeviceStatus, DoseEventType, Slot, SlotId } from '@root/lib/types';
 
@@ -422,6 +422,7 @@ export default function PillboxDashboard() {
               {tab === 'notifications' && (
                 <NotificationsTab
                   feed={feed}
+                  canDelete={NOTIFICATION_DELETE_SUPPORTED}
                   now={now}
                   alarmBusyId={alarmBusyId}
                   refreshing={refreshing}

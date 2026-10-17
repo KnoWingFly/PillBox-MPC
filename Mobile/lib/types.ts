@@ -55,8 +55,10 @@ export interface AdherenceSummary {
   onTimeDoses: number;
   lateDoses: number;
   missedDoses: number;
-  /** null when no doses have been recorded yet. */
+  /** Taken doses (on time or late) / decided doses, in percent; null when none are recorded yet. */
   adherencePercent: number | null;
   /** Average delay across taken doses (on-time counts as 0); null when none were taken. */
   averageDelayMinutes: number | null;
+  /** Period the numbers cover, e.g. "30 hari terakhir"; undefined = everything recorded. */
+  periodLabel?: string;
 }

@@ -53,7 +53,7 @@ from app.schemas.device_protocol import (
     TelemetryResponse,
 )
 from app.services.app_hub import queue_device_change
-from app.services.adherence import DoseInstants, delay_minutes_for, match_dose
+from app.services.adherence import DoseInstants, delay_minutes_for, match_dose, on_time_grace
 from app.services.device_protocol import is_fresh, status_builder
 from app.services.doses import auto_resolve_missed, get_or_create_dose, notify_dose, slot_label
 from app.services.notifications import NotificationSpec, notify
@@ -329,15 +329,20 @@ async def _apply_dose_event(
         return None
 
     log = await get_or_create_dose(session, device.id, device.elderly_id, schedule, inst, etype.value)
+    grace = on_time_grace(schedule.tolerance_minutes, settings.on_time_grace_minutes)
 
     if etype is DeviceEventType.COMPARTMENT_OPENED:
-        await _mark_taken(session, log, inst, occurred_at, via_open=True, chime_count=ev.chime_count, tz=tz, now=now)
+        await _mark_taken(
+            session, log, inst, occurred_at, via_open=True, chime_count=ev.chime_count, tz=tz, now=now, grace_minutes=grace
+        )
     elif etype is DeviceEventType.COMPARTMENT_CLOSED:
         if log.status == DoseStatus.TAKEN:
             if log.actual_close_time is None and (log.actual_open_time is None or occurred_at >= log.actual_open_time):
                 log.actual_close_time = occurred_at
         else:
-            await _mark_taken(session, log, inst, occurred_at, via_open=False, chime_count=ev.chime_count, tz=tz, now=now)
+            await _mark_taken(
+                session, log, inst, occurred_at, via_open=False, chime_count=ev.chime_count, tz=tz, now=now, grace_minutes=grace
+            )
     elif etype is DeviceEventType.ALARM_TIMEOUT:
         if log.status == DoseStatus.PENDING:
             log.status = DoseStatus.MISSED.value
@@ -362,6 +367,7 @@ async def _mark_taken(
     chime_count: int | None,
     tz: ZoneInfo,
     now: datetime,
+    grace_minutes: int,
 ) -> None:
     if log.log_source == LogSource.MANUAL_CAREGIVER_CONFIRMATION:
         # A caregiver already confirmed this dose; keep their decision and only
@@ -374,12 +380,12 @@ async def _mark_taken(
         # Already taken (e.g. by a close event); an earlier open refines it.
         if via_open and (log.actual_open_time is None or taken_at < log.actual_open_time):
             log.actual_open_time = taken_at
-            log.delay_minutes = delay_minutes_for(taken_at, inst.window_end_at)
+            log.delay_minutes = delay_minutes_for(taken_at, inst.window_end_at, grace_minutes)
         return
 
     previous = log.status
     log.status = DoseStatus.TAKEN.value
-    log.delay_minutes = delay_minutes_for(taken_at, inst.window_end_at)
+    log.delay_minutes = delay_minutes_for(taken_at, inst.window_end_at, grace_minutes)
     log.log_source = LogSource.AUTO_SENSOR.value
     log.event_type = DeviceEventType.COMPARTMENT_OPENED.value if via_open else DeviceEventType.COMPARTMENT_CLOSED.value
     log.recorded_at = taken_at

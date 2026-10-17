@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Backend/ (this file is Backend/app/core/config.py). Anchoring the .env path
@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     offline_max_wait_minutes: int = 360
     # A "taken" event this many minutes before window_start still counts.
     dose_early_accept_minutes: int = 15
+    # A dose taken up to this many whole minutes after window_end still counts as ON TIME
+    # (delay_minutes = 0, DOSE_TAKEN, TAKEN_ON_TIME), because an elderly person needs a moment to
+    # reach the box. Later than that it is late and delay_minutes is the real delay. Never reaches
+    # the slot's tolerance: see adherence.on_time_grace. 0 = on time only until window_end.
+    on_time_grace_minutes: int = Field(10, ge=0, le=60)
 
     # --- Telemetry ------------------------------------------------------
     telemetry_max_batch_size: int = 500
