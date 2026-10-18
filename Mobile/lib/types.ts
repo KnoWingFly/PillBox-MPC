@@ -63,6 +63,9 @@ export interface AppNotification {
   minutesLate?: number;
   /** What the caregiver can still do about it (backend `actions`; only on open, still-missed doses). */
   actions?: NotificationAction[];
+  /** Pillbox the notification is about; null for elderly-level ones and in mock mode. */
+  deviceId?: string | null;
+  elderlyId?: string | null;
 }
 
 /** LATE_RELEASE = "Buka bilik sekarang" (device PIN), CONFIRM_TAKEN = "Sudah diminum". */

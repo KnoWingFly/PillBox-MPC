@@ -1,6 +1,7 @@
 """Central, hard-coded config for the simulator (MVP: no env-file layer yet)."""
 
 import os
+import re
 from pathlib import Path
 
 # --- Physical layout ------------------------------------------------------
@@ -28,6 +29,35 @@ CHIME_REPEAT_SECONDS = 5             # repeats while a chamber is popped up, unt
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "pillbox_local.db"
 SCHEMA_PATH = Path(__file__).resolve().parent / "db" / "schema.sql"
+
+# --- Virtual pillbox profiles ----------------------------------------------------
+# Each simulator PROCESS is one pillbox ("main.py --profile pb2"), with its own database and so
+# its own identity (device code + secret), schedules and event log. "default" keeps the original
+# pillbox_local.db next to main.py; the others live in profiles/<name>/.
+DEFAULT_PROFILE = "default"
+VIRTUAL_PROFILES = (DEFAULT_PROFILE, "pb2", "pb3", "pb4")  # "Tambah Pillbox Virtual" allows up to 4
+PROFILES_DIR = BASE_DIR / "profiles"
+_PROFILE_NAME = re.compile(r"^[a-z0-9_-]{1,16}$")
+PROFILE = DEFAULT_PROFILE  # set once at startup by use_profile()
+
+
+def profile_dir(name: str) -> Path:
+    return BASE_DIR if name == DEFAULT_PROFILE else PROFILES_DIR / name
+
+
+def lock_path(name: str) -> Path:
+    """Held by the process running that profile, so one profile never runs twice."""
+    return profile_dir(name) / ".pillbox.lock"
+
+
+def use_profile(name: str) -> None:
+    """Points this process at one profile. Call before creating the Database."""
+    global PROFILE, DB_PATH
+    if not _PROFILE_NAME.match(name):
+        raise ValueError(f"Invalid profile name {name!r}: use 1-16 of a-z, 0-9, '-' or '_'")
+    profile_dir(name).mkdir(parents=True, exist_ok=True)
+    PROFILE = name
+    DB_PATH = profile_dir(name) / "pillbox_local.db"
 
 # --- Backend sync --------------------------------------------------------------
 # Override with PILLCARE_BACKEND_URL (e.g. http://192.168.1.10:8000) when the backend runs elsewhere.

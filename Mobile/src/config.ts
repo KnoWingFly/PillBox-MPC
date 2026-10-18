@@ -3,6 +3,9 @@
 // so never put secrets here. Each variable must be read as `process.env.EXPO_PUBLIC_X` (dot notation)
 // or Expo will not inline it.
 
+import Constants from 'expo-constants';
+import { Platform } from 'react-native';
+
 function intFromEnv(raw: string | undefined, fallback: number, min = 0): number {
   const value = Number.parseInt(raw ?? '', 10);
   return Number.isFinite(value) && value >= min ? value : fallback;
@@ -10,12 +13,31 @@ function intFromEnv(raw: string | undefined, fallback: number, min = 0): number 
 
 const trimSlash = (url: string) => url.replace(/\/+$/, '');
 
+/**
+ * EXPO_PUBLIC_PILLBOX_API_URL=auto (or auto:<port>, default 8000) = the backend runs on the same
+ * machine that serves the app, so a changed Wi-Fi IP needs no edit and no restart:
+ * web uses the page's host, a phone in development uses the Expo dev server's host.
+ */
+function resolvePillboxUrl(raw: string): string {
+  const auto = /^auto(?::(\d{1,5}))?$/i.exec(raw.trim());
+  if (!auto) return trimSlash(raw.trim());
+  const port = auto[1] ?? '8000';
+  const host =
+    Platform.OS === 'web'
+      ? typeof window !== 'undefined'
+        ? window.location.hostname
+        : ''
+      : (Constants.expoConfig?.hostUri?.split(':')[0] ?? '');
+  // No page / dev server to follow (server render, or a release build): assume this machine.
+  return `http://${host || 'localhost'}:${port}`;
+}
+
 export const AppConfig = {
   /** Expo API routes (auth, settings). Empty = same dev server as the bundle (see lib/api/client.ts). */
   apiUrl: trimSlash(process.env.EXPO_PUBLIC_API_URL ?? ''),
-  /** FastAPI pillbox backend. Empty = the dashboard uses mock data. */
-  pillboxApiUrl: trimSlash(process.env.EXPO_PUBLIC_PILLBOX_API_URL ?? ''),
-  /** Optional: pin the dashboard to one device id. Empty = first paired device. */
+  /** FastAPI pillbox backend. Empty = the dashboard uses mock data; "auto" = same host as the app. */
+  pillboxApiUrl: resolvePillboxUrl(process.env.EXPO_PUBLIC_PILLBOX_API_URL ?? ''),
+  /** Optional: pillbox selected first when the account has no saved choice. Empty = first one. */
   pinnedDeviceId: process.env.EXPO_PUBLIC_PILLBOX_DEVICE_ID || null,
 
   /** Abort a request after this long (ms). Must exceed the backend's COMMAND_ACK_TIMEOUT_SECONDS. */

@@ -40,3 +40,6 @@ __pycache__/
 .DS_Store
 /ios
 /android
+# Simulator: virtual pillbox profiles (own DBs) and per-profile run locks
+SmartDevice/profiles/
+SmartDevice/.pillbox.lock

@@ -3,8 +3,9 @@
 // The hook and UI (src/hooks/use-notification-feed.ts) are the same for both.
 
 import {
-  clearBackendNotifications,
+  activePillboxElderlyId,
   deleteBackendNotification,
+  inActiveScope,
   fetchBackendNotifications,
   getMockNotifications,
   markBackendNotificationRead,
@@ -12,6 +13,7 @@ import {
   USE_MOCK,
   type BackendFeedTab,
 } from './api';
+import { deleteMyNotificationsWhere } from './devices';
 import {
   compareFeed,
   matchesFilter,
@@ -82,28 +84,30 @@ async function fetchMockPage(filter: NotificationFilter, cursor: FeedCursor | nu
 }
 
 /**
- * Backend: GET /notifications?tab&page&limit (offset pagination, newest first).
+ * Backend: GET /notifications?tab&page&limit&elderly_id (offset pagination, newest first).
  * "Semua" and "Terlambat & Terlewat" map to the ALL and LATE_MISSED tabs. Note that LATE_MISSED
  * only lists unresolved incidents. "Tepat Waktu" and "Sistem" have no tab yet, so they read ALL
- * and filter on the phone.
- * TODO(backend): ON_TIME and SYSTEM tabs, and cursor pagination (see the handoff list).
+ * and filter on the phone. The feed shows only the active pillbox: the server narrows by its
+ * elderly profile, the phone by device (inActiveScope).
+ * The unread badge is the server's count across ALL pillboxes (the backend counts per user).
+ * TODO(backend): ON_TIME and SYSTEM tabs, a device_id filter, and cursor pagination (handoff list).
  */
 async function fetchBackendPage(filter: NotificationFilter, cursor: FeedCursor | null, limit: number): Promise<NotificationPage> {
   const tab: BackendFeedTab = filter === 'issues' ? 'LATE_MISSED' : 'ALL';
-  const serverFilters = filter === 'all' || filter === 'issues';
+  const elderlyId = activePillboxElderlyId();
   const page = await pageFromOffsets({
-    fetchRaw: (pageNumber, pageSize) => fetchBackendNotifications(tab, pageNumber, pageSize),
-    pageSize: serverFilters ? limit : BACKEND_SCAN_PAGE,
+    fetchRaw: (pageNumber, pageSize) => fetchBackendNotifications(tab, pageNumber, pageSize, elderlyId),
+    pageSize: BACKEND_SCAN_PAGE,
     limit,
     cursor,
-    match: serverFilters ? undefined : (n) => matchesFilter(n, filter),
+    match: (n) => inActiveScope(n) && (filter === 'all' || filter === 'issues' || matchesFilter(n, filter)),
   });
   return {
     items: page.items,
     nextCursor: page.nextCursor,
     unreadCount: page.unreadCount,
-    // The first page of the ALL tab starts with the newest notification of any type.
-    latest: tab === 'ALL' && page.first ? positionOf(page.first) : null,
+    // The first page of the ALL tab starts with this pillbox's newest notification of any type.
+    latest: tab === 'ALL' && !cursor && page.items[0] ? positionOf(page.items[0]) : null,
   };
 }
 
@@ -137,12 +141,21 @@ export async function deleteNotification(id: string): Promise<void> {
 }
 
 /**
- * Permanently deletes every notification up to and including `upTo` (the newest one the user saw
- * when confirming), so anything that arrives after the confirmation survives. Backend:
- * DELETE /notifications?up_to_created_at=<ISO8601>&up_to_id=<uuid> -> 200 {"deleted": number}.
+ * Permanently deletes the active pillbox's notifications up to and including `upTo` (the newest
+ * one the user saw when confirming), so anything that arrives after the confirmation survives.
+ * Other pillboxes' notifications are kept. Backend: one DELETE /notifications/{id} per row; the
+ * bulk DELETE /notifications?up_to_created_at has no device filter and would clear every pillbox.
+ * TODO(backend-branch): DELETE /notifications?device_id=&up_to_created_at= (handoff item 3).
  */
 export async function clearNotifications(upTo: FeedPosition): Promise<{ deleted: number }> {
-  if (!USE_MOCK) return clearBackendNotifications(upTo);
+  if (!USE_MOCK) {
+    const result = await deleteMyNotificationsWhere(
+      (n) => inActiveScope(n) && isAtOrOlder(n, upTo),
+      activePillboxElderlyId(),
+    );
+    if (result.failed > 0) throw new Error(`${result.failed} notifications could not be deleted`);
+    return { deleted: result.deleted };
+  }
   await mockDelay();
   if (MOCK_FAIL_DELETES) throw new Error('mock clear failure');
   const before = getMockNotifications();

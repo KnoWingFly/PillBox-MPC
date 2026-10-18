@@ -11,6 +11,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import Ionicons from '@expo/vector-icons/Ionicons';
 
 import FormField from '@root/components/auth/form-field';
 import GoogleSignInButton from '@root/components/auth/google-sign-in-button';
@@ -22,7 +23,8 @@ type Mode = 'signIn' | 'signUp';
 const E164 = /^\+[1-9]\d{6,14}$/;
 
 export default function LoginScreen() {
-  const { signIn, signUp } = useAuth();
+  const { signIn, signUp, sessionNotice, clearSessionNotice } = useAuth();
+  const [remember, setRemember] = useState(true);
   const [mode, setMode] = useState<Mode>('signIn');
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -48,7 +50,8 @@ export default function LoginScreen() {
 
     setLoading(true);
     try {
-      if (mode === 'signIn') await signIn(email.trim(), password);
+      clearSessionNotice();
+      if (mode === 'signIn') await signIn(email.trim(), password, remember);
       else
         await signUp({
           full_name: fullName.trim(),
@@ -82,6 +85,13 @@ export default function LoginScreen() {
               {mode === 'signIn' ? t.signInSubtitle : t.signUpSubtitle}
             </Text>
           </View>
+
+          {sessionNotice && (
+            <View accessibilityRole="alert" className="flex-row items-start bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-6">
+              <Ionicons name="time-outline" size={18} color="#b45309" style={{ marginTop: 1 }} />
+              <Text className="flex-1 ml-2 text-sm text-amber-800">{sessionNotice}</Text>
+            </View>
+          )}
 
           {/* Segmented control: Daftar | Masuk */}
           <View className="flex-row bg-gray-100 rounded-xl p-1 mb-6">
@@ -158,11 +168,24 @@ export default function LoginScreen() {
           )}
 
           {mode === 'signIn' && (
-            <Link href="/auth/forgot-password" asChild>
-              <TouchableOpacity className="self-end mb-2" disabled={loading}>
-                <Text className="text-sm font-medium text-blue-600">{t.forgotPasswordLink}</Text>
+            <View className="flex-row items-center justify-between mb-2">
+              <TouchableOpacity
+                onPress={() => setRemember((v) => !v)}
+                disabled={loading}
+                accessibilityRole="checkbox"
+                accessibilityState={{ checked: remember, disabled: loading }}
+                accessibilityHint={t.rememberMeHint}
+                hitSlop={8}
+                className="flex-row items-center">
+                <Ionicons name={remember ? 'checkbox' : 'square-outline'} size={22} color={remember ? '#2563eb' : '#6b7280'} />
+                <Text className="ml-2 text-sm text-gray-700">{t.rememberMe}</Text>
               </TouchableOpacity>
-            </Link>
+              <Link href="/auth/forgot-password" asChild>
+                <TouchableOpacity disabled={loading}>
+                  <Text className="text-sm font-medium text-blue-600">{t.forgotPasswordLink}</Text>
+                </TouchableOpacity>
+              </Link>
+            </View>
           )}
 
           <TouchableOpacity
@@ -184,7 +207,7 @@ export default function LoginScreen() {
             <View className="flex-1 h-[1px] bg-gray-200" />
           </View>
 
-          <GoogleSignInButton disabled={loading} />
+          <GoogleSignInButton disabled={loading} remember={mode === 'signIn' ? remember : true} />
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>

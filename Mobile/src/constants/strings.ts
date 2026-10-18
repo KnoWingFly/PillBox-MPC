@@ -28,6 +28,8 @@ export const Strings = {
     submitSignIn: 'Masuk',
     submitSignUp: 'Buat akun',
     forgotPasswordLink: 'Lupa kata sandi?',
+    rememberMe: 'Ingat saya',
+    rememberMeHint: 'Jika aktif, Anda tetap masuk hingga 30 hari. Jika tidak, Anda keluar saat aplikasi ditutup.',
     or: 'ATAU',
     continueWithGoogle: 'Lanjutkan dengan Google',
     googleUnavailable: 'Masuk dengan Google memerlukan development build (tidak tersedia di Expo Go).',

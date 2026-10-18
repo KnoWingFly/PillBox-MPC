@@ -219,9 +219,11 @@ async function backend<T>(path: string, method: Method = 'GET', body?: unknown, 
   return (await res.json()) as T;
 }
 
+/** For lib/devices.ts (the device service): same auth, refresh and error handling. */
+export const backendRequest = backend;
+
 // --- backend response shapes (subset of what the API returns) ---------------
 
-type BackendDeviceList = { data: { id: string; device_nickname: string | null; elderly_id: string }[]; total: number };
 type BackendDeviceDetail = { id: string; device_nickname: string | null; device_code: string };
 type BackendStatus = {
   connectivity: 'ONLINE' | 'OFFLINE';
@@ -247,6 +249,8 @@ type BackendNotification = {
   id: string;
   type: 'DOSE_TAKEN' | 'DOSE_LATE' | 'DOSE_MISSED' | 'DEVICE_OFFLINE' | 'DEVICE_ONLINE' | 'LOW_BATTERY' | 'UNSCHEDULED_OPEN';
   severity: 'INFO' | 'WARNING' | 'CRITICAL';
+  elderly_id: string | null;
+  device_id: string | null;
   slot_number: number | null;
   delay_minutes: number | null;
   message: string;
@@ -271,75 +275,62 @@ type BackendJournalSummary = {
   avg_delay_minutes: number | null;
 };
 
-let cachedDeviceId: string | null = AppConfig.pinnedDeviceId;
-let cachedElderlyId: string | null = null;
+// The pillbox every device-scoped call targets. Chosen by DevicesProvider (context/devices-context.tsx);
+// null = none selected yet, and device-scoped calls fail with NO_DEVICE instead of guessing one.
+let activeDeviceId: string | null = null;
+let activeElderlyId: string | null = null;
+/** Pillboxes removed this session: late pushes and polls about them are ignored. */
+const removedDeviceIds = new Set<string>();
 
-/** The elderly person the dashboard's pillbox belongs to. */
+/** Points every device-scoped call, the live notification stream and the feed at one pillbox. */
+export function setActivePillbox(pillbox: { id: string; elderlyId: string | null } | null): void {
+  if (pillbox?.id === activeDeviceId && pillbox?.elderlyId === activeElderlyId) return;
+  activeDeviceId = pillbox?.id ?? null;
+  activeElderlyId = pillbox?.elderlyId ?? null;
+  seenNotificationIds.clear();
+  historyLoaded = false;
+}
+
+export function markPillboxRemoved(id: string): void {
+  removedDeviceIds.add(id);
+  if (activeDeviceId === id) setActivePillbox(null);
+}
+
+/**
+ * Whether a notification belongs on screen for the active pillbox: its own events, plus
+ * elderly-level ones without a device (same elderly profile). Mock mode has one pillbox.
+ * TODO(backend-branch): GET /notifications?device_id= would make this a server filter (handoff 4).
+ */
+export function inActiveScope(n: Pick<AppNotification, 'deviceId' | 'elderlyId'>): boolean {
+  if (USE_MOCK) return true;
+  if (!activeDeviceId) return false;
+  if (n.deviceId && removedDeviceIds.has(n.deviceId)) return false;
+  if (n.deviceId) return n.deviceId === activeDeviceId;
+  return n.elderlyId !== null && n.elderlyId === activeElderlyId;
+}
+
+/** The active pillbox's elderly profile (journal and adherence are per elderly, not per device). */
+export function activePillboxElderlyId(): string | null {
+  return activeElderlyId;
+}
+
+/** Forgets everything tied to the signed-in account. Call on login and logout. */
+export function resetPillboxSession(): void {
+  activeDeviceId = null;
+  activeElderlyId = null;
+  removedDeviceIds.clear();
+  seenNotificationIds.clear();
+  historyLoaded = false;
+}
+
 async function elderlyId(): Promise<string> {
-  if (cachedElderlyId) return cachedElderlyId;
-  const id = await deviceId();
-  const list = await backend<BackendDeviceList>('/devices');
-  const found = list.data.find((d) => d.id === id);
-  if (!found) throw new BackendError(404, 'NO_DEVICE', 'The selected pillbox is no longer paired.');
-  cachedElderlyId = found.elderly_id;
-  return cachedElderlyId;
+  if (activeElderlyId) return activeElderlyId;
+  throw new BackendError(404, 'NO_DEVICE', 'No pillbox selected.');
 }
 
 async function deviceId(): Promise<string> {
-  if (cachedDeviceId) return cachedDeviceId;
-  const list = await backend<BackendDeviceList>('/devices');
-  if (list.data.length === 0) {
-    throw new BackendError(404, 'NO_DEVICE', 'No paired pillbox yet. Pair a device first.');
-  }
-  cachedDeviceId = list.data[0].id;
-  return cachedDeviceId;
-}
-
-export interface ConnectPillboxInput {
-  /** Code shown in the emulator's "Koneksi Server" panel, e.g. PB-1A2B3C4D (or a scanned QR payload). */
-  deviceCode: string;
-  /** New 4-digit PIN for a fresh device, or the existing PIN to join a device another caregiver paired. */
-  pin: string;
-  nickname: string;
-  /** Used only when the caregiver has no elderly profile yet. */
-  elderlyName: string;
-}
-
-export interface ConnectPillboxResult {
-  deviceId: string;
-  /** true = joined an already-paired device as PEMANTAU (read-only). */
-  joined: boolean;
-}
-
-/** Pairs a registered pillbox to the signed-in caregiver (or joins it with its PIN). */
-export async function connectPillbox(input: ConnectPillboxInput): Promise<ConnectPillboxResult> {
-  if (USE_MOCK) return mockOnly('connectPillbox');
-  const code = input.deviceCode.trim();
-  const scan = await backend<{ device_id: string; is_registered: boolean }>('/devices/pairing/scan', 'POST', {
-    device_qr_payload: code,
-  });
-  if (scan.is_registered) {
-    await backend(`/devices/${scan.device_id}/join`, 'POST', { device_pin: input.pin });
-  } else {
-    const elderly = await backend<{ data: { id: string; my_role: string }[] }>('/elderly?limit=100');
-    let elderlyId = elderly.data.find((e) => e.my_role === 'OWNER' || e.my_role === 'ADMIN')?.id;
-    if (!elderlyId) {
-      const created = await backend<{ id: string }>('/elderly', 'POST', {
-        full_name: input.elderlyName.trim() || 'Lansia',
-      });
-      elderlyId = created.id;
-    }
-    // timezone omitted: the backend uses the caregiver's own timezone from their profile.
-    await backend('/devices', 'POST', {
-      device_qr_payload: code,
-      elderly_id: elderlyId,
-      device_nickname: input.nickname.trim() || 'Pillbox Lansia',
-      device_pin: input.pin,
-    });
-  }
-  cachedDeviceId = scan.device_id;
-  cachedElderlyId = null;
-  return { deviceId: scan.device_id, joined: scan.is_registered };
+  if (activeDeviceId) return activeDeviceId;
+  throw new BackendError(404, 'NO_DEVICE', 'No pillbox selected.');
 }
 
 function slotIdOf(slotNumber: number): SlotId {
@@ -517,6 +508,8 @@ function toAppNotification(n: BackendNotification): AppNotification {
     message: n.message,
     createdAt: Date.parse(n.created_at),
     read: n.is_read,
+    deviceId: n.device_id ?? null,
+    elderlyId: n.elderly_id ?? null,
     ...(type === 'late' && n.delay_minutes !== null ? { minutesLate: n.delay_minutes } : {}),
     ...(n.actions?.length ? { actions: n.actions } : {}),
     // A forced open right after a missed dose: probably taken late, not a break-in.
@@ -563,6 +556,7 @@ function applyNotifications(items: BackendNotification[], step: 'app_fetched' | 
       });
     }
     const app = toAppNotification(n);
+    if (!inActiveScope(app)) continue; // another (or a removed) pillbox: shown when it is selected
     listeners.forEach((listener) => listener(app));
   }
 }
@@ -661,8 +655,8 @@ async function openSocket(): Promise<void> {
       if (message.items?.length) applyNotifications(message.items, 'app_pushed', Date.now());
       else void pollNotifications();
     } else if (type === 'device') {
-      // Another device the user follows: this dashboard shows only cachedDeviceId.
-      if (message.device_id && cachedDeviceId && message.device_id !== cachedDeviceId) return;
+      // Another device the user follows: this dashboard shows only the active pillbox.
+      if (message.device_id && message.device_id !== activeDeviceId) return;
       if (__DEV__) console.info('[pillbox] device update pushed');
       const status = message.status ? toStatusFields(message.status) : null;
       deviceListeners.forEach((listener) => listener(status));
@@ -837,8 +831,11 @@ export async function fetchBackendNotifications(
   tab: BackendFeedTab,
   page: number,
   limit: number,
+  elderlyId: string | null = null,
 ): Promise<{ items: AppNotification[]; total: number; unreadCount: number }> {
-  const res = await backend<BackendNotificationPage>(`/notifications?tab=${tab}&page=${page}&limit=${limit}`);
+  const query = new URLSearchParams({ tab, page: String(page), limit: String(limit) });
+  if (elderlyId) query.set('elderly_id', elderlyId);
+  const res = await backend<BackendNotificationPage>(`/notifications?${query.toString()}`);
   return { items: res.data.map(toAppNotification), total: res.total, unreadCount: res.unread_count };
 }
 
@@ -853,12 +850,6 @@ export async function deleteBackendNotification(id: string): Promise<void> {
   } catch (err) {
     if (!(err instanceof BackendError && err.status === 404)) throw err;
   }
-}
-
-/** "Hapus semua": deletes every notification at or older than `upTo` (feed order). */
-export async function clearBackendNotifications(upTo: { createdAt: number; id: string }): Promise<{ deleted: number }> {
-  const query = new URLSearchParams({ up_to_created_at: new Date(upTo.createdAt).toISOString(), up_to_id: upTo.id });
-  return backend<{ deleted: number }>(`/notifications?${query.toString()}`, 'DELETE');
 }
 
 /** Days covered by the adherence card in backend mode (today included, WIB). */
