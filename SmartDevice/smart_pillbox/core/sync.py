@@ -50,8 +50,11 @@ class RegistrationError(Exception):
 # --- identity -------------------------------------------------------------------
 
 def get_identity(db: Database) -> tuple[str | None, str | None]:
-    code = os.environ.get("PILLCARE_DEVICE_CODE") or db.get_device_state("device_code")
-    key = os.environ.get("PILLCARE_DEVICE_KEY") or db.get_device_state("device_secret")
+    # The env overrides apply to the default profile only: exported once in a shell, they would
+    # otherwise give every virtual pillbox the SAME identity.
+    use_env = config.PROFILE == config.DEFAULT_PROFILE
+    code = (use_env and os.environ.get("PILLCARE_DEVICE_CODE")) or db.get_device_state("device_code")
+    key = (use_env and os.environ.get("PILLCARE_DEVICE_KEY")) or db.get_device_state("device_secret")
     return code, key
 
 

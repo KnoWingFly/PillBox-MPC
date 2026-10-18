@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from PySide6.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, Signal
+from PySide6.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QLockFile, QProcess
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
@@ -24,6 +25,7 @@ from smart_pillbox.gui.compartment_widget import CompartmentWidget
 from smart_pillbox.gui.lcd_widget import LcdDisplay
 from smart_pillbox.gui.caregiver_tray_widget import CaregiverTrayWidget
 from smart_pillbox.gui.lansia_tray_widget import LansiaTrayWidget
+from smart_pillbox.gui.qr_widget import QrDialog, QrWidget
 from smart_pillbox.gui import styles
 from smart_pillbox.models import Compartment, ChamberState
 
@@ -105,7 +107,8 @@ class RegisterWorker(QRunnable):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Smart Pillbox — Device Simulator (CE739L)")
+        title = "Smart Pillbox — Device Simulator (CE739L)"
+        self.setWindowTitle(title if config.PROFILE == config.DEFAULT_PROFILE else f"{title} [{config.PROFILE}]")
         self.resize(1260, 840)
         self.setMinimumSize(1180, 780)
         self.setStyleSheet(f"background-color: {styles.BACKGROUND};")
@@ -126,6 +129,7 @@ class MainWindow(QMainWindow):
         self._sync_again = False  # a sync was requested while one was running
         self._reconnected = False  # next sync is the first after Wi-Fi returned
         self._is_registering = False
+        self._launching_until = 0.0  # monotonic: "Tambah Pillbox Virtual" waits for the new window
         self._battery_percent = 100
         self._config_version_seen = self.db.get_device_state("config_version")
         # True once the lab clock was moved on purpose (+1 hour, speed, jump): the server's
@@ -137,6 +141,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._refresh_connection_panel()
+        self._refresh_virtual_panel()
 
 
         self._tick_timer = QTimer(self)
@@ -324,14 +329,24 @@ class MainWindow(QMainWindow):
         lab_layout.addWidget(batt_group)
 
         # Server connection / pairing
-        conn_group = QGroupBox("Koneksi Server")
+        conn_group = QGroupBox(
+            "Koneksi Server" if config.PROFILE == config.DEFAULT_PROFILE else f"Koneksi Server · {config.PROFILE}"
+        )
         conn_layout = QHBoxLayout(conn_group)
+        # QR of the device code only (no secret); refreshed by _refresh_connection_panel.
+        self._qr = QrWidget(76, clickable=True, parent=conn_group)
+        self._qr.clicked.connect(self._on_qr_clicked)
+        conn_layout.addWidget(self._qr)
         conn_info = QVBoxLayout()
         self._lbl_device_code = QLabel()
         self._lbl_device_code.setStyleSheet("border: none; font-size: 13px; font-weight: bold; color: #E2E8F0;")
         self._lbl_device_code.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._lbl_pair_status = QLabel()
         self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px;")
+        # Wide enough for the longest texts ("Kode: PB-XXXXXXXX", "Masukkan kode ini di aplikasi"):
+        # the labels change text after layout and would otherwise be clipped.
+        for label in (self._lbl_device_code, self._lbl_pair_status):
+            label.setMinimumWidth(175)
         conn_info.addWidget(self._lbl_device_code)
         conn_info.addWidget(self._lbl_pair_status)
         conn_layout.addLayout(conn_info)
@@ -352,6 +367,21 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar(self))
         self.statusBar().setStyleSheet("color: #888;")
+        # Extra pillboxes, each its own process and identity (main.py --profile pbN). Lives in the
+        # status bar: the lab panel has no room left at the default window width.
+        self._lbl_virtual = QLabel(self)
+        self._btn_add_virtual = QPushButton("Tambah Pillbox Virtual", self)
+        self._btn_add_virtual.setToolTip(
+            f"Buka pillbox baru di jendela terpisah dengan identitas sendiri (maks. {len(config.VIRTUAL_PROFILES)})"
+        )
+        self._btn_add_virtual.setStyleSheet(
+            "QPushButton { background-color: #334155; color: white; padding: 4px 10px; border-radius: 4px; border: none; }"
+            "QPushButton:hover { background-color: #475569; }"
+            "QPushButton:disabled { color: #94A3B8; }"
+        )
+        self._btn_add_virtual.clicked.connect(self._on_add_virtual_clicked)
+        self.statusBar().addPermanentWidget(self._lbl_virtual)
+        self.statusBar().addPermanentWidget(self._btn_add_virtual)
         self._refresh_lcd()
 
     # -- event handlers ------------------------------------------------------
@@ -361,6 +391,7 @@ class MainWindow(QMainWindow):
         if self._alarm_until is not None:
             self._update_chime()  # ends an app alarm whose time is up
         self._refresh_connection_panel()
+        self._refresh_virtual_panel()
 
     def _on_sync_tick(self) -> None:
         if not self._is_online:
@@ -403,6 +434,7 @@ class MainWindow(QMainWindow):
     def _refresh_connection_panel(self) -> None:
         code, _ = sync.get_identity(self.db)
         if not sync.is_registered(self.db):
+            self._qr.set_payload(None)
             self._lbl_device_code.setText("Kode: -")
             self._lbl_pair_status.setText("Belum terdaftar ke server")
             self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px; color: #FCA5A5;")
@@ -411,6 +443,7 @@ class MainWindow(QMainWindow):
             self._btn_forget.setEnabled(False)
             return
         self._lbl_device_code.setText(f"Kode: {code}")
+        self._qr.set_payload(code)  # no-op unless the code changed (register / Reset Identitas)
         if sync.is_paired(self.db):
             self._lbl_pair_status.setText("Terpasang ke aplikasi")
             self._lbl_pair_status.setStyleSheet("border: none; font-size: 11px; color: #6EE7B7;")
@@ -420,6 +453,52 @@ class MainWindow(QMainWindow):
         self._btn_register.setText("Salin Kode")
         self._btn_register.setEnabled(True)
         self._btn_forget.setEnabled(True)
+
+    # -- virtual pillboxes -------------------------------------------------------------
+    @staticmethod
+    def _profile_running(name: str) -> bool:
+        if name == config.PROFILE:
+            return True
+        if not config.profile_dir(name).exists():
+            return False
+        probe = QLockFile(str(config.lock_path(name)))
+        probe.setStaleLockTime(0)  # same policy as main.py: only a live process holds it
+        if probe.tryLock(0):
+            probe.unlock()
+            return False
+        return True
+
+    def _refresh_virtual_panel(self) -> None:
+        running = [p for p in config.VIRTUAL_PROFILES if self._profile_running(p)]
+        free = len(config.VIRTUAL_PROFILES) - len(running)
+        launching = time.monotonic() < self._launching_until
+        self._lbl_virtual.setText(f"Pillbox virtual aktif: {len(running)}/{len(config.VIRTUAL_PROFILES)}")
+        self._btn_add_virtual.setEnabled(free > 0 and not launching)
+        self._btn_add_virtual.setText("Membuka..." if launching else "Tambah Pillbox Virtual")
+
+    def _on_add_virtual_clicked(self) -> None:
+        name = next((p for p in config.VIRTUAL_PROFILES if not self._profile_running(p)), None)
+        if name is None:
+            QMessageBox.information(
+                self, "Batas tercapai", f"Maksimal {len(config.VIRTUAL_PROFILES)} pillbox virtual berjalan bersamaan."
+            )
+            return
+        config.profile_dir(name).mkdir(parents=True, exist_ok=True)
+        ok, _pid = QProcess.startDetached(
+            sys.executable, [str(config.BASE_DIR / "main.py"), "--profile", name], str(config.BASE_DIR)
+        )
+        if not ok:
+            QMessageBox.warning(self, "Gagal membuka", f"Pillbox virtual '{name}' tidak dapat dijalankan.")
+            return
+        # The new process takes its lock a moment after starting: avoid launching the same profile twice.
+        self._launching_until = time.monotonic() + 4
+        self._refresh_virtual_panel()
+        self.statusBar().showMessage(f"Membuka pillbox virtual '{name}' di jendela baru...", 4000)
+
+    def _on_qr_clicked(self) -> None:
+        code = self._qr.payload()
+        if code:
+            QrDialog(code, self).exec()
 
     def _on_register_clicked(self) -> None:
         if sync.is_registered(self.db):

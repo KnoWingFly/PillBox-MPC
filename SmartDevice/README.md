@@ -35,11 +35,14 @@ physical hardware built).
 ## Run it
 
 ```bash
-pip install -r requirements.txt
-python main.py
+python -m venv .venv                    # once
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python main.py                # the default pillbox
+.venv/bin/python main.py --profile pb2  # another, independent pillbox (see below)
 ```
 
-A fresh run creates `pillbox_local.db` next to this file, seeded with a
+`requirements.txt` includes `segno` (pure-Python QR generator, no Pillow needed) for the
+pairing QR. A fresh run creates `pillbox_local.db` next to this file, seeded with a
 default schedule (07:00/12:00/17:00/20:00 before meals, +30 min after).
 Edit `_DEFAULT_SCHEDULE` in `smart_pillbox/db/database.py` or use
 `Database.update_schedule()` to change it.
@@ -47,7 +50,7 @@ Edit `_DEFAULT_SCHEDULE` in `smart_pillbox/db/database.py` or use
 ## Run the tests
 
 ```bash
-pytest
+.venv/bin/pytest
 ```
 
 Tests cover the scheduler (activation, MISSED detection, single-active-chamber
@@ -60,12 +63,8 @@ needed, so they run headless in CI too.
   press rather than two separate physical transitions — acceptable for a
   simulator, but note it if a reviewer asks how the real Reed Switch flow maps
   to this code.
-- `sync.flush_pending_events()` runs on the GUI thread via `QTimer`, blocking
-  briefly (bounded by `SYNC_HTTP_TIMEOUT_SECONDS`) if the backend is
-  unreachable. Fine for a 3-second timeout in a demo; move to a `QThread`
-  before this becomes a real device app.
-- `BACKEND_TELEMETRY_URL` in `config.py` is a placeholder — update it once
-  the FastAPI endpoint spec is finalized so the JSON payload shape matches.
+- Sync (`SyncWorker`) and registration (`RegisterWorker`) run on `QThreadPool` workers, so a slow
+  or unreachable backend never freezes the GUI; one sync runs at a time.
 
 ## Chime sound
 
@@ -88,10 +87,50 @@ often silent on Linux. To convert another file:
    The emulator reads `PROVISIONING_TOKEN` from `PILLCARE_PROVISIONING_TOKEN`, `SmartDevice/.env`
    or `../Backend/.env` (asks you to paste it if none is found), registers itself with the backend,
    stores its own device code + secret in `pillbox_local.db`, and copies the code to the clipboard.
-3. In the mobile app, the dashboard shows **Hubungkan Pillbox**: type the code, choose a 4-digit PIN,
-   press **Hubungkan**. The panel switches to "Terpasang ke aplikasi" on the next heartbeat (≤ 15 s).
+3. The panel shows the code and a **QR code** of it (click the QR to enlarge it). The QR holds only
+   the public device code, never the secret. In the mobile app open **Perangkat → Tambah pillbox**
+   (or the "Belum ada pillbox" screen on a fresh account), press **Pindai QR** or type the code,
+   then choose a 4-digit PIN, a name and the elderly profile.
+   The panel switches to "Terpasang ke aplikasi" on the next heartbeat (≤ 15 s).
 4. Schedules saved in the app are pulled on the next heartbeat and applied live.
 
 Backend elsewhere? Set `PILLCARE_BACKEND_URL=http://<host>:8000` before starting the emulator.
 "Reset Identitas" forgets the code/secret (e.g. after the backend database was reset).
 Device ↔ backend protocol: `docs/DEVICE_CONTRACT.md`.
+
+## Several pillboxes at once
+
+Each pillbox is its own **process** with its own **profile**: its own SQLite database, so its own
+device code + secret, schedules, event log and sync loop.
+
+- `python main.py` is the `default` profile (`pillbox_local.db` next to `main.py`, as before).
+- `python main.py --profile pb2` uses `profiles/pb2/pillbox_local.db` (`profiles/` is git-ignored).
+- **Tambah Pillbox Virtual** (status bar, bottom right) opens the next free profile of
+  `default`, `pb2`, `pb3`, `pb4` in a new window: at most 4 at once.
+- A profile can run only once (a `QLockFile` per profile); starting it twice shows
+  "Pillbox virtual '…' sudah terbuka". A crashed window's lock is released automatically.
+- **Reset Identitas** only touches that window's own database.
+- `PILLCARE_DEVICE_CODE` / `PILLCARE_DEVICE_KEY` apply to the `default` profile only, so an
+  exported value can never give two pillboxes the same identity.
+
+Why processes instead of several windows in one process: each window then has its own database
+connection, thread pool, WebSocket and sound effect, and a crash or reset in one cannot affect
+another. The backend tells pillboxes apart by device code (each `register` creates a new one).
+
+### Two-pillbox demo
+
+1. Start the backend, then `.venv/bin/python main.py`. Press **Daftarkan Perangkat** (pillbox A).
+2. Press **Tambah Pillbox Virtual**. A second window titled `[pb2]` opens; press
+   **Daftarkan Perangkat** there too (pillbox B, a different code).
+3. In the app: **Perangkat → Tambah pillbox → Pindai QR**, scan A's QR, PIN `1234`,
+   name "Kamar Ibu". Repeat for B as "Kamar Ayah". The app's pillbox switcher shows both.
+4. Within 15 s both windows show "Terpasang ke aplikasi".
+5. Select "Kamar Ayah" in the app and save a schedule for a slot a few minutes ahead.
+   Only the `[pb2]` window applies it (status bar: "Jadwal baru dari aplikasi diterapkan").
+6. Let the dose pop up in `[pb2]` and take it (or let it go missed). The notification
+   appears in the app under "Kamar Ayah" only; switch to "Kamar Ibu" and it is not there.
+7. **Reset Identitas** in `[pb2]`: the default window stays "Terpasang". In the app, "Kamar Ayah"
+   turns offline within about 45 s.
+8. In the app, remove "Kamar Ayah" (Perangkat → Hapus). "Kamar Ibu" stays, schedules intact.
+9. Open up to 4 windows with **Tambah Pillbox Virtual**: the button then disables ("4/4").
+   `python main.py --profile pb2` while `[pb2]` is open is refused.

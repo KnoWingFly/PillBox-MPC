@@ -6,15 +6,16 @@ import { useAuth } from '@/hooks/use-auth';
 import { errorMessage } from '@/lib/api/error-message';
 import { isGoogleSignInAvailable } from '@/lib/google-signin';
 
-export default function GoogleSignInButton({ disabled }: { disabled?: boolean }) {
-  const { signInWithGoogle } = useAuth();
+export default function GoogleSignInButton({ disabled, remember = true }: { disabled?: boolean; remember?: boolean }) {
+  const { signInWithGoogle, clearSessionNotice } = useAuth();
   const [loading, setLoading] = useState(false);
   const available = isGoogleSignInAvailable();
 
   const onPress = async () => {
     setLoading(true);
     try {
-      await signInWithGoogle(); // false = cancelled, stays silent
+      clearSessionNotice();
+      await signInWithGoogle(remember); // false = cancelled, stays silent
     } catch (err) {
       Alert.alert(Strings.common.error, errorMessage(err));
     } finally {

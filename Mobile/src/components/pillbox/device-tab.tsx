@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { ActivityIndicator, RefreshControl, ScrollView, Text, View } from 'react-native';
 
 import * as tokens from '@/theme/tokens';
@@ -186,6 +187,23 @@ function SimulatorCard({
   );
 }
 
+function AccountCard({ userName, onSignOut }: { userName: string | null; onSignOut: () => void }) {
+  return (
+    <Card>
+      <View className="flex-row items-center gap-3">
+        <IconBadge icon="person-circle-outline" tone="primary" />
+        <View className="flex-1">
+          <Text className="text-caption text-ink-muted">Masuk sebagai</Text>
+          <Text className="text-body font-semibold text-ink" numberOfLines={1}>
+            {userName ?? 'Pengasuh'}
+          </Text>
+        </View>
+      </View>
+      <Button label="Keluar" icon="log-out-outline" variant="danger-soft" onPress={onSignOut} />
+    </Card>
+  );
+}
+
 export function DeviceTab({
   device,
   connectionBusy,
@@ -195,6 +213,9 @@ export function DeviceTab({
   onToggleConnection,
   refreshing,
   onRefresh,
+  userName,
+  onSignOut,
+  pillboxList,
   simulator,
 }: {
   device: DeviceStatus | null;
@@ -205,6 +226,10 @@ export function DeviceTab({
   onToggleConnection: () => void;
   refreshing: boolean;
   onRefresh: () => void;
+  userName: string | null;
+  onSignOut: () => void;
+  /** "Pillbox Anda" list (backend mode). */
+  pillboxList: ReactNode;
   simulator: Parameters<typeof SimulatorCard>[0];
 }) {
   return (
@@ -222,6 +247,7 @@ export function DeviceTab({
         title="Perangkat"
         subtitle={api.USE_MOCK ? 'Koneksi, baterai, dan alat uji Pillbox' : 'Koneksi, baterai, dan pintu bilik Pillbox'}
       />
+      {pillboxList}
       <ConnectionCard
         device={device}
         busy={connectionBusy}
@@ -232,6 +258,7 @@ export function DeviceTab({
       />
       {/* Mock only: with the real backend, events come from the smart device emulator. */}
       {api.USE_MOCK && <SimulatorCard {...simulator} />}
+      <AccountCard userName={userName} onSignOut={onSignOut} />
     </ScrollView>
   );
 }
