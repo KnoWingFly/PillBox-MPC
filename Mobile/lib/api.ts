@@ -570,7 +570,7 @@ function startPolling(): void {
   const loop = async () => {
     await pollNotifications();
     if (pollActive && generation === pollGeneration) {
-      pollTimer = setTimeout(() => void loop(), AppConfig.notificationPollMs);
+      pollTimer = setTimeout(() => void loop(), isRealtimeLive() ? REALTIME_FALLBACK_POLL_MS : AppConfig.notificationPollMs);
     }
   };
   void loop();
@@ -613,8 +613,22 @@ type PushMessage = {
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 
+/**
+ * While the push socket is live, polling is only a safety net for a lost hint, so it slows
+ * down to this period. With many app users this keeps the backend (and its shared database)
+ * from answering a request per user every few seconds.
+ */
+export const REALTIME_FALLBACK_POLL_MS = 60_000;
+
 let socket: WebSocket | null = null;
+/** true from the backend's "ready" until the socket closes. */
+let socketReady = false;
 let socketWanted = false;
+
+/** The backend's push socket is connected and authenticated. */
+export function isRealtimeLive(): boolean {
+  return socketReady && socket?.readyState === WebSocket.OPEN;
+}
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelayMs = RECONNECT_MIN_MS;
 
@@ -647,6 +661,7 @@ async function openSocket(): Promise<void> {
     }
     const type = message.type;
     if (type === 'ready') {
+      socketReady = true;
       if (__DEV__) console.info('[pillbox] live updates connected');
       reconnectDelayMs = RECONNECT_MIN_MS;
       void pollNotifications(); // catch up on anything sent while disconnected
@@ -663,7 +678,10 @@ async function openSocket(): Promise<void> {
     }
   };
   ws.onclose = (e) => {
-    if (socket === ws) socket = null;
+    if (socket === ws) {
+      socket = null;
+      socketReady = false;
+    }
     if (__DEV__ && socketWanted) console.info(`[pillbox] live updates disconnected (code ${e.code}), retrying`);
     scheduleReconnect();
   };
@@ -691,6 +709,7 @@ function stopSocket(): void {
   reconnectDelayMs = RECONNECT_MIN_MS;
   const ws = socket;
   socket = null;
+  socketReady = false;
   ws?.close();
 }
 

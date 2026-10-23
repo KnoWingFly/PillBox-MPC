@@ -70,5 +70,6 @@ export const Strings = {
     GOOGLE_TOKEN_INVALID: 'Gagal masuk dengan Google. Silakan coba lagi.',
     NETWORK_ERROR: 'Tidak dapat terhubung ke server. Periksa koneksi Anda.',
     UNAUTHORIZED: 'Sesi Anda telah berakhir. Silakan masuk kembali.',
+    SERVICE_UNAVAILABLE: 'Server sedang sibuk. Coba lagi sebentar lagi.',
   } as Record<string, string>,
 } as const;

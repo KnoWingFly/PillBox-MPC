@@ -52,6 +52,7 @@ from app.models.enums import (
 from app.services.adherence import dose_instants, is_scheduled_on
 from app.services.device_clock import device_now, device_now_sql
 from app.services.doses import notify_dose, pending_dose_row, pending_doses_insert_stmt
+from app.services.leader import RULES_ENGINE_LOCK_KEY, try_lead
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
@@ -142,8 +143,12 @@ async def decide_missed(session: AsyncSession, now: datetime, settings: Settings
 
 async def run_once(sessionmaker: async_sessionmaker[AsyncSession], now: datetime, settings: Settings) -> tuple[int, int]:
     async with sessionmaker() as session:
+        if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
+            return 0, 0  # another backend instance runs this pass
         created = await materialize_due_doses(session, now, settings)
     async with sessionmaker() as session:
+        if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
+            return created, 0
         missed = await decide_missed(session, now, settings)
     return created, missed
 

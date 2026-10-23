@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.services import presence
+from app.services.leader import PRESENCE_LOCK_KEY, try_lead
 from app.services.rules_engine import rules_engine_loop
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,8 @@ async def presence_loop(sessionmaker: async_sessionmaker[AsyncSession], settings
     while True:
         try:
             async with sessionmaker() as session:
-                await presence.sweep(session, datetime.now(UTC), settings)
+                if await try_lead(session, PRESENCE_LOCK_KEY):
+                    await presence.sweep(session, datetime.now(UTC), settings)
         except Exception:
             logger.exception("presence_sweep_failed")
         await asyncio.sleep(settings.presence_check_interval_seconds)

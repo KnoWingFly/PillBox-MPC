@@ -215,10 +215,14 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   // pushes a hint when they change; the interval is the fallback when the socket is down.
   useEffect(() => {
     if (api.USE_MOCK || needsPairing) return;
-    const refresh = () => {
+    let lastFetchAt = 0;
+    const refresh = (force = false) => {
+      // Pushed changes already arrive over the socket; then poll only as a slow safety net.
+      if (!force && api.isRealtimeLive() && Date.now() - lastFetchAt < api.REALTIME_FALLBACK_POLL_MS) return;
+      lastFetchAt = Date.now();
       api.getDeviceStatus().then(setDevice).catch(() => undefined);
     };
-    const timer = setInterval(refresh, AppConfig.deviceStatusPollMs);
+    const timer = setInterval(() => refresh(), AppConfig.deviceStatusPollMs);
     // Stock changes on the pillbox (refill, a sachet taken) arrive with the same heartbeat as the
     // status, but are not part of the pushed status: fetch them on each push. Only the stock field
     // is touched, so unsaved schedule edits survive. One request at a time.
@@ -241,7 +245,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     // Pushed values are applied directly; without them, refetch.
     const unsubscribe = api.subscribeToDeviceChanges((status) => {
       if (status) setDevice((prev) => (prev ? { ...prev, ...status } : prev));
-      else refresh();
+      else refresh(true);
       refreshStock();
     });
     return () => {

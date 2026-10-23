@@ -29,9 +29,20 @@ class Settings(BaseSettings):
     log_json: bool = True
 
     # --- Database -------------------------------------------------------
-    database_url: str  # Supabase session-pooler URI
-    db_pool_size: int = 5
-    db_max_overflow: int = 5
+    database_url: str  # Supabase pooler URI (transaction pooler, port 6543, recommended)
+    # "auto" = transaction mode when the URL's port is 6543. See app/db/session.py.
+    db_pooler_mode: Literal["auto", "session", "transaction"] = "auto"
+    # Kept small on purpose: every running backend (each teammate's laptop) takes
+    # up to db_pool_size + db_max_overflow connections from the SAME Supabase project.
+    db_pool_size: int = 3
+    db_max_overflow: int = 2
+    # Seconds a request waits for a free pooled connection before failing with 503.
+    db_pool_timeout_seconds: float = 10.0
+    # Connections opened at startup (warm_pool). They stay open in the pool.
+    db_pool_warm_connections: int = 1
+    db_connect_timeout_seconds: float = 10.0
+    # Server-side statement deadline, so one stuck query cannot hold a connection forever.
+    db_command_timeout_seconds: float = 30.0
     # NullPool opens a fresh connection per session. Used by the test suite so
     # pooled asyncpg connections never cross event loops.
     db_use_null_pool: bool = False
