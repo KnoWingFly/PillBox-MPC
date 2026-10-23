@@ -584,10 +584,9 @@ function stopPolling(): void {
 
 // ---------------------------------------------------------------------------
 // Push hints (Backend /ws/app, Backend/app/services/app_hub.py)
-// The backend sends {"type":"notifications"} or {"type":"device"} right after a DB commit, so the
-// dashboard refetches at once instead of on the next poll. The socket carries no data: the
-// refetch goes through the normal authenticated endpoints. Polling keeps running as the fallback
-// (socket down, hint lost).
+// The backend sends {"type":"notifications","items"} or {"type":"device","status"} right after a DB
+// commit; the data is applied directly, and only a message without data triggers a refetch through
+// the normal authenticated endpoints. Polling keeps running as the fallback (socket down, push lost).
 // ---------------------------------------------------------------------------
 
 /** status = new values pushed by the backend; null = something changed, refetch. */

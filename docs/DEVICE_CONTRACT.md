@@ -272,10 +272,10 @@ These are the differences observed in `SmartDevice/` (not modified by the backen
 
 | # | Emulator today | Contract | Impact |
 |---|---|---|---|
-| 1 | ~~Hardcoded `sim-01` / `dummy-key`~~ **Fixed:** the "Koneksi Server" panel's "Daftarkan Perangkat" button provisions the emulator and stores its code + secret in `device_state` | Per-device secret from provisioning | None. `PILLCARE_DEVICE_CODE` / `PILLCARE_DEVICE_KEY` env vars can override the stored identity. |
-| 2 | No WebSocket client | WS for commands and heartbeats | `trigger_alarm` and clock calibrate return `409 DEVICE_COMMAND_CHANNEL_UNAVAILABLE` while the emulator is online. Presence still works through REST heartbeats. |
+| 1 | ~~Hardcoded `sim-01` / `dummy-key`~~ **Fixed:** the "Koneksi Server" panel's "Daftarkan Perangkat" button provisions the emulator and stores its code + secret in `device_state` | Per-device secret from provisioning | None. `PILLCARE_DEVICE_CODE` / `PILLCARE_DEVICE_KEY` env vars can override the stored identity (default profile only). |
+| 2 | ~~No WebSocket client~~ **Fixed:** `smart_pillbox/core/ws_client.py`, commands handled in `gui/main_window.py` | WS for commands and heartbeats | None while the socket is up. `trigger_alarm` and clock calibrate return `409 DEVICE_COMMAND_CHANNEL_UNAVAILABLE` only while it is down (e.g. Wi-Fi toggled off). Presence also works through REST heartbeats. |
 | 3 | `occurred_at`, `rtc_time` and `applied_at` are naive (`datetime.isoformat()`) | Offset included | Works: naive times are read in the device timezone. Wrong if the emulator PC's timezone differs from the device's configured one. |
-| 4 | Simulated RTC can run at 10×/60× and jump +1 h | Real time | Events "from the future" are accepted up to 7 days ahead. Server-side missed detection still uses real server time, so fast-forwarded demos can disagree with the server. |
+| 4 | Simulated RTC can run at 10×/60× and jump +1 h | Real time | Events "from the future" are accepted up to 7 days ahead. With `FOLLOW_DEVICE_CLOCK=true` (default) the rules engine judges doses by the device clock (§2 heartbeat `rtc_speed`), so fast-forwarded demos agree with the server. |
 | 5 | Lid **open** = taken (`scheduler.open_compartment`); `ALARM_TIMEOUT` fires at `schedule_time + tolerance` | Taken on open (or on close if no open); server deadline = `window_end + tolerance` | Same result when `window_end == window_start`. With a wider window the emulator times out earlier than the server would. |
 | 6 | `update_schedules()` uses only `window_start` (ignores `window_end`) | Window `[start, end]` | See row 5. |
 | 7 | Telemetry sends `schedule_id: null` | Optional | Works: matched by slot and time. |
@@ -283,4 +283,7 @@ These are the differences observed in `SmartDevice/` (not modified by the backen
 | 9 | Marks the whole batch synced on any 2xx | Per-event `results` | Fine: rejected events are final anyway. |
 | 10 | Local `config_version` is reset to `0` when the device registers | — | Works: the first config after pairing is always pulled, and the GUI now applies pulled schedules live (no restart needed). |
 | 11 | No `NETWORK_RECOVERED` or `BATTERY_STATUS` events; battery only in the heartbeat | Optional | None. |
-| 12 | Heartbeat and flush skipped while "Wi-Fi: Offline"; heartbeat then flush on return | Same (§5) | Compatible. Offline is detected about 45 s after the toggle. |
+| 12 | Heartbeat and flush skipped while "Wi-Fi: Offline"; heartbeat then flush on return | Same (§5) | Compatible. Offline is detected at once: the toggle closes the WebSocket and the backend marks the device offline on disconnect. A REST-only client goes offline after `DEVICE_HEARTBEAT_TIMEOUT_SECONDS` (default 45 s). |
+| 13 | `trigger_alarm` logs `ALARM_STARTED` without `command_id`, logs nothing when `slot_number` is null (all slots), and never sends `ALARM_STOPPED` | Log `ALARM_STARTED` with `command_id` | Alarm history in the app lacks the command link and all-slot alarms. |
+| 14 | `schedule_updated` is acked at once, before the config pull, with no `result` | Pull config, `config-ack`, then ack with `{"config_version_applied": n}` | Works: the pull and `config-ack` follow right after; the ack only confirms receipt. |
+| 15 | The heartbeat pulls the config itself when `config_update_available`, before the buffer flush | §5 step 3: heartbeat, flush, then config | Works: events carry their own `occurred_at`, so order does not change their outcome. |

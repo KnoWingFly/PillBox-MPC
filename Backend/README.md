@@ -20,7 +20,7 @@ app/
   services/               all logic: telemetry, adherence, doses, rules_engine, presence,
                           connection_manager, notifications, device_management, schedules,
                           stock, elderly, journal, notification_feed, provisioning
-migrations/               0001 = ERD tables, 0002 = backend additions not in the ERD
+migrations/               0001 = ERD tables, 0002 = backend additions not in the ERD, 0003-0006 = indexes and later changes
 scripts/migrate.py        applies migrations/*.sql
 scripts/fake_device.py    device test client (REST + WS, Wi-Fi off/on simulation)
 tests/                    pytest suite against a real Postgres test database

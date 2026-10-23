@@ -178,8 +178,8 @@ async def app_socket(websocket: WebSocket) -> None:
     App -> server:  auth (first, within WS_AUTH_TIMEOUT_SECONDS) | ping | resubscribe
     Server -> app:  ready | notifications | device | pong
     `resubscribe` reloads the elderly the user follows (send it after pairing).
-    The token is checked once, at connect; the socket carries no data, only
-    hints to call the authenticated REST endpoints.
+    The token is checked once, at connect. Pushes carry the changed data (see
+    app/services/app_hub.py); a message without data tells the app to refetch.
     """
     settings = get_settings()
     await websocket.accept()
