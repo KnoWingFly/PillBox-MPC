@@ -41,3 +41,6 @@ example
 # generated native folders
 /ios
 /android
+
+# dev-only OTP capture (src/server/email.ts)
+.dev-last-otp.json

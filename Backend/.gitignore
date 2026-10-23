@@ -4,3 +4,4 @@ __pycache__/
 .env
 .pytest_cache/
 .ruff_cache/
+.fake_device_*.json

@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Backend/ (this file is Backend/app/core/config.py). Anchoring the .env path
@@ -12,26 +13,147 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 class Settings(BaseSettings):
     # Priority: real environment variables > .env file > defaults.
+    # Env var names are case-insensitive (pydantic-settings default).
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # `BATTERY_RATED_DAYS=` (empty) in .env means "unset", not "".
+        env_ignore_empty=True,
     )
 
     app_name: str = "PillCare API"
     environment: str = "development"
     debug: bool = False
+    log_level: str = "INFO"
+    log_json: bool = True
 
-    supabase_url: str          # https://<project-ref>.supabase.co
-    database_url: str          # Supabase session-pooler URI
-    supabase_jwt_audience: str = "authenticated"
+    # --- Database -------------------------------------------------------
+    database_url: str  # Supabase pooler URI (transaction pooler, port 6543, recommended)
+    # "auto" = transaction mode when the URL's port is 6543. See app/db/session.py.
+    db_pooler_mode: Literal["auto", "session", "transaction"] = "auto"
+    # Kept small on purpose: every running backend (each teammate's laptop) takes
+    # up to db_pool_size + db_max_overflow connections from the SAME Supabase project.
+    db_pool_size: int = 3
+    db_max_overflow: int = 2
+    # Seconds a request waits for a free pooled connection before failing with 503.
+    db_pool_timeout_seconds: float = 10.0
+    # Connections opened at startup (warm_pool). They stay open in the pool.
+    db_pool_warm_connections: int = 1
+    db_connect_timeout_seconds: float = 10.0
+    # Server-side statement deadline, so one stuck query cannot hold a connection forever.
+    db_command_timeout_seconds: float = 30.0
+    # NullPool opens a fresh connection per session. Used by the test suite so
+    # pooled asyncpg connections never cross event loops.
+    db_use_null_pool: bool = False
+    # pre_ping costs THREE extra DB round trips on EVERY session checkout
+    # (each request and each background pass): SQLAlchemy's asyncpg dialect
+    # pings with BEGIN, "SELECT ;", ROLLBACK. On a remote database that is
+    # the single largest fixed cost. Turning it off is safe only together with a
+    # recycle age shorter than the pooler's idle timeout.
+    db_pool_pre_ping: bool = True
+    # Seconds after which a pooled connection is replaced on checkout; -1 = never.
+    db_pool_recycle_seconds: int = -1
 
     cors_origins: list[str] = ["http://localhost:8081"]
 
+    # --- Caregiver auth -------------------------------------------------
+    # "app_jwt": HS256 access tokens issued by the Mobile server
+    #   (Mobile/src/server/tokens.ts, secret JWT_ACCESS_SECRET, sub = users.id).
+    # "supabase": Supabase Auth access tokens verified against the project JWKS;
+    #   sub is mapped to users through auth_identities.supabase_user_id.
+    auth_mode: Literal["app_jwt", "supabase"] = "app_jwt"
+    jwt_access_secret: SecretStr | None = None
+    supabase_url: str | None = None
+    supabase_jwt_audience: str = "authenticated"
+
+    # --- Device auth / provisioning -------------------------------------
+    # Enables POST /api/v1/admin/devices (factory provisioning). Unset = disabled.
+    provisioning_token: SecretStr | None = None
+    device_secret_min_length: int = 16
+
+    # --- Presence (online/offline) --------------------------------------
+    device_heartbeat_interval_seconds: int = 15
+    device_heartbeat_timeout_seconds: int = 45
+    presence_check_interval_seconds: int = 5
+    # Minimum time a device must stay offline before DEVICE_OFFLINE is written.
+    # Each caregiver's notification_preferences.device_offline_after_minutes
+    # can only make it longer.
+    device_offline_notify_grace_seconds: int = 120
+    ws_auth_timeout_seconds: float = 10.0
+    command_ack_timeout_seconds: float = 10.0
+
+    # --- Rules engine ---------------------------------------------------
+    rules_engine_interval_seconds: int = 30
+    rules_engine_lookback_days: int = 1
+    # Extra wait after a dose deadline for in-flight telemetry.
+    missed_decision_grace_seconds: int = 60
+    # After a device reconnects, wait this long for its buffered flush.
+    offline_flush_wait_seconds: int = 60
+    # If the device stays offline this long past the deadline, decide MISSED
+    # anyway so caregivers are not left uninformed (a later flush can still
+    # upgrade the dose to TAKEN).
+    offline_max_wait_minutes: int = 360
+    # A "taken" event this many minutes before window_start still counts.
+    dose_early_accept_minutes: int = 15
+    # A dose taken up to this many whole minutes after window_end still counts as ON TIME
+    # (delay_minutes = 0, DOSE_TAKEN, TAKEN_ON_TIME), because an elderly person needs a moment to
+    # reach the box. Later than that it is late and delay_minutes is the real delay. Never reaches
+    # the slot's tolerance: see adherence.on_time_grace. 0 = on time only until window_end.
+    on_time_grace_minutes: int = Field(10, ge=0, le=60)
+
+    # --- Telemetry ------------------------------------------------------
+    telemetry_max_batch_size: int = 500
+    # Emulator RTC can be fast-forwarded; events further in the future than
+    # this are rejected.
+    telemetry_max_future_skew_minutes: int = 10080
+
+    # --- Thresholds -----------------------------------------------------
+    low_battery_threshold_percent: int = 20
+    # Battery must climb this far above the threshold before a new
+    # LOW_BATTERY notification can fire (prevents flapping around 20%).
+    low_battery_hysteresis_percent: int = 5
+    # wifi_rssi_dbm >= strong -> "KUAT", >= medium -> "SEDANG", else "LEMAH".
+    wifi_rssi_strong_dbm: int = -60
+    wifi_rssi_medium_dbm: int = -75
+    low_stock_threshold_units: int = 3
+    stock_capacity_per_slot: int = 30
+    clock_drift_tolerance_seconds: int = 60
+    # Judge doses (rules engine) and show the app's day by the DEVICE clock as last reported
+    # (rtc_time, rtc_speed), so a lab clock moved or sped up on the emulator stays consistent
+    # end to end. A real device's RTC is on real time, so this changes nothing for it.
+    # See app/services/device_clock.py.
+    follow_device_clock: bool = True
+
+    # --- Missed dose taken late ("Buka bilik sekarang", app/services/late_dose.py) -----
+    # How long the re-opened chamber stays popped up.
+    late_release_minutes: int = Field(15, ge=1, le=120)
+    # A missed dose may still be taken until this fraction of the way from its schedule
+    # time to the device's next dose (any slot); later it would come too close to the next
+    # dose (double dose). 0.5 = halfway.
+    late_release_cutoff_fraction: float = Field(0.5, gt=0, le=1)
+    # Rated runtime of a full battery, used for estimated_battery_days_remaining.
+    # Unset = the estimate is returned as null.
+    battery_rated_days: float | None = None
+    pin_max_attempts: int = 5
+    pin_lockout_seconds: int = 300
+
+    # Used when pairing a device and neither the request nor the caregiver
+    # profile has a valid IANA timezone.
+    default_device_timezone: str = "Asia/Jakarta"
+
+    enable_background_tasks: bool = True
+    default_page_limit: int = 20
+    max_page_limit: int = 100
+
+    # Structured "perf_timing" log lines with durations (core/timing.py).
+    # Off by default; when off the instrumentation is a single bool check.
+    perf_timing_logs: bool = False
+
     @field_validator("supabase_url")
     @classmethod
-    def _strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+    def _strip_trailing_slash(cls, v: str | None) -> str | None:
+        return v.rstrip("/") if v else v
 
     @field_validator("database_url")
     @classmethod
