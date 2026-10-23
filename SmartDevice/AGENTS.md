@@ -1,0 +1,1 @@
+@[SmartDevice guide](CLAUDE.md)

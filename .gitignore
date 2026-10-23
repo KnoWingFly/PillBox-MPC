@@ -1,3 +1,7 @@
+# Agent personal overrides
+CLAUDE.local.md
+.claude/settings.local.json
+
 # Environment and local secrets
 .env
 .env.*
