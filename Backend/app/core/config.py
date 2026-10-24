@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     # profile has a valid IANA timezone.
     default_device_timezone: str = "Asia/Jakarta"
 
+    # Elderly profile validation (POST/PUT /elderly): birth_date must not be in the
+    # future nor older than this many years; full_name needs at least this many chars.
+    elderly_max_age_years: int = Field(120, ge=1)
+    elderly_name_min_length: int = Field(2, ge=1)
+
     enable_background_tasks: bool = True
     default_page_limit: int = 20
     max_page_limit: int = 100

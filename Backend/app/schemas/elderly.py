@@ -5,13 +5,13 @@ from uuid import UUID
 from pydantic import BaseModel, EmailStr, Field
 
 from app.models.enums import Connectivity, Gender, Role
-from app.schemas.common import E164, FreeText, Label50, Name100
+from app.schemas.common import E164, BirthDate, ElderlyName, FreeText, Label50, Name100
 
 
 class ElderlyIn(BaseModel):
-    full_name: Name100
+    full_name: ElderlyName
     nickname: Name100 | None = None
-    birth_date: date | None = None
+    birth_date: BirthDate | None = None
     gender: Gender | None = None
     contact_phone: E164 | None = None
     notes: FreeText | None = None
