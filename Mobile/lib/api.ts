@@ -118,11 +118,16 @@ function mockOnly(name: string): never {
 // Real backend client (FastAPI, /api/v1)
 // ---------------------------------------------------------------------------
 
+/** One entry of a 422 VALIDATION_ERROR body, e.g. { path: 'body.full_name', message }. */
+export type BackendErrorDetail = { path: string; message: string };
+
 export class BackendError extends Error {
   constructor(
     public readonly status: number,
     public readonly code: string,
     message: string,
+    /** Field-level problems for VALIDATION_ERROR; empty otherwise. */
+    public readonly details: readonly BackendErrorDetail[] = [],
   ) {
     super(message);
     this.name = 'BackendError';
@@ -182,17 +187,25 @@ async function accessToken(): Promise<string | null> {
 async function toBackendError(res: Response): Promise<BackendError> {
   let code = 'HTTP_ERROR';
   let message = `Backend request failed (${res.status})`;
+  let details: BackendErrorDetail[] = [];
   try {
-    const err = (await res.json()) as { error?: { code?: string; message?: string; details?: { error?: unknown } } };
+    const err = (await res.json()) as { error?: { code?: string; message?: string; details?: unknown } };
     code = err.error?.code ?? code;
     message = err.error?.message ?? message;
-    // The pillbox's own reason (e.g. "Bilik lain sedang terbuka") says more than "Device rejected the command".
-    const deviceReason = err.error?.details?.error;
-    if (code === 'DEVICE_REJECTED_COMMAND' && typeof deviceReason === 'string') message = deviceReason;
+    const raw = err.error?.details;
+    if (Array.isArray(raw)) {
+      details = raw.filter(
+        (d): d is BackendErrorDetail => typeof d?.path === 'string' && typeof d?.message === 'string',
+      );
+    } else if (code === 'DEVICE_REJECTED_COMMAND') {
+      // The pillbox's own reason (e.g. "Bilik lain sedang terbuka") says more than "Device rejected the command".
+      const deviceReason = (raw as { error?: unknown } | undefined)?.error;
+      if (typeof deviceReason === 'string') message = deviceReason;
+    }
   } catch {
     // non-JSON error body
   }
-  return new BackendError(res.status, code, message);
+  return new BackendError(res.status, code, message, details);
 }
 
 async function backend<T>(path: string, method: Method = 'GET', body?: unknown, opts: SendOptions = {}): Promise<T> {

@@ -1,6 +1,8 @@
+import { useRouter } from 'expo-router';
 import type { ReactNode } from 'react';
 import { ActivityIndicator, RefreshControl, ScrollView, Text, View } from 'react-native';
 
+import { Strings } from '@/constants/strings';
 import * as tokens from '@/theme/tokens';
 import * as api from '@root/lib/api';
 import { formatJakartaTimestamp } from '@root/lib/schedule-time';
@@ -232,6 +234,7 @@ export function DeviceTab({
   pillboxList: ReactNode;
   simulator: Parameters<typeof SimulatorCard>[0];
 }) {
+  const router = useRouter();
   return (
     <ScrollView
       contentContainerClassName="gap-4 px-4 pb-8 pt-4"
@@ -248,6 +251,15 @@ export function DeviceTab({
         subtitle={api.USE_MOCK ? 'Koneksi, baterai, dan alat uji Pillbox' : 'Koneksi, baterai, dan pintu bilik Pillbox'}
       />
       {pillboxList}
+      {/* Creating a profile needs the backend (mock data has no elderly profiles). */}
+      {!api.USE_MOCK && (
+        <Button
+          label={Strings.elderlyForm.title}
+          icon="person-add-outline"
+          variant="secondary"
+          onPress={() => router.push('/elderly/new')}
+        />
+      )}
       <ConnectionCard
         device={device}
         busy={connectionBusy}

@@ -35,6 +35,8 @@ function RootNavigator() {
       <Stack.Protected guard={signedIn}>
         <Stack.Screen name="index" />
         <Stack.Screen name="explore" />
+        <Stack.Screen name="elderly/new" />
+        <Stack.Screen name="elderly/[id]/schedule" />
       </Stack.Protected>
       <Stack.Protected guard={!signedIn}>
         <Stack.Screen name="auth/login" />
