@@ -1,17 +1,21 @@
 import { Pressable, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { Strings } from '@/constants/strings';
 import * as tokens from '@/theme/tokens';
 
 import { Icon, type IconName, type Tone } from './ui';
 
-export type TabKey = 'home' | 'schedule' | 'notifications' | 'device';
+/** `schedule` has no tab of its own: it opens from Beranda and PillBox and highlights PillBox. */
+export type TabKey = 'home' | 'schedule' | 'notifications' | 'device' | 'settings';
 
-const TABS: { key: TabKey; label: string; icon: IconName; activeIcon: IconName }[] = [
-  { key: 'home', label: 'Beranda', icon: 'home-outline', activeIcon: 'home' },
-  { key: 'schedule', label: 'Jadwal', icon: 'calendar-outline', activeIcon: 'calendar' },
-  { key: 'notifications', label: 'Notifikasi', icon: 'notifications-outline', activeIcon: 'notifications' },
-  { key: 'device', label: 'Perangkat', icon: 'hardware-chip-outline', activeIcon: 'hardware-chip' },
+type BarTab = Exclude<TabKey, 'schedule'>;
+
+const TABS: { key: BarTab; label: string; icon: IconName; activeIcon: IconName }[] = [
+  { key: 'home', label: Strings.tabs.home, icon: 'home-outline', activeIcon: 'home' },
+  { key: 'device', label: Strings.tabs.device, icon: 'cube-outline', activeIcon: 'cube' },
+  { key: 'notifications', label: Strings.tabs.notifications, icon: 'notifications-outline', activeIcon: 'notifications' },
+  { key: 'settings', label: Strings.tabs.settings, icon: 'settings-outline', activeIcon: 'settings' },
 ];
 
 const DOT: Partial<Record<Tone, string>> = {
@@ -38,21 +42,21 @@ export function TabBar({ active, onChange, badges }: { active: TabKey; onChange:
       className="flex-row border-t border-line bg-surface px-2 pt-2"
       style={{ paddingBottom: Math.max(insets.bottom, 8) }}>
       {TABS.map((tab) => {
-        const selected = tab.key === active;
+        const selected = tab.key === active || (tab.key === 'device' && active === 'schedule');
         const count = tab.key === 'notifications' ? badges.notifications : 0;
         const dot =
-          tab.key === 'schedule' && badges.scheduleDirty
+          tab.key === 'device' && badges.scheduleDirty
             ? DOT.late
             : tab.key === 'device' && badges.deviceTone
               ? DOT[badges.deviceTone]
               : undefined;
         const extra =
           count > 0
-            ? `, ${count} belum dibaca`
-            : tab.key === 'schedule' && badges.scheduleDirty
-              ? ', ada perubahan belum disimpan'
+            ? Strings.tabs.unread(count)
+            : tab.key === 'device' && badges.scheduleDirty
+              ? Strings.tabs.scheduleDirty
               : tab.key === 'device' && dot
-                ? ', perlu perhatian'
+                ? Strings.tabs.attention
                 : '';
         return (
           <Pressable

@@ -1,4 +1,6 @@
+import { Strings } from '@/constants/strings';
 import * as api from '@root/lib/api';
+import type { DoseStatus, TodayDose } from '@root/lib/insights';
 import type { NotificationFilter } from '@root/lib/notifications';
 import { jakartaMinutesNow } from '@root/lib/schedule-time';
 import type { AppNotification, DeviceStatus, NotificationType, Slot, SlotId, ToleranceMinutes } from '@root/lib/types';
@@ -169,4 +171,49 @@ export function greeting(nowMs: number): string {
   if (hour < 15) return 'Selamat siang';
   if (hour < 18) return 'Selamat sore';
   return 'Selamat malam';
+}
+
+/** Adherence at or above these percentages is "Sangat Baik" / "Baik"; below is "Perlu Perhatian". */
+export const ADHERENCE_GREAT_PERCENT = 90;
+export const ADHERENCE_GOOD_PERCENT = 75;
+
+export function adherenceBand(percent: number | null): { label: string; tone: Tone } {
+  const bands = Strings.home.adherenceBands;
+  if (percent === null) return { label: bands.none, tone: 'neutral' };
+  if (percent >= ADHERENCE_GREAT_PERCENT) return { label: bands.great, tone: 'ontime' };
+  if (percent >= ADHERENCE_GOOD_PERCENT) return { label: bands.good, tone: 'late' };
+  return { label: bands.low, tone: 'missed' };
+}
+
+const DOSE_TONE: Record<DoseStatus, Tone> = {
+  PENDING: 'primary',
+  TAKEN_ON_TIME: 'ontime',
+  TAKEN_LATE: 'late',
+  MISSED: 'missed',
+};
+
+export function doseLook(dose: Pick<TodayDose, 'status' | 'delayMinutes'>): { label: string; tone: Tone } {
+  const s = Strings.home.status;
+  const label = dose.status === 'TAKEN_LATE' ? s.TAKEN_LATE(dose.delayMinutes) : s[dose.status];
+  return { label, tone: DOSE_TONE[dose.status] };
+}
+
+/** Whole years between a "YYYY-MM-DD" birth date and `nowMs` (WIB); null when unknown. */
+export function ageInYears(birthDate: string | null, nowMs: number): number | null {
+  if (!birthDate) return null;
+  const [y, m, d] = birthDate.split('-').map(Number);
+  const today = new Date(nowMs + 7 * 60 * 60000);
+  const beforeBirthday = today.getUTCMonth() + 1 < m || (today.getUTCMonth() + 1 === m && today.getUTCDate() < d);
+  return today.getUTCFullYear() - y - (beforeBirthday ? 1 : 0);
+}
+
+/** "15:06:26" in WIB. */
+export function formatJakartaClock(ms: number): string {
+  const d = new Date(ms + 7 * 60 * 60000);
+  return [d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
+}
+
+/** First word of a name, for greetings ("Halo, Arya"). */
+export function firstName(name: string | null | undefined): string {
+  return name?.trim().split(/\s+/)[0] || Strings.shell.caregiverFallback;
 }
