@@ -79,6 +79,14 @@ export const AppConfig = {
   phoneNationalMinDigits: 9,
   phoneNationalMaxDigits: 13,
 
+  /** Account password length; keep equal to the auth server's rule in src/server/schemas.ts. */
+  passwordMinLength: 8,
+  passwordMaxLength: 72,
+  /** Startup takes longer than this (ms) = the loading screen explains it is waiting for the server. */
+  slowLoadingHintMs: intFromEnv(process.env.EXPO_PUBLIC_SLOW_LOADING_HINT_MS, 3_000, 0),
+  /** Show developer shortcuts (e.g. "replay onboarding" on the sign-in screen). Dev builds only. */
+  showDebugTools: __DEV__,
+
   /** true = log "[perf]" timing lines (see src/lib/perf.ts). */
   perfTimingLogs: process.env.EXPO_PUBLIC_PERF_TIMING_LOGS === 'true',
 } as const;

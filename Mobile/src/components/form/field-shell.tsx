@@ -15,30 +15,35 @@ export function FieldError({ text }: { text: string }) {
   );
 }
 
-/** Label (with an optional required marker), the control, then a helper line or an error. */
+/** Label (with an optional required marker and right-side extra), the control, then a helper line or an error. */
 export function FieldShell({
   label,
   required = false,
+  labelRight,
   hint,
   error,
   children,
 }: {
   label: string;
   required?: boolean;
+  labelRight?: ReactNode;
   hint?: string | null;
   error?: string | null;
   children: ReactNode;
 }) {
   return (
     <View className="gap-1.5">
-      <Text className="text-body-sm font-semibold text-ink">
-        {label}
-        {required && (
-          <Text className="text-missed-fg" accessibilityLabel={Strings.elderlyForm.requiredA11y}>
-            {` ${Strings.elderlyForm.requiredMarker}`}
-          </Text>
-        )}
-      </Text>
+      <View className="flex-row items-center justify-between gap-2">
+        <Text className="shrink text-body-sm font-semibold text-ink">
+          {label}
+          {required && (
+            <Text className="text-missed-fg" accessibilityLabel={Strings.elderlyForm.requiredA11y}>
+              {` ${Strings.elderlyForm.requiredMarker}`}
+            </Text>
+          )}
+        </Text>
+        {labelRight}
+      </View>
       {children}
       {error ? <FieldError text={error} /> : hint ? <Text className="text-caption text-ink-muted">{hint}</Text> : null}
     </View>

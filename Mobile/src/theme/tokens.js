@@ -44,11 +44,18 @@ const fontSize = {
   heading: [24, 32],
   display: [30, 36],
   time: [36, 44],
+  hero: [40, 48], // onboarding headline on wide (web) screens
 };
+
+/**
+ * Layout breakpoints (min width, px). Tailwind's `md:` ... `2xl:` prefixes use these, and
+ * src/hooks/use-breakpoint.ts reads the same values when a component must not mount at all.
+ */
+const breakpoints = { md: 768, lg: 1024, xl: 1280, '2xl': 1536 };
 
 const shadow = {
   card: '0px 1px 3px rgba(15, 23, 42, 0.08)',
   raised: '0px 6px 16px rgba(15, 23, 42, 0.16)',
 };
 
-module.exports = { colors, spacing, radius, fontSize, shadow };
+module.exports = { colors, spacing, radius, fontSize, shadow, breakpoints };

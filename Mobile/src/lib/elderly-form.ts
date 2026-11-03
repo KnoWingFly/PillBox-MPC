@@ -2,6 +2,7 @@
 // (name length, birth date range, E.164 phone) so most mistakes are caught before the request.
 import { AppConfig } from '@/config';
 import { Strings } from '@/constants/strings';
+import { normalizeIdPhone } from '@/lib/phone';
 import type { ElderlyIn, Gender } from '@root/lib/elderly';
 
 const E = Strings.elderlyForm.errors;
@@ -82,23 +83,6 @@ export function validBirthDate(text: string): Date | null {
   const date = parseDateInput(text);
   if (!date || date > latestBirthDate() || date < earliestBirthDate()) return null;
   return date;
-}
-
-// --- phone ------------------------------------------------------------------------
-
-const PHONE_SEPARATORS = /[\s\-().]/g;
-
-/** "0812-3456-7890", "62812…", "+62812…" -> "+62812…"; null when it is not a valid Indonesian number. */
-export function normalizeIdPhone(input: string): string | null {
-  const code = AppConfig.phoneCountryCode;
-  let digits = input.replace(PHONE_SEPARATORS, '');
-  if (digits.startsWith(`+${code}`)) digits = digits.slice(code.length + 1);
-  else if (digits.startsWith(code)) digits = digits.slice(code.length);
-  else if (digits.startsWith('0')) digits = digits.slice(1);
-  else return null;
-  const { phoneNationalMinDigits: min, phoneNationalMaxDigits: max } = AppConfig;
-  if (!/^[1-9]\d*$/.test(digits) || digits.length < min || digits.length > max) return null;
-  return `+${code}${digits}`;
 }
 
 // --- whole form -------------------------------------------------------------------
