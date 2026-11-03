@@ -37,7 +37,7 @@ Content-Type: application/json
 }
 ```
 
-Lost the secret? Issue a new one with `POST /api/v1/admin/devices/{device_code}/rotate-secret` (same header, body `{}`).
+Lost the secret? Issue a new one with `POST /api/v1/admin/devices/{device_code}/rotate-secret` (same header, body `{}`). The old secret stops working at once: REST answers `401 DEVICE_KEY_INVALID`, and a WebSocket opened with it is closed with code **4401**.
 
 **Every device request** sends:
 
@@ -73,7 +73,8 @@ Send one every **`heartbeat_interval_seconds`** (default **15 s**, returned in e
 - Required: `battery_percent`. Everything else is optional, but please send it.
 - `stock_count` is the physical sachet count and is **authoritative**: it overwrites the backend's stock for that slot.
 - `rtc_time` feeds the clock-drift view in the app. Read it when the heartbeat is sent, not when a sync starts.
-- `rtc_speed` (default 1.0): device seconds per real second. The emulator's lab clock runs 1x/10x/60x and can be moved; the backend extrapolates the device clock as `rtc_time + (now - received_at) * rtc_speed`. With `FOLLOW_DEVICE_CLOCK=true` (default) the rules engine and the app judge doses by that clock, so a moved lab clock stays consistent end to end. A real device sends 1.0 and keeps its RTC on real time, so nothing changes for it. Send a heartbeat right after the clock is changed.
+- `config_version_applied` above `latest_config_version` was never issued (e.g. a local database from another server): the backend ignores it and answers `config_update_available: true`, so the device pulls the config and acks a real version.
+- `rtc_speed` (default 1.0): device seconds per real second. The emulator's lab clock runs 1x/10x/60x and can be moved; the backend extrapolates the device clock as `rtc_time + (now - received_at) * rtc_speed`. With `FOLLOW_DEVICE_CLOCK=true` (default) the rules engine and the app judge doses by that clock, so a moved lab clock stays consistent end to end. A real device sends 1.0 and keeps its RTC on real time, so nothing changes for it. Send a heartbeat right after the clock is changed. The device clock is followed only while it is within `DEVICE_CLOCK_MAX_SKEW_MINUTES` (default 7 days) of server time; beyond that (e.g. an RTC reset to 2000) the backend uses server time.
 
 Response `200`:
 ```json
@@ -89,7 +90,7 @@ If `config_update_available` is true, pull the config (2.2).
 
 ### 2.2 Config pull: `GET /devices/{device_code}/config?since_version={applied}`
 
-- `304 Not Modified` (no body) when `since_version >= latest`.
+- `304 Not Modified` (no body) when `since_version == latest`. A `since_version` above the latest was never issued, so it gets the full config (`200`).
 - `200`:
 ```json
 {
@@ -176,8 +177,9 @@ Response `200`:
 ```
 - `results` follows the request order. `status` is `accepted`, `duplicate` or `rejected`.
 - **All three are final.** Remove those events from the local buffer. Only a network error or a 5xx means "keep and retry".
-- `rejected` covers an unknown `event_type`, a missing `slot_number`, or `occurred_at` too far in the future (default > 7 days, to allow fast-forwarded RTCs).
-- Batch errors: `413 BATCH_TOO_LARGE` (more than 500 events: send in chunks), `422 VALIDATION_ERROR` (malformed JSON or fields), `401 DEVICE_KEY_INVALID`.
+- `rejected` covers an unknown `event_type`, a missing `slot_number`, a field with an invalid value (e.g. a negative `chime_count`; the reason names the field, never the value), `occurred_at` too far in the future (default > 7 days, to allow fast-forwarded RTCs), or a dose/door event whose `occurred_at` is too far in the past (default > 7 days, `TELEMETRY_MAX_PAST_SKEW_MINUTES`). An item that is not an object is rejected with `event_id: ""`.
+- Batch errors: `413 BATCH_TOO_LARGE` (more than 500 events: send in chunks), `422 VALIDATION_ERROR` (malformed JSON, or the envelope itself is wrong, e.g. `events` is not a list), `401 DEVICE_KEY_INVALID`.
+- What the device does with a batch answer: `2xx` → remove the events. `401`, `408`, `429`, `5xx` or a network error → keep them and retry later (`401`: re-register). `413` → resend in smaller chunks. Any other `4xx` → final: remove the batch (retrying it would block every later event).
 - If `latest_config_version` is above your applied version, pull the config now.
 
 ---
@@ -188,7 +190,7 @@ Connect to `ws://<host>:8000/ws/device/{device_code}` with header `X-Device-Key:
 ```json
 {"type": "auth", "device_key": "<secret>"}
 ```
-Auth failure closes the socket with code **4401**. A newer connection for the same device replaces the old one, which is closed with code **4000**.
+Auth failure, and rotating the device secret while connected, close the socket with code **4401**. A newer connection for the same device replaces the old one, which is closed with code **4000**.
 
 **Server → device on connect:**
 ```json
@@ -219,6 +221,7 @@ Reply:
 | `command` | Payload | Device should | Ack `result` (suggested) |
 |---|---|---|---|
 | `trigger_alarm` | `slot_number` (nullable), `duration_seconds`, `reason` | Ring the chime and LED. Also log `ALARM_STARTED` with `command_id` | `{"ringing": true}` |
+| `stop_alarm` | `reason` | Stop an alarm started by `trigger_alarm` before its `duration_seconds` ends ("Hentikan Alarm" in the app, `DELETE /api/v1/devices/{id}/alarm`). A popped-up dose keeps ringing: this never silences a dose reminder. Log `ALARM_STOPPED` if an alarm was ringing. Ack `ok: true` also when nothing was ringing | `{"ringing": false}` |
 | `time_sync` | `server_time`, `timezone` | Set the RTC | `{"device_time_before": "…", "device_time_after": "…"}` |
 | `schedule_updated` | `config_version` | Run `GET /config` then `POST /config-ack` | `{"config_version_applied": 5}` |
 | `refill_mode` | `enabled` | Lock or unlock the lids | `{"is_refill_mode": true}` |
@@ -255,12 +258,12 @@ The app's request waits up to `COMMAND_ACK_TIMEOUT_SECONDS` (default 10 s) for t
 1. Write **every** event to local storage first, with its `event_id` and the **device's own `occurred_at`**. Do not wait for the network.
 2. While offline, keep ringing alarms and evaluating schedules locally (offline-first). Do not drop events.
 3. When Wi-Fi returns: **(a)** send a heartbeat (or open the WS), then **(b)** immediately flush the buffer oldest-first (`is_offline_flush: true`, ≤ 500 events per batch, `NETWORK_RECOVERED` first), then **(c)** pull the config if needed.
-4. Remove an event from the buffer only after it appears in `results` (accepted, duplicate or rejected). On a timeout or 5xx, retry the same events with the same `event_id`s.
+4. Remove an event from the buffer only after it appears in `results` (accepted, duplicate or rejected), or its batch got a final `4xx` (§2.4). On a timeout, 5xx, 401, 408 or 429, retry the same events with the same `event_id`s.
 5. The backend processes each batch in `occurred_at` order, so arrival order does not matter.
 
 **How the backend decides "missed" while you were offline.** A dose is due at `window_start`. It is on time until `window_end` plus the on-time grace (`ON_TIME_GRACE_MINUTES`, default 10, always at least 1 minute below the slot's tolerance), and late until `window_end + tolerance_minutes` (the deadline). A dose taken within the grace is stored with `delay_minutes = 0`; a later one stores its real delay after `window_end`. The exact lid-open time is always kept in `actual_open_time`. After the deadline the backend marks it `MISSED` **only if** one of these holds:
 - the device is online and has been online for `OFFLINE_FLUSH_WAIT_SECONDS` (60 s), which gives your flush time to arrive, or
-- the deadline passed more than `OFFLINE_MAX_WAIT_MINUTES` ago (6 h). The device is presumed gone, and caregivers must be told.
+- the deadline passed more than `OFFLINE_MAX_WAIT_MINUTES` ago (6 h, always judged on **server** time, so a lagging device clock cannot postpone it). The device is presumed gone, and caregivers must be told.
 
 If a flushed `COMPARTMENT_OPENED`/`CLOSED` later proves the dose was taken before its deadline, the backend changes the dose to `TAKEN` and closes the missed-dose alerts. Flushing promptly keeps caregivers from seeing false alarms.
 
@@ -280,10 +283,10 @@ These are the differences observed in `SmartDevice/` (not modified by the backen
 | 6 | `update_schedules()` uses only `window_start` (ignores `window_end`) | Window `[start, end]` | See row 5. |
 | 7 | Telemetry sends `schedule_id: null` | Optional | Works: matched by slot and time. |
 | 8 | ~~Sends all unsynced events in one batch~~ **Fixed:** sends in chunks of 200 | ≤ 500 per batch | None. |
-| 9 | Marks the whole batch synced on any 2xx | Per-event `results` | Fine: rejected events are final anyway. |
+| 9 | Marks the whole batch synced on any 2xx, and on a final 4xx (§2.4); keeps it on 401/408/429/5xx; halves the chunk on 413 | Per-event `results` | Fine: rejected events are final anyway. |
 | 10 | Local `config_version` is reset to `0` when the device registers | — | Works: the first config after pairing is always pulled, and the GUI now applies pulled schedules live (no restart needed). |
 | 11 | No `NETWORK_RECOVERED` or `BATTERY_STATUS` events; battery only in the heartbeat | Optional | None. |
 | 12 | Heartbeat and flush skipped while "Wi-Fi: Offline"; heartbeat then flush on return | Same (§5) | Compatible. Offline is detected at once: the toggle closes the WebSocket and the backend marks the device offline on disconnect. A REST-only client goes offline after `DEVICE_HEARTBEAT_TIMEOUT_SECONDS` (default 45 s). |
-| 13 | `trigger_alarm` logs `ALARM_STARTED` without `command_id`, logs nothing when `slot_number` is null (all slots), and never sends `ALARM_STOPPED` | Log `ALARM_STARTED` with `command_id` | Alarm history in the app lacks the command link and all-slot alarms. |
+| 13 | `trigger_alarm` logs `ALARM_STARTED` without `command_id`, and logs nothing when `slot_number` is null (all slots). `stop_alarm` logs `ALARM_STOPPED` the same way (slot alarms only); an alarm that simply runs out logs nothing | Log `ALARM_STARTED` / `ALARM_STOPPED` with `command_id` | Alarm history in the app lacks the command link and all-slot alarms. |
 | 14 | `schedule_updated` is acked at once, before the config pull, with no `result` | Pull config, `config-ack`, then ack with `{"config_version_applied": n}` | Works: the pull and `config-ack` follow right after; the ack only confirms receipt. |
 | 15 | The heartbeat pulls the config itself when `config_update_available`, before the buffer flush | §5 step 3: heartbeat, flush, then config | Works: events carry their own `occurred_at`, so order does not change their outcome. |

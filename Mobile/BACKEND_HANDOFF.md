@@ -32,12 +32,12 @@ checks do (`services/pin_attempts.py`). A device code is 8 hex characters (2^32 
 Return the name only when the caller already has a role on that elderly profile. The app shows
 the name when present and works without it.
 
-## 3. Delete the caller's notifications for one pillbox
+## 3. Delete the caller's notifications for one pillbox — DONE (3 Nov 2026)
 
-Today the app pages through `GET /notifications?elderly_id=` and calls
-`DELETE /notifications/{id}` once per row (`Mobile/lib/devices.ts` `deleteMyNotificationsWhere`).
-Used by "Hapus pillbox" and by "Hapus semua" in the Notifikasi tab, which must not clear other
-pillboxes. Requested:
+Implemented as specified below (`Backend/app/api/routes/notifications.py` `delete_all`) and used by
+the app (`lib/api.ts` `deleteBackendNotificationsForDevice`, for "Hapus pillbox" and "Hapus semua").
+The app used to page through `GET /notifications?elderly_id=` and call `DELETE /notifications/{id}`
+once per row. Still to do: add the `device_id` parameter to the API list. Contract:
 
 ```
 DELETE /api/v1/notifications?device_id={uuid}[&up_to_created_at={ISO8601}&up_to_id={uuid}]
