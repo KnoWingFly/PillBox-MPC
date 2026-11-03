@@ -327,6 +327,11 @@ export function activePillboxElderlyId(): string | null {
   return activeElderlyId;
 }
 
+/** The active pillbox's id (null until one is chosen). */
+export function activePillboxDeviceId(): string | null {
+  return activeDeviceId;
+}
+
 /** Forgets everything tied to the signed-in account. Call on login and logout. */
 export function resetPillboxSession(): void {
   activeDeviceId = null;
@@ -405,18 +410,21 @@ async function backendSchedules(): Promise<ScheduleState> {
   const stockBySlot = new Map(stock.map((s) => [s.slot_number, s.remaining_units]));
   const rows = new Map<SlotId, BackendSlotSchedule>();
   const slots = schedules.map((s): Slot => {
-    const slotId = slotIdOf(s.slot_number);
-    rows.set(slotId, s);
-    return {
-      id: slotId,
-      timeMinutes: s.is_empty ? null : parseHHmm(s.window_start),
-      enabled: !s.is_empty && s.active,
-      toleranceMinutes: toTolerance(s.tolerance_minutes),
-      stock: stockBySlot.get(s.slot_number) ?? 0,
-      capacity: AppConfig.slotCapacity,
-    };
+    rows.set(slotIdOf(s.slot_number), s);
+    return toSlot(s, stockBySlot.get(s.slot_number) ?? 0);
   });
   return { slots, rows };
+}
+
+function toSlot(s: BackendSlotSchedule, stock: number): Slot {
+  return {
+    id: slotIdOf(s.slot_number),
+    timeMinutes: s.is_empty ? null : parseHHmm(s.window_start),
+    enabled: !s.is_empty && s.active,
+    toleranceMinutes: toTolerance(s.tolerance_minutes),
+    stock,
+    capacity: AppConfig.slotCapacity,
+  };
 }
 
 /** Sachets per slot as last reported by the pillbox (heartbeat), without the schedules. */
@@ -440,7 +448,12 @@ function isUnchanged(row: BackendSlotSchedule | undefined, fields: { window_star
 
 async function backendSaveSchedule(slots: Slot[]): Promise<Slot[]> {
   const id = await deviceId();
-  const { slots: current, rows } = await backendSchedules();
+  // The server's rows decide what changed (another caregiver may have edited meanwhile, so a cached
+  // copy is not safe). Stock is not read: the slots being saved already carry it.
+  const schedules = await backend<BackendSlotSchedule[]>(`/devices/${id}/schedules`);
+  const rows = new Map(schedules.map((s) => [slotIdOf(s.slot_number), s]));
+  const stockOf = new Map(slots.map((s) => [s.id, s.stock]));
+  const withStock = (s: BackendSlotSchedule): Slot => toSlot(s, stockOf.get(slotIdOf(s.slot_number)) ?? 0);
   // Only slots that change are sent, all in one request: the backend saves them in one transaction
   // (one device lock, one config version, one push to the pillbox) and checks WINDOW_OVERLAP on the
   // final state, so the order does not matter. One write per slot was slow on a remote database.
@@ -459,20 +472,9 @@ async function backendSaveSchedule(slots: Slot[]): Promise<Slot[]> {
     if (isUnchanged(row, fields)) continue;
     changes.push({ slot_number: slotNumber, ...fields, ...(row && !row.is_empty ? {} : { days_of_week: [1, 2, 3, 4, 5, 6, 7] }) });
   }
-  if (changes.length === 0) return current;
+  if (changes.length === 0) return schedules.map(withStock);
   const saved = await backend<BackendSlotSchedule[]>(`/devices/${id}/schedules`, 'PUT', { slots: changes });
-  const stock = new Map(current.map((s) => [s.id, s.stock]));
-  return saved.map((s): Slot => {
-    const slotId = slotIdOf(s.slot_number);
-    return {
-      id: slotId,
-      timeMinutes: s.is_empty ? null : parseHHmm(s.window_start),
-      enabled: !s.is_empty && s.active,
-      toleranceMinutes: toTolerance(s.tolerance_minutes),
-      stock: stock.get(slotId) ?? 0,
-      capacity: AppConfig.slotCapacity,
-    };
-  });
+  return saved.map(withStock);
 }
 
 async function backendAlarm(slotId: SlotId | null, durationSeconds: number): Promise<void> {
@@ -875,6 +877,24 @@ export async function markBackendNotificationRead(id: string): Promise<void> {
 }
 
 /** Deletes the caller's copy of one notification; already gone (404) counts as done. */
+/**
+ * Deletes the caller's notifications of one pillbox in ONE request (never other caregivers'
+ * copies), optionally only those at or older than `upTo`. Returns how many were deleted.
+ * Backend: DELETE /notifications?device_id=[&up_to_created_at=&up_to_id=] (handoff item 3).
+ */
+export async function deleteBackendNotificationsForDevice(
+  deviceId: string,
+  upTo?: { createdAt: number; id: string },
+): Promise<number> {
+  const query = new URLSearchParams({ device_id: deviceId });
+  if (upTo) {
+    query.set('up_to_created_at', new Date(upTo.createdAt).toISOString());
+    query.set('up_to_id', upTo.id);
+  }
+  const res = await backend<{ deleted: number }>(`/notifications?${query.toString()}`, 'DELETE');
+  return res.deleted;
+}
+
 export async function deleteBackendNotification(id: string): Promise<void> {
   try {
     await backend<void>(`/notifications/${id}`, 'DELETE');
@@ -1003,17 +1023,29 @@ export async function confirmDoseTaken(notificationId: string): Promise<void> {
 
 export async function triggerAlarm(slotId: SlotId | null): Promise<{ slotId: SlotId | null }> {
   if (!USE_MOCK) {
-    await backendAlarm(slotId, 60);
+    await backendAlarm(slotId, AppConfig.alarmDurationSeconds);
     return { slotId };
   }
   await delay();
   return { slotId };
 }
 
+/**
+ * Stops the alarm a caregiver started ("Bunyikan Alarm" / "Tes Pengingat"); a dose reminder keeps
+ * ringing. Backend: DELETE /devices/{id}/alarm (answers after the pillbox acks).
+ */
+export async function stopAlarm(): Promise<void> {
+  if (!USE_MOCK) {
+    await backend(`/devices/${await deviceId()}/alarm`, 'DELETE');
+    return;
+  }
+  await delay();
+}
+
 /** Fires a test reminder (LED + buzzer) on a single compartment. */
 export async function triggerTestSlot(slotId: SlotId): Promise<{ slotId: SlotId }> {
   if (!USE_MOCK) {
-    await backendAlarm(slotId, 10);
+    await backendAlarm(slotId, AppConfig.testAlarmDurationSeconds);
     return { slotId };
   }
   await delay();

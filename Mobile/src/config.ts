@@ -51,6 +51,13 @@ export const AppConfig = {
   /** Refresh the access token this long before its `exp` (ms), so a request never starts with a dead token. */
   tokenRefreshSkewMs: 30_000,
 
+  /**
+   * How long the pillbox rings for "Bunyikan Alarm" and "Tes Pengingat" (seconds; the backend
+   * accepts 5-600). While it rings the app offers "Hentikan Alarm".
+   */
+  alarmDurationSeconds: 60,
+  testAlarmDurationSeconds: 10,
+
   /** Sachets per compartment; keep equal to the backend's STOCK_CAPACITY_PER_SLOT. */
   slotCapacity: intFromEnv(process.env.EXPO_PUBLIC_SLOT_CAPACITY, 30, 1),
   /** Placeholder phone number for the "call" action until elderly profiles carry one. */

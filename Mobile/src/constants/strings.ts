@@ -122,6 +122,11 @@ export const Strings = {
     backToDashboard: 'Kembali ke beranda',
   },
   // Messages for API error codes; unknown codes fall back to common.unexpectedError.
+  alarm: {
+    stop: 'Hentikan Alarm',
+    stopped: 'Alarm di pillbox dihentikan',
+    stopFailed: 'Gagal menghentikan alarm',
+  },
   apiErrors: {
     INVALID_CREDENTIALS: 'Email atau kata sandi salah.',
     EMAIL_ALREADY_REGISTERED: 'Email sudah terdaftar.',

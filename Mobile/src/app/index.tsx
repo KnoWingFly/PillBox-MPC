@@ -24,10 +24,13 @@ import { makeToast, Toast, type ToastData } from '@/components/pillbox/toast';
 import { LoadErrorBox } from '@/components/pillbox/ui';
 import * as tokens from '@/theme/tokens';
 import { useAuth } from '@/hooks/use-auth';
+import { Strings } from '@/constants/strings';
 import { useNotificationFeed } from '@/hooks/use-notification-feed';
+import { usePillboxAlarm } from '@/hooks/use-pillbox-alarm';
 import { perfLog, perfLoginStep } from '@/lib/perf';
 import { DevicesProvider, useDevices } from '@root/context/devices-context';
 import * as api from '@root/lib/api';
+import { compareFeed } from '@root/lib/feed';
 import type { ConnectPillboxResult, Pillbox } from '@root/lib/devices';
 import { fetchNotificationPage, NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
 import { findAllConflicts } from '@root/lib/schedule-time';
@@ -122,6 +125,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const [selectedSlotId, setSelectedSlotId] = useState<SlotId | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const pillboxAlarm = usePillboxAlarm();
 
   const [alarmBusyId, setAlarmBusyId] = useState<string | null>(null);
   const [doseActionBusy, setDoseActionBusy] = useState<DoseActionBusy>(null);
@@ -159,10 +163,13 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       perfLog('iot_to_app', 'shown_on_screen', { notification_id: n.id });
       setToast(makeToast(n.slotId ? `${n.title} · ${n.slotId}` : n.title, notificationLook(n).toast));
       setNow(Date.now());
-      refreshRecent();
+      // The pushed row is all the recent list needs: no 100-row refetch per arrival.
+      if (api.inActiveScope(n)) {
+        setRecent((prev) => [n, ...prev.filter((r) => r.id !== n.id)].sort(compareFeed).slice(0, RECENT_COUNT));
+      }
       if (n.type !== 'system') refreshAdherence();
     },
-    [refreshAdherence, refreshRecent],
+    [refreshAdherence],
   );
   const feed = useNotificationFeed({ onArrive: handleArrive });
 
@@ -520,6 +527,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     setAlarmBusyId(n.id);
     try {
       await api.triggerAlarm(n.slotId);
+      pillboxAlarm.started(AppConfig.alarmDurationSeconds);
       showToast(`Alarm dibunyikan di ${device?.deviceName ?? 'Pillbox'}`, 'success');
     } catch (err) {
       // e.g. "Device is offline; the command was not sent" from the backend
@@ -603,10 +611,21 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     });
   };
 
+  const handleStopAlarm = async () => {
+    try {
+      await pillboxAlarm.stop();
+      showToast(Strings.alarm.stopped, 'success');
+    } catch (err) {
+      showToast(failMessage(Strings.alarm.stopFailed, err), 'error');
+    }
+  };
+  const alarmControl = { ringing: pillboxAlarm.ringing, stopping: pillboxAlarm.stopping, onStop: handleStopAlarm };
+
   const handleTestSlot = async (id: SlotId) => {
     setTesting(true);
     try {
       await api.triggerTestSlot(id);
+      pillboxAlarm.started(AppConfig.testAlarmDurationSeconds);
       showToast(`Tes pengingat dikirim ke slot ${id}`, 'success');
     } catch (err) {
       showToast(failMessage('Gagal mengirim tes pengingat', err), 'error');
@@ -626,8 +645,8 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       const saved = await api.saveSchedule(draftSlots);
       setSavedSlots(saved);
       setDraftSlots(saved);
+      // No status re-read: a schedule save does not change it, and /ws/app pushes status changes.
       if (device?.online) {
-        setDevice(await api.getDeviceStatus());
         showToast('Jadwal berhasil disimpan ke Pillbox', 'success');
       } else {
         showToast('Jadwal disimpan, akan dikirim saat Pillbox terhubung kembali', 'warning');
@@ -681,6 +700,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   onRetry={handleRetryDashboard}
                   now={pillboxNowMs}
                   testing={testing}
+                  alarm={alarmControl}
                   onTest={handleTestSlot}
                   saving={saving}
                   onSave={handleSave}
@@ -693,6 +713,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   canDelete={NOTIFICATION_DELETE_SUPPORTED}
                   now={now}
                   alarmBusyId={alarmBusyId}
+                  alarm={alarmControl}
                   actionBusy={doseActionBusy}
                   onAction={handleDoseAction}
                   refreshing={refreshing}

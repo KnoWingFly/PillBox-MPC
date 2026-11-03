@@ -8,6 +8,7 @@ import { formatJakartaTimestamp } from '@root/lib/schedule-time';
 import type { AppNotification, NotificationAction } from '@root/lib/types';
 
 import { EMPTY_TEXT, formatRelative, notificationLook } from './helpers';
+import { AlarmButton, type AlarmControl } from './alarm-button';
 import { SwipeToDelete } from './swipe-to-delete';
 import { Button, Chip, EmptyState, Icon, IconBadge, LoadErrorBox, ScreenHeader } from './ui';
 
@@ -18,6 +19,7 @@ function NotificationItem({
   notification,
   now,
   alarmBusy,
+  alarm,
   actionBusy,
   onPress,
   onCall,
@@ -28,6 +30,7 @@ function NotificationItem({
   notification: AppNotification;
   now: number;
   alarmBusy: boolean;
+  alarm: AlarmControl;
   actionBusy: NotificationAction | null;
   onPress: () => void;
   onCall: () => void;
@@ -101,7 +104,15 @@ function NotificationItem({
             <Button label="Hubungi" icon="call-outline" variant="secondary" size="sm" onPress={onCall} accessibilityLabel="Hubungi lansia" />
           </View>
           <View className="flex-1">
-            <Button label="Bunyikan Alarm" icon="alarm-outline" variant="danger" size="sm" loading={alarmBusy} onPress={onAlarm} />
+            <AlarmButton
+              label="Bunyikan Alarm"
+              icon="alarm-outline"
+              variant="danger"
+              size="sm"
+              starting={alarmBusy}
+              onStart={onAlarm}
+              alarm={alarm}
+            />
           </View>
         </View>
       )}
@@ -238,6 +249,7 @@ export function NotificationsTab({
   canDelete,
   now,
   alarmBusyId,
+  alarm,
   actionBusy,
   refreshing,
   onRefresh,
@@ -265,6 +277,7 @@ export function NotificationsTab({
   canDelete: boolean;
   now: number;
   alarmBusyId: string | null;
+  alarm: AlarmControl;
   actionBusy: DoseActionBusy;
   refreshing: boolean;
   onRefresh: () => void;
@@ -307,6 +320,7 @@ export function NotificationsTab({
         notification={n}
         now={now}
         alarmBusy={alarmBusyId === n.id}
+        alarm={alarm}
         actionBusy={actionBusy?.id === n.id ? actionBusy.action : null}
         onPress={() => onMarkRead(n.id)}
         onCall={() => onCall(n)}

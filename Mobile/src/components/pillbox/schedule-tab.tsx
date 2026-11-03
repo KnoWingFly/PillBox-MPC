@@ -22,6 +22,7 @@ import {
   slotTitle,
   TOLERANCE_OPTIONS,
 } from './helpers';
+import { AlarmButton, type AlarmControl } from './alarm-button';
 import { TimeField } from './time-field';
 import { Button, Card, Chip, Divider, Icon, InfoRow, LoadErrorBox, ScreenHeader, StatusPill } from './ui';
 
@@ -86,6 +87,7 @@ function SlotEditor({
   conflictWith,
   now,
   testing,
+  alarm,
   onChange,
   onTest,
 }: {
@@ -96,6 +98,7 @@ function SlotEditor({
   conflictWith: SlotConflict | null;
   now: number;
   testing: boolean;
+  alarm: AlarmControl;
   onChange: (patch: Partial<Slot>) => void;
   onTest: () => void;
 }) {
@@ -172,7 +175,14 @@ function SlotEditor({
 
       <Divider />
       <InfoRow icon="file-tray-stacked-outline" label="Stok" value={`${slot.stock} dari ${slot.capacity} dosis`} />
-      <Button label="Tes Pengingat di Pillbox" icon="volume-high-outline" variant="secondary" loading={testing} onPress={onTest} />
+      <AlarmButton
+        label="Tes Pengingat di Pillbox"
+        icon="volume-high-outline"
+        variant="secondary"
+        starting={testing}
+        onStart={onTest}
+        alarm={alarm}
+      />
     </Card>
   );
 }
@@ -187,6 +197,7 @@ export function ScheduleTab({
   onRetry,
   now,
   testing,
+  alarm,
   onTest,
   saving,
   onSave,
@@ -201,6 +212,7 @@ export function ScheduleTab({
   onRetry: () => void;
   now: number;
   testing: boolean;
+  alarm: AlarmControl;
   onTest: (id: SlotId) => void;
   saving: boolean;
   onSave: () => void;
@@ -268,6 +280,7 @@ export function ScheduleTab({
             conflictWith={conflicts.get(selected.id) ?? null}
             now={now}
             testing={testing}
+            alarm={alarm}
             onChange={(patch) => onChangeSlot(selected.id, patch)}
             onTest={() => onTest(selected.id)}
           />
