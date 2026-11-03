@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
-from PySide6.QtNetwork import QNetworkRequest
+from PySide6.QtNetwork import QAbstractSocket, QNetworkRequest
 from PySide6.QtWebSockets import QWebSocket
 
 from smart_pillbox import config
@@ -29,6 +30,7 @@ class DeviceSocket(QObject):
     command_received = Signal(str, str, dict)  # command_id, command, payload
     connected_changed = Signal(bool)
     welcome_received = Signal(dict)  # carries server_time + timezone (clock sync)
+    auth_rejected = Signal()  # closed with 4401: the device key is not (or no longer) valid
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -73,12 +75,15 @@ class DeviceSocket(QObject):
     def _open(self) -> None:
         if not self._wanted or self._identity is None:
             return
+        if self._ws.state() != QAbstractSocket.SocketState.UnconnectedState:
+            return  # already connecting or connected (a stale retry must not replace it)
         code, key = self._identity
         request = QNetworkRequest(QUrl(config.device_ws_url(code)))
         request.setRawHeader(b"X-Device-Key", key.encode("utf-8"))
         self._ws.open(request)
 
     def _on_connected(self) -> None:
+        self._retry.stop()
         self._delay_ms = config.WS_RECONNECT_MIN_MS
         self.is_connected = True
         logger.info("Command channel connected.")
@@ -90,9 +95,22 @@ class DeviceSocket(QObject):
             self.is_connected = False
             logger.info("Command channel disconnected.")
             self.connected_changed.emit(False)
-        if self._wanted and not self._retry.isActive():
-            self._retry.start(self._delay_ms)
-            self._delay_ms = min(self._delay_ms * 2, config.WS_RECONNECT_MAX_MS)
+        if not self._wanted or self._retry.isActive():
+            return
+        code = self._ws.closeCode().value
+        if code == config.WS_CLOSE_AUTH_FAILED:
+            # Retrying every second cannot fix a rejected key: wait the longest delay, and tell
+            # the window so it can ask for the device to be registered again.
+            logger.warning("Command channel refused the device key (4401).")
+            self.auth_rejected.emit()
+            self._delay_ms = config.WS_RECONNECT_MAX_MS
+        elif code == config.WS_CLOSE_REPLACED:
+            # Another process uses this identity: reconnecting at once would kick it off again.
+            logger.warning("Command channel taken over by another connection with this identity (4000).")
+            self._delay_ms = config.WS_RECONNECT_MAX_MS
+        jitter = 1 + random.uniform(-config.WS_RECONNECT_JITTER, config.WS_RECONNECT_JITTER)
+        self._retry.start(int(self._delay_ms * jitter))
+        self._delay_ms = min(self._delay_ms * 2, config.WS_RECONNECT_MAX_MS)
 
     def _on_message(self, raw: str) -> None:
         try:

@@ -245,9 +245,12 @@ class Database:
         ).fetchall()
 
     @_locked
-    def get_unsynced_events(self) -> list[sqlite3.Row]:
+    def get_unsynced_events(self, limit: int | None = None) -> list[sqlite3.Row]:
+        """Unsynced events, oldest first; `limit` reads one outbox chunk without loading the rest."""
+        if limit is None:
+            return self._conn.execute("SELECT * FROM events WHERE synced = 0 ORDER BY occurred_at").fetchall()
         return self._conn.execute(
-            "SELECT * FROM events WHERE synced = 0 ORDER BY occurred_at"
+            "SELECT * FROM events WHERE synced = 0 ORDER BY occurred_at LIMIT ?", (limit,)
         ).fetchall()
 
     @_locked

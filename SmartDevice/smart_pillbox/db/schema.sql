@@ -51,5 +51,7 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Outbox reads: unsynced rows oldest first (WHERE synced = 0 ORDER BY occurred_at LIMIT n).
 CREATE INDEX IF NOT EXISTS idx_events_unsynced ON events (synced);
+CREATE INDEX IF NOT EXISTS idx_events_outbox ON events (synced, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_events_compartment ON events (compartment_id, occurred_at);

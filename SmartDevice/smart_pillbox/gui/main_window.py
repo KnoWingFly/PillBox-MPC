@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -64,11 +65,16 @@ class SyncWorker(QRunnable):
         try:
             if self.after_reconnect:
                 self._heartbeat()
-                synced_count = sync.flush_pending_events(self.db, offline_flush=True)
+                synced_count = sync.flush_pending_events(
+                    self.db, offline_flush=True, device_time=self.clock.now().isoformat()
+                )
             else:
-                # Events first: they are what the caregiver is waiting for.
-                synced_count = sync.flush_pending_events(self.db)
-                self._heartbeat()
+                # Events first: they are what the caregiver is waiting for. A failure there (a bad
+                # config, a disk error) must not also cost the heartbeat, or the device looks OFFLINE.
+                try:
+                    synced_count = sync.flush_pending_events(self.db, device_time=self.clock.now().isoformat())
+                finally:
+                    self._heartbeat()
             try:
                 if synced_count > 0:
                     self.signals.finished.emit(synced_count, f"Synced {synced_count} event(s) to backend.")
@@ -169,6 +175,11 @@ class MainWindow(QMainWindow):
         self._socket = DeviceSocket(self)
         self._socket.command_received.connect(self._on_device_command)
         self._socket.welcome_received.connect(self._on_welcome)
+        self._socket.auth_rejected.connect(
+            lambda: self.statusBar().showMessage("Kunci perangkat ditolak server: daftarkan ulang perangkat.", 8000)
+        )
+        self._apply_heartbeat_interval(self.db.get_device_state("heartbeat_interval_seconds"))
+        self._acked_commands: OrderedDict[str, tuple[bool, dict | None, str | None]] = OrderedDict()
         # Backend reachable again: send anything buffered now, not on the next tick.
         self._socket.connected_changed.connect(lambda ok: ok and self._request_sync())
         self._refresh_socket()
@@ -420,11 +431,15 @@ class MainWindow(QMainWindow):
             self._sync_again = False
             self._request_sync()
         self.statusBar().showMessage(message, 3000)
+        self._apply_heartbeat_interval(self.db.get_device_state("heartbeat_interval_seconds"))
         # A new config from the app was pulled during this sync: apply it live.
         version = self.db.get_device_state("config_version")
         if version != self._config_version_seen:
             self._config_version_seen = version
             self.scheduler.reload_schedules()
+            # Refill mode set in the app while the command channel was down arrives with the config.
+            if (self.db.get_device_state("is_refill_mode") == "1") != self.scheduler.is_refill_mode:
+                self._toggle_refill_mode()
             for compartment in self.scheduler.compartments.values():
                 self._refresh_widget(compartment)
             self._refresh_lcd()
@@ -789,17 +804,18 @@ class MainWindow(QMainWindow):
         else:
             self._socket.stop()
 
-    @staticmethod
-    def _server_local_time(server_time: object, timezone: object) -> datetime:
+    def _server_local_time(self, server_time: object, timezone: object) -> datetime:
         """Server UTC instant -> naive local time, as the simulated RTC keeps it.
         Raises ValueError / ZoneInfoNotFoundError on a bad payload."""
         instant = datetime.fromisoformat(str(server_time))
-        return instant.astimezone(ZoneInfo(str(timezone or "Asia/Jakarta"))).replace(tzinfo=None)
+        zone = timezone or self.db.get_device_state("timezone") or config.DEFAULT_DEVICE_TIMEZONE
+        return instant.astimezone(ZoneInfo(str(zone))).replace(tzinfo=None)
 
     def _on_welcome(self, message: dict) -> None:
         """Command channel connected: correct the RTC from the server clock (a real
         device would use NTP). Skipped while the lab clock was moved on purpose: the
         backend and the app follow the device clock instead (heartbeat rtc_time)."""
+        self._apply_heartbeat_interval(message.get("heartbeat_interval_seconds"))
         if self.clock.speed != 1.0 or self._manual_clock:
             return
         try:
@@ -814,9 +830,31 @@ class MainWindow(QMainWindow):
         logger.info("RTC corrected from server time (was %+.0f s off).", drift)
         self.statusBar().showMessage(f"Jam perangkat disinkronkan dengan server (selisih {drift:+.0f} detik).", 5000)
 
+    def _apply_heartbeat_interval(self, value: object) -> None:
+        """Heartbeats follow the backend's heartbeat_interval_seconds (contract §2.1)."""
+        try:
+            seconds = int(str(value))
+        except (TypeError, ValueError):
+            return
+        if seconds > 0 and self._sync_timer.interval() != seconds * 1000:
+            self._sync_timer.setInterval(seconds * 1000)
+            logger.info("Heartbeat interval set to %d s by the backend.", seconds)
+
+    def _ack(self, command_id: str, ok: bool, result: dict | None = None, error: str | None = None) -> None:
+        """Acks a command and remembers the answer for a re-delivered command_id."""
+        self._acked_commands[command_id] = (ok, result, error)
+        while len(self._acked_commands) > config.COMMAND_DEDUPE_SIZE:
+            self._acked_commands.popitem(last=False)
+        self._socket.send_ack(command_id, ok, result, error)
+
     def _on_device_command(self, command_id: str, command: str, payload: dict) -> None:
         """Handles a command from the app (contract §3) and acks it right away:
-        the caregiver's request waits for this ack."""
+        the caregiver's request waits for this ack. A command_id seen before is answered with
+        its first ack and not run again (e.g. no second alarm, no second ALARM_STARTED)."""
+        if command_id and command_id in self._acked_commands:
+            ok, result, error = self._acked_commands[command_id]
+            self._socket.send_ack(command_id, ok, result, error)
+            return
         if command == "trigger_alarm":
             slot = payload.get("slot_number")
             compartment = next((c for c in self.scheduler.compartments.values() if c.slot_number == slot), None)
@@ -834,34 +872,48 @@ class MainWindow(QMainWindow):
             self._update_chime()
             where = f"Slot {slot}" if slot else "semua slot"
             self.statusBar().showMessage(f"Alarm dari aplikasi ({where}, {duration} detik)", 5000)
-            self._socket.send_ack(command_id, True, {"ringing": True, "duration_seconds": duration})
+            self._ack(command_id, True, {"ringing": True, "duration_seconds": duration})
+        elif command == "stop_alarm":
+            # Only an alarm started from the app stops: a popped-up dose keeps ringing so the
+            # elderly person is still reminded (docs/DEVICE_CONTRACT.md §3).
+            slot = self._alarm_slot
+            was_ringing = self._alarm_until is not None
+            self._alarm_until = self._alarm_slot = None
+            self._update_chime()
+            compartment = next((c for c in self.scheduler.compartments.values() if c.slot_number == slot), None)
+            if was_ringing and compartment is not None:
+                self.db.log_event(compartment.id, compartment.slot_number, "ALARM_STOPPED", self.clock.now())
+                self._request_sync()
+            if was_ringing:
+                self.statusBar().showMessage("Alarm dari aplikasi dihentikan", 5000)
+            self._ack(command_id, True, {"ringing": False})
         elif command == "schedule_updated":
-            self._socket.send_ack(command_id, True)
+            self._ack(command_id, True)
             self._request_sync()  # pulls the new config now instead of on the next heartbeat
         elif command == "release_slot":
             try:
                 slot = int(payload["slot_number"])
                 until = datetime.fromisoformat(str(payload["until"])).replace(tzinfo=None)
             except (KeyError, TypeError, ValueError) as exc:
-                self._socket.send_ack(command_id, False, error=f"invalid release_slot payload: {exc}")
+                self._ack(command_id, False, error=f"invalid release_slot payload: {exc}")
                 return
             refused = self.scheduler.release_late(slot, until)
             if refused:
-                self._socket.send_ack(command_id, False, error=refused)
+                self._ack(command_id, False, error=refused)
                 return
             self.statusBar().showMessage(f"🔓 Slot {slot} dibuka lagi dari aplikasi sampai {until:%H:%M} (dosis terlewat).", 6000)
-            self._socket.send_ack(command_id, True, {"released": True, "release_until": until.isoformat()})
+            self._ack(command_id, True, {"released": True, "release_until": until.isoformat()})
         elif command == "refill_mode":
             enabled = bool(payload.get("enabled"))
             if enabled != self.scheduler.is_refill_mode:
                 self._toggle_refill_mode()
-            self._socket.send_ack(command_id, True, {"is_refill_mode": self.scheduler.is_refill_mode})
+            self._ack(command_id, True, {"is_refill_mode": self.scheduler.is_refill_mode})
         elif command == "time_sync":
             before = self.clock.now()
             try:
                 local = self._server_local_time(payload["server_time"], payload.get("timezone"))
             except (KeyError, ValueError, ZoneInfoNotFoundError) as exc:
-                self._socket.send_ack(command_id, False, error=f"invalid time_sync payload: {exc}")
+                self._ack(command_id, False, error=f"invalid time_sync payload: {exc}")
                 return
             # A caregiver asked for it ("Kalibrasi jam"): real time again, at real speed.
             self._manual_clock = False
@@ -871,12 +923,12 @@ class MainWindow(QMainWindow):
             self.clock.set_speed(1.0)
             self.clock.set_time(local)
             self._on_clock_changed()
-            self._socket.send_ack(
+            self._ack(
                 command_id, True,
                 {"device_time_before": before.isoformat(), "device_time_after": self.clock.now().isoformat()},
             )
         else:
-            self._socket.send_ack(command_id, False, error=f"unsupported command {command!r}")
+            self._ack(command_id, False, error=f"unsupported command {command!r}")
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
         self._socket.stop()

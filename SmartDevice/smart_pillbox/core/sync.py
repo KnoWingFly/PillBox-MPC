@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 # Backend accepts at most 500 events per telemetry batch.
 FLUSH_CHUNK_SIZE = 200
 
+# Telemetry answers that mean "keep the events and retry later" (docs/DEVICE_CONTRACT.md §2.4,
+# §5.4): 401 = this identity is not accepted (re-register), 408/429 = try again later. Every
+# other 4xx is final for the batch: retrying it forever would block every later event.
+_RETRY_LATER = {401, 408, 429}
+_BATCH_TOO_LARGE = 413
+
 
 _local = threading.local()
 
@@ -150,17 +156,19 @@ def _auth(db: Database) -> tuple[str, dict[str, str]] | None:
 
 # --- telemetry ------------------------------------------------------------------
 
-def flush_pending_events(db: Database, offline_flush: bool = False) -> int:
+def flush_pending_events(db: Database, offline_flush: bool = False, device_time: str | None = None) -> int:
     """Sends unsynced events (oldest first, in chunks). Returns how many were
     synced (0 if not registered or the backend is unreachable). offline_flush
-    marks the batches sent right after Wi-Fi returns (contract §2.4, §5.3)."""
+    marks the batches sent right after Wi-Fi returns (contract §2.4, §5.3).
+    device_time: the RTC reading, used for config-ack if a newer config is pulled."""
     auth = _auth(db)
     if auth is None:
         return 0
     code, headers = auth
     synced = 0
+    chunk_size = FLUSH_CHUNK_SIZE
     while True:
-        pending = db.get_unsynced_events()[:FLUSH_CHUNK_SIZE]
+        pending = db.get_unsynced_events(limit=chunk_size)
         if not pending:
             return synced
         payload = {
@@ -185,13 +193,28 @@ def flush_pending_events(db: Database, offline_flush: bool = False) -> int:
                 headers=headers,
                 timeout=config.SYNC_HTTP_TIMEOUT_SECONDS,
             )
-            response.raise_for_status()
-            res_json = response.json()
         except requests.RequestException as exc:
             logger.info("Backend unreachable, buffering %d event(s) locally: %s", len(pending), exc)
             return synced
+        status = response.status_code
+        if status == _BATCH_TOO_LARGE and chunk_size > 1:
+            chunk_size = max(1, chunk_size // 2)  # the backend's limit is lower: send smaller batches
+            continue
+        if status in _RETRY_LATER or status >= 500:
+            logger.info("Backend answered HTTP %d, buffering %d event(s) locally.", status, len(pending))
+            return synced
+        res_json: dict = {}
+        if 200 <= status < 300:
+            try:
+                res_json = response.json()
+            except requests.JSONDecodeError:
+                logger.info("Backend sent an unreadable answer, buffering %d event(s) locally.", len(pending))
+                return synced
+        else:
+            logger.warning("Backend rejected a batch of %d event(s) (HTTP %d); dropping it.", len(pending), status)
 
-        # accepted, duplicate and rejected are all final outcomes for an event_id.
+        # accepted, duplicate and rejected are all final outcomes for an event_id (and so is a
+        # batch the backend refused with a final 4xx, see _RETRY_LATER).
         db.mark_synced([row["id"] for row in pending])
         synced += len(pending)
         logger.info("Synced %d event(s) to backend.", len(pending))
@@ -199,7 +222,7 @@ def flush_pending_events(db: Database, offline_flush: bool = False) -> int:
         latest_version = res_json.get("latest_config_version")
         current_version = int(db.get_device_state("config_version") or "1")
         if latest_version and latest_version > current_version:
-            pull_latest_config(db)
+            pull_latest_config(db, device_time)
 
 
 # --- heartbeat & config -----------------------------------------------------------
@@ -218,7 +241,8 @@ def send_heartbeat(
     payload = {
         "sent_at": current_time_str,
         "battery_percent": battery_percent,
-        "wifi_rssi_dbm": -50,
+        "wifi_rssi_dbm": config.SIMULATED_WIFI_RSSI_DBM,
+        "rtc_backup_active": config.SIMULATED_RTC_BACKUP_ACTIVE,
         "rtc_time": current_time_str,
         # The simulated RTC can run fast; the backend and the app extrapolate the device clock
         # with it between heartbeats (docs/DEVICE_CONTRACT.md, heartbeat).
@@ -249,16 +273,21 @@ def send_heartbeat(
         if response.status_code == 200:
             res_json = response.json()
             db.update_device_state("is_paired", "1" if res_json.get("is_paired") else "0")
+            interval = res_json.get("heartbeat_interval_seconds")
+            if isinstance(interval, int) and interval > 0:
+                # The backend decides the heartbeat period (contract §2.1); the window applies it.
+                db.update_device_state("heartbeat_interval_seconds", str(interval))
             latest_version = res_json.get("latest_config_version")
             update_available = res_json.get("config_update_available", False)
             current_version = int(config_version)
             if update_available or (latest_version and latest_version > current_version):
-                pull_latest_config(db)
+                pull_latest_config(db, current_time_str)
     except requests.RequestException:
         pass  # offline: the next heartbeat retries
 
 
-def pull_latest_config(db: Database) -> None:
+def pull_latest_config(db: Database, device_time: str | None = None) -> None:
+    """device_time: the RTC reading sent as config-ack applied_at (wall clock if not given)."""
     auth = _auth(db)
     if auth is None:
         return
@@ -273,9 +302,16 @@ def pull_latest_config(db: Database) -> None:
         if response.status_code == 200:
             config_data = response.json()
             schedules = config_data.get("schedules", [])
-            new_version = config_data.get("config_version") or config_data.get("version", current_version + 1)
+            new_version = config_data["config_version"]
 
             db.update_schedules(schedules)
+            # Refill mode and timezone travel in the config too: a refill_mode command sent while
+            # the command channel was down must still reach the device (contract §3).
+            if "is_refill_mode" in config_data:
+                db.update_device_state("is_refill_mode", "1" if config_data["is_refill_mode"] else "0")
+            if config_data.get("timezone"):
+                db.update_device_state("timezone", str(config_data["timezone"]))
+            # Written last: a crash before this line only causes a harmless re-pull.
             db.update_device_state("config_version", str(new_version))
             logger.info("Config successfully synced to version %s.", new_version)
 
@@ -283,7 +319,7 @@ def pull_latest_config(db: Database) -> None:
             try:
                 ack_payload = {
                     "config_version": int(new_version),
-                    "applied_at": datetime.now().isoformat(),
+                    "applied_at": device_time or datetime.now().isoformat(),
                 }
                 _http().post(
                     f"{config.BACKEND_BASE_URL}/devices/{code}/config-ack",
