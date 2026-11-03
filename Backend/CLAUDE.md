@@ -11,7 +11,7 @@ Section A (auth, `/setting`, push tokens) is NOT here: it lives in the Mobile au
 - Test: `uv run pytest`. Needs `TEST_DATABASE_URL` pointing to a **separate, disposable** Postgres whose name contains `test`; the suite drops and recreates its `public` schema. Never point it at the shared database.
 - Device test client: `uv run python -m scripts.fake_device --help`.
 - There is no linter configured (ruff is not a dependency). Do not claim lint passed.
-- Database: Supabase transaction pooler (port 6543) is recommended; it is auto-detected and asyncpg's prepared-statement cache is turned off for it (`DB_POOLER_MODE` overrides). See `.env.example` for every setting.
+- Database: a deployed backend uses the Supabase session pooler (port 5432) or the direct connection: prepared statements work, so each query is one round trip. Several laptops sharing a dev project use the transaction pooler (port 6543) to stay under the session pooler's client limit; it is auto-detected and asyncpg's prepared-statement cache is turned off for it (`DB_POOLER_MODE` overrides), which costs two round trips per query. Keep queries per request low either way (`Backend/README.md`, "Which Supabase connection"). See `.env.example` for every setting.
 
 ## Layout (match it; do not mass-move)
 ```
