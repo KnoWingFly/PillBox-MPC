@@ -10,14 +10,23 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Executable, and_, select, update
+from sqlalchemy import and_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Notification, Schedule, TelemetryLog
+from app.models import Notification, Schedule, TelemetryLog, User
 from app.models.enums import DoseStatus, NotificationType, Severity
 from app.services.adherence import DoseInstants
-from app.services.notifications import NotificationSpec, load_recipients, notify
+from app.services.notifications import (
+    NOTE_TAKEN_AFTER_MISSED,
+    LocalizedText,
+    NotificationSpec,
+    Recipient,
+    load_recipients,
+    localized_for_recipient,
+    note_texts,
+    notify,
+)
 from app.services.slots import slot_layout
 
 _DOSE_KEY_WHERE = and_(TelemetryLog.schedule_id.is_not(None), TelemetryLog.scheduled_for.is_not(None))
@@ -68,18 +77,23 @@ def pending_dose_row(
     }
 
 
-def pending_doses_insert_stmt(rows: list[dict[str, Any]]) -> Executable:
-    """Multi-row INSERT ... ON CONFLICT DO NOTHING RETURNING id for PENDING
-    dose rows (rows from pending_dose_row). Only newly created ids come back."""
-    return (
-        insert(TelemetryLog)
-        .values(rows)
+async def insert_pending_doses(session: AsyncSession, rows: list[dict[str, Any]]) -> int:
+    """INSERT ... ON CONFLICT DO NOTHING for PENDING dose rows (from pending_dose_row); returns
+    how many were new. One statement executed with many parameter sets: SQLAlchemy compiles it
+    once and batches the rows (insertmanyvalues), instead of compiling thousands of bind
+    parameters in Python on the event loop."""
+    if not rows:
+        return 0
+    table = TelemetryLog.__table__
+    stmt = (
+        insert(table)
         .on_conflict_do_nothing(
-            index_elements=[TelemetryLog.schedule_id, TelemetryLog.scheduled_for],
-            index_where=_DOSE_KEY_WHERE,
+            index_elements=[table.c.schedule_id, table.c.scheduled_for],
+            index_where=and_(table.c.schedule_id.is_not(None), table.c.scheduled_for.is_not(None)),
         )
-        .returning(TelemetryLog.id)
+        .returning(table.c.id)
     )
+    return len((await session.execute(stmt, rows)).all())
 
 
 async def get_or_create_dose(
@@ -113,47 +127,64 @@ MISSED_DOSE_ACTIONS = ["LATE_RELEASE", "CONFIRM_TAKEN"]
 
 
 async def notify_dose(
-    session: AsyncSession, log: TelemetryLog, ntype: NotificationType, tz: ZoneInfo, *, variant: str | None = None
+    session: AsyncSession,
+    log: TelemetryLog,
+    ntype: NotificationType,
+    tz: ZoneInfo,
+    *,
+    variant: str | None = None,
+    recipients: list[Recipient] | None = None,
 ) -> list[UUID]:
+    """recipients: preloaded for this log's elderly (load_recipients_many), else loaded here."""
     if log.elderly_id is None or log.slot_number is None:
         return []
+    if recipients is None:
+        recipients = await load_recipients(session, log.elderly_id)
+    spec = dose_notification(log, ntype, tz, recipients, variant=variant)
+    return await notify(session, spec, recipients=recipients) if spec else []
+
+
+def dose_notification(
+    log: TelemetryLog,
+    ntype: NotificationType,
+    tz: ZoneInfo,
+    recipients: list[Recipient],
+    *,
+    variant: str | None = None,
+) -> NotificationSpec | None:
+    """The notification for a dose row, or None when nobody can receive it."""
+    if log.elderly_id is None or log.slot_number is None or not recipients:
+        return None
     severity = {
         NotificationType.DOSE_MISSED: Severity.CRITICAL,
         NotificationType.DOSE_LATE: Severity.WARNING,
         NotificationType.DOSE_TAKEN: Severity.INFO,
     }[ntype]
-    recipients = await load_recipients(session, log.elderly_id)
-    if not recipients:
-        return []
     scheduled = log.scheduled_for.astimezone(tz).strftime("%H:%M") if log.scheduled_for else "-"
     taken = log.recorded_at.astimezone(tz).strftime("%H:%M") if log.recorded_at else "-"
-    return await notify(
-        session,
-        NotificationSpec(
-            type=ntype,
-            severity=severity,
-            event_key=f"{ntype.value}:{log.id}",
-            elderly_id=log.elderly_id,
-            device_id=log.device_id,
-            telemetry_log_id=log.id,
-            params={
-                "slot": slot_label(log.slot_number),
-                "period": period_label(log.slot_number),
-                "time": scheduled,
-                "elderly": recipients[0].elderly_name,
-                "delay": log.delay_minutes or 0,
-                "taken": taken,
-            },
-            slot_number=log.slot_number,
-            delay_minutes=log.delay_minutes,
-            variant=variant,
-            actions=MISSED_DOSE_ACTIONS if ntype is NotificationType.DOSE_MISSED else [],
-        ),
-        recipients=recipients,
+    return NotificationSpec(
+        type=ntype,
+        severity=severity,
+        event_key=f"{ntype.value}:{log.id}",
+        elderly_id=log.elderly_id,
+        device_id=log.device_id,
+        telemetry_log_id=log.id,
+        params={
+            "slot": slot_label(log.slot_number),
+            "period": period_label(log.slot_number),
+            "time": scheduled,
+            "elderly": recipients[0].elderly_name,
+            "delay": log.delay_minutes or 0,
+            "taken": taken,
+        },
+        slot_number=log.slot_number,
+        delay_minutes=log.delay_minutes,
+        variant=variant,
+        actions=MISSED_DOSE_ACTIONS if ntype is NotificationType.DOSE_MISSED else [],
     )
 
 
-async def auto_resolve_missed(session: AsyncSession, log_id: UUID, now: datetime, note: str) -> None:
+async def auto_resolve_missed(session: AsyncSession, log_id: UUID, now: datetime, note: LocalizedText) -> None:
     """A dose first decided MISSED and later proven TAKEN: close the open
     DOSE_MISSED notifications for it, and a forced-open alert linked to it
     (resolved_by_user_id stays NULL = system). They stay in history, resolved."""
@@ -163,30 +194,35 @@ async def auto_resolve_missed(session: AsyncSession, log_id: UUID, now: datetime
             Notification.telemetry_log_id == log_id,
             Notification.type.in_([NotificationType.DOSE_MISSED.value, NotificationType.UNSCHEDULED_OPEN.value]),
             Notification.is_resolved.is_(False),
+            User.id == Notification.user_id,  # the note in each recipient's language
         )
-        .values(is_resolved=True, resolved_at=now, resolution_note=note)
+        .values(is_resolved=True, resolved_at=now, resolution_note=localized_for_recipient(note))
     )
 
 
 async def report_taken_after_missed(
-    session: AsyncSession, log: TelemetryLog, tz: ZoneInfo, now: datetime, how: str
+    session: AsyncSession, log: TelemetryLog, tz: ZoneInfo, now: datetime, how: LocalizedText
 ) -> None:
     """The dose was MISSED and is now TAKEN (log already updated and flushed): close the
     missed alert with a note and tell every caregiver it was taken after all, so whoever
-    was alarmed knows it is settled. `how` ends the note, e.g. "lewat sensor pillbox"."""
+    was alarmed knows it is settled. `how` ends the note (note_texts(NOTE_BY_SENSOR), ...)."""
     taken = log.recorded_at.astimezone(tz).strftime("%H:%M") if log.recorded_at else "-"
-    note = f"Diminum terlambat pukul {taken} (+{log.delay_minutes or 0} menit), {how}."
+    note = note_texts(NOTE_TAKEN_AFTER_MISSED, taken=taken, delay=log.delay_minutes or 0, how=how)
     await auto_resolve_missed(session, log.id, now, note)
     await notify_dose(session, log, NotificationType.DOSE_LATE, tz, variant="AFTER_MISSED")
 
 
-async def forget_dose(session: AsyncSession, log: TelemetryLog, now: datetime, note: str) -> None:
+async def forget_dose(session: AsyncSession, log: TelemetryLog, now: datetime, note: LocalizedText) -> None:
     """Removes a decided dose row so it can be recorded again from scratch (its open alerts are
     resolved with `note` first; other notifications and device_events keep their history, unlinked)."""
     await session.execute(
         update(Notification)
-        .where(Notification.telemetry_log_id == log.id, Notification.is_resolved.is_(False))
-        .values(is_resolved=True, resolved_at=now, resolution_note=note)
+        .where(
+            Notification.telemetry_log_id == log.id,
+            Notification.is_resolved.is_(False),
+            User.id == Notification.user_id,  # the note in each recipient's language
+        )
+        .values(is_resolved=True, resolved_at=now, resolution_note=localized_for_recipient(note))
     )
     await session.delete(log)
     await session.flush()

@@ -136,6 +136,9 @@ async def ensure_not_in_progress(
     rows = await session.execute(
         select(TelemetryLog.scheduled_for, TelemetryLog.status, TelemetryLog.late_release_until).where(
             TelemetryLog.schedule_id == schedule.id,
+            # Dose rows always have scheduled_for; saying so lets telemetry_logs_dose_key_idx
+            # (partial on it) serve this instead of a scan by date across every elderly.
+            TelemetryLog.scheduled_for.is_not(None),
             TelemetryLog.scheduled_date >= today - timedelta(days=1),
             TelemetryLog.status.is_not(None),
         )
@@ -242,7 +245,6 @@ def _raise_overlap(conflicts: list[Conflict]) -> None:
 async def _commit_and_notify(session: AsyncSession, device: Device, schedule: Schedule) -> ScheduleOut:
     version = await bump_config(session, device)
     await session.commit()
-    await session.refresh(schedule)
     notified = await notify_config_changed(device.id, version)
     return to_out(schedule, version, notified)
 

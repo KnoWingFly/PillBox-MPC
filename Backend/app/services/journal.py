@@ -37,6 +37,7 @@ from app.services.access import require_role
 from app.services.adherence import AdherenceSummary, delay_minutes_for, dose_instants, is_scheduled_on, journal_status
 from app.services.device_clock import device_now
 from app.services.doses import report_taken_after_missed
+from app.services.notifications import NOTE_BY_CAREGIVER, note_texts
 from app.services.slots import slot_layout
 from app.services.timeutil import as_aware, zone
 
@@ -73,23 +74,69 @@ async def day_doses(
     device_id -> local date to show for that device. With unlinked_date, rows
     of devices no longer linked to this elderly (history) on that date are
     included too."""
-    records: list[DoseRecord] = []
-    devices_by_id = {d.id: d for d in devices}
     dates = set(day_for.values()) | ({unlinked_date} if unlinked_date else set())
     if not dates:
-        return records
+        return []
+    logs, schedules = await _dose_rows(session, [elderly_id], list(day_for), dates)
+    return _records(logs, schedules, {d.id: d for d in devices}, day_for, now, unlinked_date)
+
+
+async def day_doses_many(
+    session: AsyncSession, devices_by_elderly: dict[UUID, list[Device]], day_for: dict[UUID, date], now: datetime
+) -> dict[UUID, list[DoseRecord]]:
+    """day_doses for several elderly at once (two queries in total, not two per elderly)."""
+    device_ids = [d.id for devices in devices_by_elderly.values() for d in devices]
+    dates = set(day_for.values())
+    if not dates or not device_ids:
+        return {elderly_id: [] for elderly_id in devices_by_elderly}
+    logs, schedules = await _dose_rows(session, list(devices_by_elderly), device_ids, dates)
+    logs_by_elderly: dict[UUID, list[tuple[TelemetryLog, Device, Schedule | None]]] = defaultdict(list)
+    for row in logs:
+        logs_by_elderly[row[0].elderly_id].append(row)
+    out = {}
+    for elderly_id, devices in devices_by_elderly.items():
+        own = {d.id: d for d in devices}
+        out[elderly_id] = _records(
+            logs_by_elderly.get(elderly_id, []), [s for s in schedules if s.device_id in own], own, day_for, now, None
+        )
+    return out
+
+
+async def _dose_rows(
+    session: AsyncSession, elderly_ids: list[UUID], device_ids: list[UUID], dates: set[date]
+) -> tuple[list[tuple[TelemetryLog, Device, Schedule | None]], list[Schedule]]:
     rows = await session.execute(
         select(TelemetryLog, Device, Schedule)
         .join(Device, Device.id == TelemetryLog.device_id)
         .outerjoin(Schedule, Schedule.id == TelemetryLog.schedule_id)
         .where(
-            TelemetryLog.elderly_id == elderly_id,
+            TelemetryLog.elderly_id.in_(elderly_ids),
             TelemetryLog.status.is_not(None),
             TelemetryLog.scheduled_date.in_(list(dates)),
         )
     )
+    schedules = await session.execute(
+        select(Schedule).where(
+            Schedule.device_id.in_(device_ids),
+            Schedule.deleted_at.is_(None),
+            Schedule.is_active.is_(True),
+        )
+    )
+    logs = [(log, device, schedule) for log, device, schedule in rows.all()]
+    return logs, list(schedules.scalars().all())
+
+
+def _records(
+    logs: list[tuple[TelemetryLog, Device, Schedule | None]],
+    schedules: list[Schedule],
+    devices_by_id: dict[UUID, Device],
+    day_for: dict[UUID, date],
+    now: datetime,
+    unlinked_date: date | None,
+) -> list[DoseRecord]:
+    records: list[DoseRecord] = []
     seen: set[tuple[UUID, date]] = set()
-    for log, device, schedule in rows.all():
+    for log, device, schedule in logs:
         if log.scheduled_date is None or log.scheduled_for is None or log.slot_number is None:
             continue
         wanted = day_for.get(device.id, unlinked_date)
@@ -102,14 +149,7 @@ async def day_doses(
             seen.add((log.schedule_id, log.scheduled_date))
         records.append(DoseRecord(log, device, schedule, log.slot_number, log.scheduled_for, status))
 
-    schedules = await session.execute(
-        select(Schedule).where(
-            Schedule.device_id.in_(list(day_for)),
-            Schedule.deleted_at.is_(None),
-            Schedule.is_active.is_(True),
-        )
-    )
-    for schedule in schedules.scalars().all():
+    for schedule in schedules:
         device = devices_by_id.get(schedule.device_id)
         if device is None:
             continue
@@ -321,7 +361,7 @@ async def manual_confirmation(
     log.recorded_at = confirmed_at
     if previous == DoseStatus.MISSED:
         await session.flush()
-        await report_taken_after_missed(session, log, tz, now, f"dikonfirmasi oleh {user.full_name}")
+        await report_taken_after_missed(session, log, tz, now, note_texts(NOTE_BY_CAREGIVER, name=user.full_name))
     await session.commit()
     logger.info("dose_manually_confirmed", extra={"telemetry_log_id": str(log.id), "user_id": str(user.id)})
     return ManualConfirmationOut(

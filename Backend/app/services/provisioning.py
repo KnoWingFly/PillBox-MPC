@@ -13,6 +13,7 @@ from app.core.errors import AppError, conflict, not_found, unprocessable
 from app.core.security import generate_device_code, generate_device_secret, hash_device_secret
 from app.models import Device
 from app.schemas.admin import ProvisionDeviceIn, ProvisionDeviceOut, RotateSecretOut
+from app.services.connection_manager import WS_CLOSE_AUTH_FAILED, connection_manager
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,6 @@ async def provision(session: AsyncSession, body: ProvisionDeviceIn, settings: Se
     device = Device(device_code=code, device_secret_hash=hash_device_secret(secret))
     session.add(device)
     await session.commit()
-    await session.refresh(device)
     logger.info("device_provisioned", extra={"device_id": str(device.id), "device_code": code})
     return ProvisionDeviceOut(
         id=device.id, device_code=code, device_secret=secret, qr_payload=qr_payload(code), created_at=device.created_at
@@ -60,12 +60,15 @@ async def rotate_secret(
     session: AsyncSession, device_code: str, requested: str | None, settings: Settings
 ) -> RotateSecretOut:
     device = (
-        await session.execute(select(Device).where(Device.device_code == device_code).with_for_update())
+        await session.execute(select(Device).where(Device.device_code == device_code).with_for_update(key_share=True))
     ).scalar_one_or_none()
     if device is None:
         raise not_found(message="Device not found")
     secret = _secret(requested, settings)
     device.device_secret_hash = hash_device_secret(secret)
     await session.commit()
+    # The old key is revoked: a socket it authenticated must not keep receiving commands
+    # or sending heartbeats. The device reconnects with the new secret.
+    await connection_manager.close(device.id, WS_CLOSE_AUTH_FAILED, "device secret rotated")
     logger.info("device_secret_rotated", extra={"device_id": str(device.id)})
     return RotateSecretOut(device_code=device_code, device_secret=secret)

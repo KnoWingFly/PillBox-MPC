@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import exc as sa_exc
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,7 +129,7 @@ def install_error_handlers(app: FastAPI) -> None:
             return JSONResponse(
                 error_body("SERVICE_UNAVAILABLE", "Server is busy, please try again shortly"),
                 status_code=503,
-                headers={"Retry-After": "5"},
+                headers={"Retry-After": str(get_settings().db_unavailable_retry_after_seconds)},
             )
         logger.exception(
             "unhandled_error", extra={"method": request.method, "path": request.url.path}

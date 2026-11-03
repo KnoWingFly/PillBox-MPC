@@ -8,9 +8,14 @@ device keeps its RTC on real time (NTP / time_sync), so for it device time is
 server time give or take a few seconds and nothing changes.
 
     device time = rtc_time + (now - rtc_reported_at) * rtc_speed
+
+The device clock is trusted only within DEVICE_CLOCK_MAX_SKEW_MINUTES of server
+time. Outside that (an RTC reset to 2000 after its backup battery died, a
+wildly wrong clock) server time is used, so a broken clock can neither hold
+back nor invent MISSED alerts.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import ColumnElement, DateTime, Interval, and_, case, func, literal
 
@@ -29,7 +34,10 @@ def device_now(device: Device, now: datetime, settings: Settings) -> datetime:
     """The "now" doses of this device are judged by."""
     if not settings.follow_device_clock:
         return now
-    return extrapolated(device, now) or now
+    clock = extrapolated(device, now)
+    if clock is None or abs(clock - now) > timedelta(minutes=settings.device_clock_max_skew_minutes):
+        return now
+    return clock
 
 
 def device_now_sql(now: datetime, settings: Settings) -> ColumnElement[datetime]:
@@ -38,10 +46,16 @@ def device_now_sql(now: datetime, settings: Settings) -> ColumnElement[datetime]
     if not settings.follow_device_clock:
         return server_now
     device_seconds = func.extract("epoch", server_now - Device.rtc_reported_at) * func.coalesce(Device.rtc_speed, 1.0)
+    clock = Device.rtc_time + func.make_interval(0, 0, 0, 0, 0, 0, device_seconds, type_=Interval)
+    skew = timedelta(minutes=settings.device_clock_max_skew_minutes)
     return case(
         (
-            and_(Device.rtc_time.is_not(None), Device.rtc_reported_at.is_not(None)),
-            Device.rtc_time + func.make_interval(0, 0, 0, 0, 0, 0, device_seconds, type_=Interval),
+            and_(
+                Device.rtc_time.is_not(None),
+                Device.rtc_reported_at.is_not(None),
+                clock.between(literal(now - skew, DateTime(timezone=True)), literal(now + skew, DateTime(timezone=True))),
+            ),
+            clock,
         ),
         else_=server_now,
     )

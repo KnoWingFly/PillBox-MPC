@@ -18,7 +18,10 @@ Every RULES_ENGINE_INTERVAL_SECONDS:
 
 "Now" in both steps is the DEVICE clock (services/device_clock.py,
 FOLLOW_DEVICE_CLOCK): when the emulator's lab clock is moved or sped up, doses
-fall due and are missed by the time the pillbox shows, not the server's.
+fall due and are missed by the time the pillbox shows, not the server's. A
+device clock further than DEVICE_CLOCK_MAX_SKEW_MINUTES from server time is
+ignored, doses are materialized up to server time even when the device clock
+lags, and the OFFLINE_MAX_WAIT rule below always uses server time.
 
 OFFLINE RULE: a device that was offline may still hold the door events for
 the dose in its local buffer. We therefore only decide MISSED when
@@ -36,7 +39,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import any_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
@@ -51,15 +54,16 @@ from app.models.enums import (
 )
 from app.services.adherence import dose_instants, is_scheduled_on
 from app.services.device_clock import device_now, device_now_sql
-from app.services.doses import notify_dose, pending_dose_row, pending_doses_insert_stmt
+from app.services.doses import dose_notification, insert_pending_doses, pending_dose_row
 from app.services.leader import RULES_ENGINE_LOCK_KEY, try_lead
+from app.services.notifications import load_recipients_many, notify_many
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
 
-# 10 columns per row; keeps each statement far below Postgres' 32767 bind-parameter limit.
-_INSERT_CHUNK_ROWS = 1000
-
+# Schedules handled between event-loop yields in materialize_due_doses (bounds the stall a pass
+# causes for requests to a few milliseconds).
+_YIELD_EVERY_SCHEDULES = 500
 
 def can_decide_missed(device: Device, deadline_at: datetime, now: datetime, settings: Settings) -> bool:
     flushed = (
@@ -67,9 +71,9 @@ def can_decide_missed(device: Device, deadline_at: datetime, now: datetime, sett
         and device.online_since is not None
         and device.online_since <= now - timedelta(seconds=settings.offline_flush_wait_seconds)
     )
-    gave_up_waiting = device_now(device, now, settings) >= deadline_at + timedelta(
-        minutes=settings.offline_max_wait_minutes
-    )
+    # Server time on purpose: a device clock that lags (within the followed skew) must not
+    # postpone the "caregivers must still be told" rule.
+    gave_up_waiting = now >= deadline_at + timedelta(minutes=settings.offline_max_wait_minutes)
     return flushed or gave_up_waiting
 
 
@@ -85,9 +89,14 @@ async def materialize_due_doses(session: AsyncSession, now: datetime, settings: 
         )
     )
     due: list[dict[str, Any]] = []
-    for schedule, device in rows.all():
+    for index, (schedule, device) in enumerate(rows.all()):
+        if index and index % _YIELD_EVERY_SCHEDULES == 0:
+            # Pure Python work for thousands of schedules: let requests run in between.
+            await asyncio.sleep(0)
         tz = zone(device.timezone)
-        clock = device_now(device, now, settings)
+        # Never behind server time: doses due by the server clock must exist for the
+        # OFFLINE_MAX_WAIT rule even when the device clock lags; a clock ahead (lab demo) is followed.
+        clock = max(now, device_now(device, now, settings))
         today = clock.astimezone(tz).date()
         # When the schedule's current timing / the pairing took effect, on the device clock. Not
         # created_at: an edited slot keeps it, and its new time must not back-fill past days.
@@ -100,14 +109,28 @@ async def materialize_due_doses(session: AsyncSession, now: datetime, settings: 
             if inst.scheduled_for > clock or inst.scheduled_for < not_before:
                 continue
             due.append(pending_dose_row(device.id, device.elderly_id, schedule, inst, EVENT_SCHEDULE_DUE))
-    # A few multi-row statements instead of one round trip per (schedule, day):
-    # every pass re-offers all due doses and ON CONFLICT skips existing ones.
-    created = 0
-    for start in range(0, len(due), _INSERT_CHUNK_ROWS):
-        result = await session.execute(pending_doses_insert_stmt(due[start:start + _INSERT_CHUNK_ROWS]))
-        created += len(result.scalars().all())
+    # Almost every due dose already exists after the first pass. Compiling multi-row INSERTs
+    # for all of them cost seconds of event-loop CPU per pass, so existing keys are read in one
+    # indexed query and only new doses are inserted (ON CONFLICT still covers races).
+    due = await _not_yet_materialized(session, due)
+    created = await insert_pending_doses(session, due)
     await session.commit()
     return created
+
+
+async def _not_yet_materialized(session: AsyncSession, due: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not due:
+        return due
+    existing = await session.execute(
+        select(TelemetryLog.schedule_id, TelemetryLog.scheduled_for).where(
+            # Matches the partial unique index telemetry_logs_dose_key_idx (schedule_id, scheduled_for).
+            TelemetryLog.schedule_id == any_(list({row["schedule_id"] for row in due})),
+            TelemetryLog.scheduled_for >= min(row["scheduled_for"] for row in due),
+            TelemetryLog.scheduled_for.is_not(None),
+        )
+    )
+    keys = {(schedule_id, scheduled_for) for schedule_id, scheduled_for in existing.all()}
+    return [row for row in due if (row["schedule_id"], row["scheduled_for"]) not in keys]
 
 
 async def decide_missed(session: AsyncSession, now: datetime, settings: Settings) -> int:
@@ -118,34 +141,53 @@ async def decide_missed(session: AsyncSession, now: datetime, settings: Settings
         .where(
             TelemetryLog.status == DoseStatus.PENDING.value,
             TelemetryLog.deadline_at.is_not(None),
-            TelemetryLog.deadline_at <= device_now_sql(now, settings) - grace,
+            or_(
+                TelemetryLog.deadline_at <= device_now_sql(now, settings) - grace,
+                TelemetryLog.deadline_at <= now - timedelta(minutes=settings.offline_max_wait_minutes),
+            ),
         )
         .order_by(TelemetryLog.deadline_at)
         # Rows being updated by telemetry right now are skipped this round.
         .with_for_update(of=TelemetryLog, skip_locked=True)
     )
-    decided = 0
-    for log, device in rows.all():
-        if log.deadline_at is None or not can_decide_missed(device, log.deadline_at, now, settings):
-            continue
+    missed = [
+        (log, device)
+        for log, device in rows.all()
+        if log.deadline_at is not None and can_decide_missed(device, log.deadline_at, now, settings)
+    ]
+    for log, device in missed:
         log.status = DoseStatus.MISSED.value
         log.log_source = LogSource.SYSTEM_RULES_ENGINE.value
         log.event_type = EVENT_RULES_ENGINE_MISSED
         log.delay_minutes = None
         log.recorded_at = device_now(device, now, settings)
-        await session.flush()
-        await notify_dose(session, log, NotificationType.DOSE_MISSED, zone(device.timezone))
-        decided += 1
+    await session.flush()
+    # One recipients query and a few multi-row notification INSERTs for the whole pass, instead
+    # of a recipients query and an INSERT per dose (a backlog pass decides thousands at once).
+    recipients = await load_recipients_many(session, {log.elderly_id for log, _ in missed if log.elderly_id})
+    batch = []
+    for log, device in missed:
+        audience = recipients.get(log.elderly_id, []) if log.elderly_id else []
+        spec = dose_notification(log, NotificationType.DOSE_MISSED, zone(device.timezone), audience)
+        if spec is not None:
+            batch.append((spec, audience, None))
         logger.info("dose_missed", extra={"telemetry_log_id": str(log.id), "device_id": str(device.id)})
+    await notify_many(session, batch)
     await session.commit()
-    return decided
+    return len(missed)
 
 
 async def run_once(sessionmaker: async_sessionmaker[AsyncSession], now: datetime, settings: Settings) -> tuple[int, int]:
-    async with sessionmaker() as session:
-        if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
-            return 0, 0  # another backend instance runs this pass
-        created = await materialize_due_doses(session, now, settings)
+    created = 0
+    try:
+        async with sessionmaker() as session:
+            if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
+                return 0, 0  # another backend instance runs this pass
+            created = await materialize_due_doses(session, now, settings)
+    except Exception:
+        # Doses already materialized must still be judged: a failed materialization (e.g. a
+        # lock conflict with telemetry) must not also hold back MISSED alerts this pass.
+        logger.exception("rules_engine_materialize_failed")
     async with sessionmaker() as session:
         if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
             return created, 0

@@ -12,31 +12,34 @@ Formats: docs/DEVICE_CONTRACT.md.
 import asyncio
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+import jwt
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import user_from_token
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.db.session import get_sessionmaker
-from app.models import Device, UserElderlyRole
+from app.models import Device
 from app.schemas.device_protocol import HeartbeatRequest
-from app.services.app_hub import AppConnection, app_hub
-from app.services.connection_manager import DeviceCommand, DeviceConnection, connection_manager
+from app.services.app_hub import AppConnection, app_hub, followed_elderly
+from app.services.connection_manager import (
+    WS_CLOSE_AUTH_FAILED,
+    WS_CLOSE_REPLACED,
+    DeviceCommand,
+    DeviceConnection,
+    connection_manager,
+)
 from app.services.device_protocol import authenticate_device, process_heartbeat
 from app.services.presence import mark_offline, mark_seen
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-WS_CLOSE_AUTH_FAILED = 4401
-WS_CLOSE_REPLACED = 4000
 
 
 async def _authenticate(websocket: WebSocket, device_code: str, timeout: float) -> Device | None:
@@ -118,7 +121,9 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
                 try:
                     hb = HeartbeatRequest.model_validate(message)
                 except ValidationError as exc:
-                    await _send(conn, {"type": "error", "error": "invalid heartbeat", "details": exc.errors(include_url=False)})
+                    # Paths and messages only: the submitted values are not echoed back.
+                    details = exc.errors(include_url=False, include_input=False, include_context=False)
+                    await _send(conn, {"type": "error", "error": "invalid heartbeat", "details": details})
                     continue
                 async with sessionmaker() as session:
                     current = await session.get(Device, device.id)
@@ -149,8 +154,9 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
                 await session.commit()
 
 
-async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUID]] | None:
-    """First message must be {"type": "auth", "token": "<access token>"}."""
+async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUID], float | None] | None:
+    """First message must be {"type": "auth", "token": "<access token>"}. Returns the user, the
+    elderly they follow, and the token's expiry (epoch seconds)."""
     try:
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=timeout))
     except (TimeoutError, ValueError, WebSocketDisconnect):
@@ -163,12 +169,10 @@ async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUI
             user = await user_from_token(token, get_settings(), session)
         except AppError:
             return None
-        return user.id, await _elderly_ids(session, user.id)
-
-
-async def _elderly_ids(session: AsyncSession, user_id: UUID) -> set[UUID]:
-    rows = await session.execute(select(UserElderlyRole.elderly_id).where(UserElderlyRole.user_id == user_id))
-    return set(rows.scalars().all())
+        # Signature and expiry were verified above; only the expiry is read here.
+        expires_at = jwt.decode(token, options={"verify_signature": False}).get("exp")
+        followed = await followed_elderly(session, {user.id})
+        return user.id, followed[user.id], float(expires_at) if expires_at is not None else None
 
 
 @router.websocket("/ws/app")
@@ -178,7 +182,9 @@ async def app_socket(websocket: WebSocket) -> None:
     App -> server:  auth (first, within WS_AUTH_TIMEOUT_SECONDS) | ping | resubscribe
     Server -> app:  ready | notifications | device | pong
     `resubscribe` reloads the elderly the user follows (send it after pairing).
-    The token is checked once, at connect. Pushes carry the changed data (see
+    The token is checked at connect and the socket is closed (4401) when it expires; the app
+    reconnects with a fresh one. Role changes refresh the followed elderly on their own
+    (app_hub.queue_roles_changed). Pushes carry the changed data (see
     app/services/app_hub.py); a message without data tells the app to refetch.
     """
     settings = get_settings()
@@ -187,14 +193,19 @@ async def app_socket(websocket: WebSocket) -> None:
     if auth is None:
         await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="authentication failed")
         return
-    user_id, elderly_ids = auth
+    user_id, elderly_ids, expires_at = auth
     conn = AppConnection(user_id, elderly_ids, websocket)
     app_hub.register(conn)
     logger.info("app_ws_connected", extra={"user_id": str(user_id), "elderly_count": len(elderly_ids)})
     try:
         await websocket.send_json({"type": "ready"})
         while True:
-            raw = await websocket.receive_text()
+            remaining = None if expires_at is None else expires_at - time.time()
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+            except TimeoutError:
+                await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="access token expired")
+                break
             try:
                 kind = json.loads(raw).get("type")
             except (ValueError, AttributeError):
@@ -204,7 +215,7 @@ async def app_socket(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "pong"})
             elif kind == "resubscribe":
                 async with get_sessionmaker()() as session:
-                    conn.elderly_ids = await _elderly_ids(session, user_id)
+                    app_hub.set_elderly(conn, (await followed_elderly(session, {user_id}))[user_id])
     except WebSocketDisconnect:
         pass
     except Exception:
