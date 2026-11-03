@@ -42,6 +42,27 @@ uv sync                       # installs runtime + dev dependencies
 
 > ⚠️ Prisma only knows its own tables. **Do not run `prisma migrate dev` against the shared database**: it will see the backend tables as drift and offer to **reset the database**. Use `prisma migrate deploy`.
 
+### Which Supabase connection
+
+Every SQL statement is a network round trip to Supabase, so the connection type sets the floor for every request.
+
+| Use | Connection | Why |
+|---|---|---|
+| Deployed backend (demo, production: one server) | **Session pooler** (pooler host, port 5432) or the **direct** connection | Prepared statements work: one round trip per query, plans are cached. |
+| Several laptops sharing one dev project | **Transaction pooler** (port 6543) | The session pooler allows only a few clients per project ("max clients reached in session mode"). Supabase's transaction mode does not support prepared statements ([Supabase docs](https://supabase.com/docs/guides/troubleshooting/disabling-prepared-statements-qL8lEL)), so asyncpg prepares each query again: two round trips per query. |
+
+Measured on 3 Nov 2026 against a local Postgres behind a TCP proxy that added a 40 ms round trip, median of 5 warm requests each:
+
+| Request | Transaction pooler mode | Session mode |
+|---|---|---|
+| `GET /devices/{id}/status` | 176 ms | 91 ms |
+| `GET /notifications` | 178 ms | 97 ms |
+| `PUT /devices/{id}` | 344 ms | 176 ms |
+| `GET /elderly` | 686 ms | 267 ms |
+| `PUT /devices/{id}/schedules` | 608 ms | 274 ms |
+
+A real round trip to your Supabase region may be shorter or longer than 40 ms; the ratio is what carries over. Set `DATABASE_URL` accordingly (`.env.example` has both forms); `DB_POOLER_MODE=auto` picks the right driver settings from the port.
+
 ## Run
 
 ```bash
@@ -82,13 +103,13 @@ Type `open 1`, `close 1`, `wifi off`, `wifi on`, `status`, `help` while it runs.
 | Area | Routes |
 |---|---|
 | Device protocol (X-Device-Key) | `POST /devices/{code}/heartbeat`, `GET /devices/{code}/config`, `POST /devices/{code}/config-ack`, `POST /devices/{code}/telemetry`, WS `/ws/device/{code}` |
-| Devices | `POST /devices/pairing/scan`, `POST /devices`, `GET /devices`, `GET/PUT/DELETE /devices/{id}`, `POST /devices/{id}/join`, `PUT /devices/{id}/pin`, `GET /devices/{id}/status`, `GET /devices/{id}/clock`, `POST /devices/{id}/clock/calibrate`, `POST /devices/{id}/alarm`, `GET /devices/{id}/events` |
+| Devices | `POST /devices/pairing/scan`, `POST /devices`, `GET /devices`, `GET/PUT/DELETE /devices/{id}`, `POST /devices/{id}/join`, `PUT /devices/{id}/pin`, `GET /devices/{id}/status`, `GET /devices/{id}/clock`, `POST /devices/{id}/clock/calibrate`, `POST/DELETE /devices/{id}/alarm`, `GET /devices/{id}/events` |
 | Schedules | `GET/POST /devices/{id}/schedules`, `PUT/DELETE /devices/{id}/schedules/{schedule_id}`, `POST /devices/{id}/schedules/validate` |
 | Stock | `POST /devices/{id}/refill-mode`, `POST/GET /devices/{id}/refills`, `GET /devices/{id}/stock` |
 | Elderly | `POST/GET /elderly`, `GET/PUT/DELETE /elderly/{id}`, `POST/GET /elderly/{id}/caregivers`, `DELETE /elderly/{id}/caregivers/{caregiver_id}`, `POST /elderly/{id}/transfer-ownership`, `GET/PUT /elderly/{id}/notification-preferences` |
 | Elderly validation | `POST`/`PUT /elderly`: `full_name` is trimmed, `ELDERLY_NAME_MIN_LENGTH`..100 chars; `birth_date` must not be in the future nor more than `ELDERLY_MAX_AGE_YEARS` ago; `contact_phone` is E.164. Failures are `422 VALIDATION_ERROR` with `details[].path` (e.g. `body.birth_date`). A profile can be created with only `full_name`; devices are added afterwards through pairing. |
 | Journal | `GET /elderly/{id}/journal/calendar?month=YYYY-MM`, `GET /elderly/{id}/journal/{YYYY-MM-DD}`, `GET /elderly/{id}/journal/summary?start&end`, `PUT /journal/dose-logs/{id}/manual-confirmation` |
-| Notifications | `GET /notifications?tab=ALL\|LATE_MISSED\|RESOLVED&elderly_id&page&limit`, `GET /notifications/{id}`, `PUT /notifications/{id}/read`, `PUT /notifications/read-all`, `PUT /notifications/{id}/resolve` |
+| Notifications | `GET /notifications?tab=ALL\|LATE_MISSED\|RESOLVED&elderly_id&page&limit`, `GET /notifications/{id}`, `PUT /notifications/{id}/read`, `PUT /notifications/read-all`, `PUT /notifications/{id}/resolve`, `DELETE /notifications?device_id&up_to_created_at&up_to_id` (one pillbox's rows, or up to a boundary), `DELETE /notifications/{id}` |
 | App push (no prefix) | WS `/ws/app`: first message `{"type":"auth","token":"<access token>"}`, then right after each commit the server sends `{"type":"notifications","items":[…]}` (the new rows, as in `GET /notifications`) or `{"type":"device","device_id","status":{…}}` (the `GET /devices/{id}/status` body), so the app updates without refetching. Polling stays as the fallback (`app/services/app_hub.py`) |
 | Admin | `POST /admin/devices`, `POST /admin/devices/{code}/rotate-secret` (X-Provisioning-Token) |
 | Misc | `GET /me`, `GET /health`, `GET /health/db` |
