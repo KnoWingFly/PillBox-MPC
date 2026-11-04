@@ -3,8 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time
 from enum import Enum
+
+from smart_pillbox import config
+
+
+def is_int(value: object) -> bool:
+    """An int that is not a bool (JSON true would otherwise pass as 1)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def parse_hhmm(value: object) -> time:
+    """"HH:MM" (window_start / window_end) -> time; raises ValueError."""
+    return datetime.strptime(str(value), config.SCHEDULE_TIME_FORMAT).time()
 
 
 class ChamberState(str, Enum):
@@ -19,13 +31,15 @@ class Compartment:
     id: int                     # primary key in db
     meal_relation: str          # "sebelum_makan" | "sesudah_makan"
     meal_time: str              # "pagi" | "siang" | "sore" | "malam"
-    schedule_time: str          # "HH:MM"
-    tolerance_minutes: int = 30
+    schedule_time: str          # "HH:MM", window start
+    tolerance_minutes: int = config.DEFAULT_TOLERANCE_MINUTES
     medication_name: str | None = None
     stock_count: int = 0
     is_active: bool = True
     slot_number: int = 1        # mapped 1-8
-    days_of_week: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
+    days_of_week: list[int] = field(default_factory=lambda: list(config.ISO_WEEKDAYS))
+    window_end: str | None = None  # "HH:MM"; the deadline is window_end + tolerance (contract §5)
+    schedule_id: str | None = None  # backend schedule id from the config
 
     # --- runtime-only fields (not persisted directly on this row) ----------
     state: ChamberState = field(default=ChamberState.IDLE)
@@ -36,7 +50,7 @@ class Compartment:
 
     @property
     def label(self) -> str:
-        relation = "Sebelum" if self.meal_relation == "sebelum_makan" else "Sesudah"
+        relation = "Sebelum" if self.meal_relation == config.BEFORE_MEAL else "Sesudah"
         return f"Slot {self.slot_number}: {self.meal_time.capitalize()} ({relation})"
 
 

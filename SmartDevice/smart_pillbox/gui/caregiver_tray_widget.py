@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QSizePolicy
 )
 
+from smart_pillbox import config
 from smart_pillbox.gui.sachet_graphic import SachetGraphic
 from smart_pillbox.core.scheduler import PillboxScheduler
 
@@ -201,7 +202,7 @@ class CaregiverTrayWidget(QFrame):
         quick_title.setStyleSheet("color: #94A3B8; font-size: 10px; font-weight: bold; margin-top: 4px;")
         layout.addWidget(quick_title)
 
-        btn_fill_7 = QPushButton("Fill 7 Days")
+        btn_fill_7 = QPushButton(f"Fill {config.DAYS_PER_WEEK} Days")
         btn_fill_7.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_fill_7.setStyleSheet("""
             QPushButton {
@@ -218,10 +219,10 @@ class CaregiverTrayWidget(QFrame):
                 color: #06B6D4;
             }
         """)
-        btn_fill_7.clicked.connect(lambda: self._on_bulk_fill(7))
+        btn_fill_7.clicked.connect(lambda: self._on_bulk_fill(config.DAYS_PER_WEEK))
         layout.addWidget(btn_fill_7)
 
-        btn_fill_30 = QPushButton("Fill 30 Days")
+        btn_fill_30 = QPushButton(f"Fill {config.MAX_STOCK_CAPACITY} Days")
         btn_fill_30.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_fill_30.setStyleSheet("""
             QPushButton {
@@ -237,7 +238,7 @@ class CaregiverTrayWidget(QFrame):
                 background-color: #115E59;
             }
         """)
-        btn_fill_30.clicked.connect(lambda: self._on_bulk_fill(30))
+        btn_fill_30.clicked.connect(lambda: self._on_bulk_fill(config.MAX_STOCK_CAPACITY))
         layout.addWidget(btn_fill_30)
 
         btn_empty = QPushButton("Clear All")
@@ -273,7 +274,7 @@ class CaregiverTrayWidget(QFrame):
                 )
             return
 
-        for slot_num in range(1, 9):
+        for slot_num in config.SLOT_NUMBERS:
             self.scheduler.db.set_stock(slot_num, count)
         for c in self.scheduler.compartments.values():
             c.stock_count = count

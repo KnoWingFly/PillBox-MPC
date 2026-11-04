@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+
 from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPoint
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPen, QBrush, QLinearGradient, QDrag
@@ -10,12 +12,24 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect, QGraphicsDropShadowEffect
 )
 
+from smart_pillbox import config
 from smart_pillbox.gui import styles
 from smart_pillbox.gui.icons import speaker_pixmap
+from smart_pillbox.gui.lcd_widget import STATUS_DOSE
 from smart_pillbox.gui.sachet_graphic import SachetGraphic
 from smart_pillbox.models import ChamberState, Compartment
 from smart_pillbox.core.audio import play_chime
 from smart_pillbox.core.scheduler import PillboxScheduler
+
+logger = logging.getLogger(__name__)
+
+
+def locked_message(compartment: Compartment) -> str:
+    """Status bar text when a locked chamber is clicked (also used by the main window)."""
+    return (
+        f"🔒 AKSES DITOLAK: Slot {compartment.slot_number} terkunci oleh solenoid! "
+        f"(Jadwal: {compartment.schedule_time})"
+    )
 
 
 class ChamberCanvas(QWidget):
@@ -190,7 +204,7 @@ class CompartmentWidget(QWidget):
         self._housing.setStyleSheet(f"""
             QFrame {{
                 background-color: {styles.IDLE_SLOT_BG};
-                border: 2px solid #EF4444;
+                border: 2px solid {styles.MISSED_COLOR};
                 border-radius: 12px;
             }}
         """)
@@ -212,10 +226,7 @@ class CompartmentWidget(QWidget):
             if not self.scheduler.is_refill_mode and self.compartment.state != ChamberState.ACTIVE:
                 self.trigger_shake()
                 if hasattr(self.window(), "statusBar") and self.window().statusBar():
-                    self.window().statusBar().showMessage(
-                        f"🔒 AKSES DITOLAK: Slot {self.compartment.slot_number} terkunci oleh solenoid! (Jadwal: {self.compartment.schedule_time} WIB)",
-                        3500,
-                    )
+                    self.window().statusBar().showMessage(locked_message(self.compartment), 3500)
                 event.accept()
                 return
 
@@ -308,7 +319,7 @@ class CompartmentWidget(QWidget):
         if event.mimeData().hasFormat("application/x-pillcare-sachet"):
             try:
                 data = json.loads(bytes(event.mimeData().data("application/x-pillcare-sachet")).decode("utf-8"))
-                # Strictly validate Refill Mode and Capacity <= 30
+                # Strictly validate Refill Mode and Capacity <= MAX_STOCK_CAPACITY
                 if data.get("source_type") == "caregiver_tray":
                     if not self.scheduler.is_refill_mode:
                         self.trigger_shake()
@@ -320,11 +331,11 @@ class CompartmentWidget(QWidget):
                         event.ignore()
                         return
 
-                    if self.compartment.stock_count >= 30:
+                    if self.compartment.stock_count >= config.MAX_STOCK_CAPACITY:
                         self.trigger_shake()
                         if hasattr(self.window(), "statusBar") and self.window().statusBar():
                             self.window().statusBar().showMessage(
-                                f"⚠️ Slot {self.compartment.slot_number} sudah penuh (Maksimal 30 sachet).",
+                                f"⚠️ Slot {self.compartment.slot_number} sudah penuh (Maksimal {config.MAX_STOCK_CAPACITY} sachet).",
                                 3000,
                             )
                         event.ignore()
@@ -334,8 +345,8 @@ class CompartmentWidget(QWidget):
                     self._canvas.is_highlighted = True
                     self._canvas.update()
                     return
-            except Exception:
-                pass
+            except (ValueError, UnicodeDecodeError):
+                logger.exception("Ignoring an unreadable sachet drag payload.")
         # Reject drop -> triggers snap-back
         event.ignore()
 
@@ -355,7 +366,7 @@ class CompartmentWidget(QWidget):
                     event.ignore()
                     return
 
-                if self.compartment.stock_count < 30:
+                if self.compartment.stock_count < config.MAX_STOCK_CAPACITY:
                     # Refill slot by +1
                     new_stock = self.scheduler.refill_slot(self.compartment.slot_number, 1)
                     self.compartment.stock_count = new_stock
@@ -367,8 +378,8 @@ class CompartmentWidget(QWidget):
                     self.trigger_shake()
                     event.ignore()
                     return
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 - a drop must never crash the window; logged
+            logger.exception("Sachet drop on slot %s failed.", self.compartment.slot_number)
         event.ignore()
 
     @staticmethod
@@ -380,7 +391,9 @@ class CompartmentWidget(QWidget):
         if compartment.state == ChamberState.ACTIVE:
             if compartment.stock_count == 0:
                 return styles.MISSED_COLOR, "STOK HABIS", True, True
-            return styles.ACTIVE_CYAN, "WAKTUNYA MINUM", True, True
+            # The breathing LED tells before-meal (yellow) from after-meal (blue) doses.
+            led = styles.LED_BEFORE_MEAL if compartment.meal_relation == config.BEFORE_MEAL else styles.LED_AFTER_MEAL
+            return led, STATUS_DOSE, True, True
             
         if compartment.state == ChamberState.TAKEN:
             return styles.TAKEN_COLOR, "TAKEN", False, False
