@@ -19,7 +19,7 @@ from app.core.config import Settings
 from app.core.errors import AppError, conflict, not_found, unprocessable
 from app.core.security import hash_pin, verify_pin
 from app.models import Device, DeviceEvent, DeviceStock, Elderly, Schedule, TelemetryLog, User, UserElderlyRole
-from app.models.enums import ALL_ROLES, EDITOR_ROLES, ChimeVolume, Connectivity, DoseStatus, Role
+from app.models.enums import ALL_ROLES, EDITOR_ROLES, AttemptScope, ChimeVolume, Connectivity, DoseStatus, Role
 from app.schemas.devices import (
     ChamberDoor,
     ClockOut,
@@ -37,7 +37,7 @@ from app.schemas.devices import (
     PairingScanOut,
     SlotLayoutOut,
 )
-from app.services import stock_cache
+from app.services import pin_attempts, stock_cache
 from app.services.access import get_device_for_user, require_role
 from app.services.app_hub import queue_roles_changed
 from app.services.connection_manager import (
@@ -50,7 +50,6 @@ from app.services.connection_manager import (
     connection_manager,
 )
 from app.services.device_clock import extrapolated
-from app.services.pin_attempts import pin_limiter
 from app.services.slots import SLOT_NUMBERS, all_slots
 from app.services.timeutil import as_aware, is_valid_timezone, zone
 
@@ -131,13 +130,27 @@ async def notify_config_changed(device_id: UUID, config_version: int) -> bool:
     )
 
 
-async def _check_pin(user_id: UUID, device: Device, pin: str, settings: Settings, error_code: str) -> None:
-    key = f"{user_id}:{device.id}"
-    pin_limiter.check(key, settings.pin_max_attempts, settings.pin_lockout_seconds)
+async def _check_pin(
+    user_id: UUID,
+    device: Device,
+    pin: str,
+    settings: Settings,
+    error_code: str,
+    scope: AttemptScope = AttemptScope.DEVICE_PIN,
+) -> None:
+    """Counted per device across all users (services/pin_attempts.py), before scrypt runs, so
+    parallel guesses cannot get past the limit. `join` (callers who are not caregivers yet) uses
+    its own counter, DEVICE_PIN_JOIN: strangers guessing cannot lock the caregivers out of their
+    own PIN actions (change PIN, calibrate, late release)."""
+    check_pin_format(pin)
+    key = str(device.id)
+    await pin_attempts.register_attempt(
+        scope, key, settings.pin_max_attempts, settings.pin_lockout_seconds,
+        "Too many incorrect PIN attempts, try again later",
+    )
     if not await asyncio.to_thread(verify_pin, pin, device.device_pin_hash):
-        pin_limiter.record_failure(key)
         raise AppError(401, error_code, "Device PIN is incorrect")
-    pin_limiter.reset(key)
+    await pin_attempts.reset(scope, key)
 
 
 def command_error_to_app_error(exc: CommandError, device: Device) -> AppError:
@@ -202,16 +215,39 @@ async def unpair(session: AsyncSession, device: Device, now: datetime) -> None:
 
 # --- pairing ---------------------------------------------------------------------
 
-async def scan(session: AsyncSession, raw_payload: str) -> PairingScanOut:
+async def _count_lookup(user: User, settings: Settings) -> None:
+    """Device-code lookups are rate-limited per user: the answers reveal which codes exist
+    (Mobile/BACKEND_HANDOFF.md item 1). Shared by POST /pairing/scan and POST /devices."""
+    await pin_attempts.register_attempt(
+        AttemptScope.PAIRING_SCAN, str(user.id), settings.pairing_scan_max_attempts,
+        settings.pairing_scan_window_seconds, "Too many device code lookups, try again later",
+    )
+
+
+async def scan(session: AsyncSession, user: User, raw_payload: str, settings: Settings) -> PairingScanOut:
+    await session.commit()  # the user lookup's connection goes back before counting takes one
+    await _count_lookup(user, settings)
     code = parse_qr_payload(raw_payload)
     device = (await session.execute(select(Device).where(Device.device_code == code))).scalar_one_or_none()
     if device is None:
         raise not_found("QR_CODE_NOT_RECOGNIZED", "QR code is not a known PillCare device")
     elderly_name = None
     if device.elderly_id is not None:
-        elderly = await session.get(Elderly, device.elderly_id)
-        if elderly is not None and elderly.deleted_at is None:
-            elderly_name = elderly.nickname or elderly.full_name
+        # Only a caregiver of that elderly sees the name; anyone else holding the QR code (or
+        # guessing codes) learns only that the device is registered (BACKEND_HANDOFF §2).
+        row = (
+            await session.execute(
+                select(Elderly)
+                .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
+                .where(
+                    Elderly.id == device.elderly_id,
+                    Elderly.deleted_at.is_(None),
+                    UserElderlyRole.user_id == user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            elderly_name = row.nickname or row.full_name
     return PairingScanOut(
         device_id=device.id, is_registered=device.elderly_id is not None, elderly_name_if_owned=elderly_name
     )
@@ -224,7 +260,9 @@ async def pair(
     code = parse_qr_payload(body.device_qr_payload)
     # scrypt takes tens of ms: hash before taking the row lock, with no transaction (and so no
     # pooled connection) held. The caller's user lookup opened one; nothing was written yet.
+    # Committed before counting too, which uses a connection of its own.
     await session.commit()
+    await _count_lookup(user, settings)  # an unknown code answers 404: same enumeration guard as scan
     pin_hash = await asyncio.to_thread(hash_pin, body.device_pin)
     device = (
         await session.execute(select(Device).where(Device.device_code == code).with_for_update(key_share=True))
@@ -274,7 +312,7 @@ async def join(
     if device is None or device.elderly_id is None:
         raise not_found(message="Device not found")
     await session.commit()  # read only so far: hold no pooled connection during the slow PIN check
-    await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT")
+    await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT", AttemptScope.DEVICE_PIN_JOIN)
     elderly_id = device.elderly_id
     existing = (
         await session.execute(
@@ -318,18 +356,22 @@ async def change_pin(
 # --- reads --------------------------------------------------------------------------
 
 async def list_devices(
-    session: AsyncSession, user: User, elderly_id: UUID | None, settings: Settings
-) -> list[DeviceListItem]:
+    session: AsyncSession, user: User, elderly_id: UUID | None, settings: Settings, offset: int, limit: int
+) -> tuple[list[DeviceListItem], int]:
+    """One page and the total, in one query (the total rides along as a window count)."""
     stmt = (
-        select(Device, Elderly)
+        select(Device, Elderly, func.count().over().label("total"))
         .join(Elderly, Elderly.id == Device.elderly_id)
         .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
         .where(UserElderlyRole.user_id == user.id, Elderly.deleted_at.is_(None))
-        .order_by(Elderly.full_name, Device.device_nickname)
+        .order_by(Elderly.full_name, Device.device_nickname, Device.id)
+        .offset(offset)
+        .limit(limit)
     )
     if elderly_id is not None:
         stmt = stmt.where(Device.elderly_id == elderly_id)
     rows = (await session.execute(stmt)).all()
+    total = rows[0].total if rows else await _count_devices(session, user, elderly_id, offset)
     return [
         DeviceListItem(
             id=d.id,
@@ -342,8 +384,24 @@ async def list_devices(
             estimated_battery_days_remaining=battery_days(d, settings),
             last_seen_at=d.last_heartbeat,
         )
-        for d, e in rows
-    ]
+        for d, e, _ in rows
+    ], total
+
+
+async def _count_devices(session: AsyncSession, user: User, elderly_id: UUID | None, offset: int) -> int:
+    """Total for an empty page: 0 on the first page, else a count (a page past the end)."""
+    if offset == 0:
+        return 0
+    stmt = (
+        select(func.count())
+        .select_from(Device)
+        .join(Elderly, Elderly.id == Device.elderly_id)
+        .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
+        .where(UserElderlyRole.user_id == user.id, Elderly.deleted_at.is_(None))
+    )
+    if elderly_id is not None:
+        stmt = stmt.where(Device.elderly_id == elderly_id)
+    return int(await session.scalar(stmt) or 0)
 
 
 async def active_slots(session: AsyncSession, device_id: UUID) -> set[int]:
@@ -358,7 +416,8 @@ async def active_slots(session: AsyncSession, device_id: UUID) -> set[int]:
 async def detail(session: AsyncSession, user: User, device_id: UUID) -> DeviceDetail:
     device, role = await get_device_for_user(session, user.id, device_id, ALL_ROLES)
     active = await active_slots(session, device.id)
-    assert device.elderly_id is not None
+    if device.elderly_id is None:  # get_device_for_user only returns paired devices
+        raise not_found(message="Device not found")
     return DeviceDetail(
         id=device.id,
         device_code=device.device_code,
@@ -406,7 +465,8 @@ async def update_settings(
     await session.commit()
     if config_changed:
         await notify_config_changed(device.id, device.config_version)
-    assert device.elderly_id is not None
+    if device.elderly_id is None:  # get_device_for_user only returns paired devices
+        raise not_found(message="Device not found")
     return DeviceUpdateOut(
         id=device.id,
         device_nickname=device.device_nickname,
@@ -424,6 +484,8 @@ async def remove(session: AsyncSession, user: User, device_id: UUID, now: dateti
     await unpair(session, device, now)
     await session.commit()
     logger.info("device_unpaired", extra={"device_id": str(device.id)})
+    # A WebSocket device drops its schedules now instead of at its next heartbeat.
+    await notify_config_changed(device.id, device.config_version)
 
 
 async def status(session: AsyncSession, user: User, device_id: UUID, settings: Settings) -> DeviceStatusOut:

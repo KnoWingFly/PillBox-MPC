@@ -36,10 +36,11 @@ TAKEN and auto-resolves the DOSE_MISSED notifications.
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import any_, or_, select
+from sqlalchemy import and_, any_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
@@ -61,9 +62,6 @@ from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
 
-# Schedules handled between event-loop yields in materialize_due_doses (bounds the stall a pass
-# causes for requests to a few milliseconds).
-_YIELD_EVERY_SCHEDULES = 500
 
 def can_decide_missed(device: Device, deadline_at: datetime, now: datetime, settings: Settings) -> bool:
     flushed = (
@@ -90,7 +88,7 @@ async def materialize_due_doses(session: AsyncSession, now: datetime, settings: 
     )
     due: list[dict[str, Any]] = []
     for index, (schedule, device) in enumerate(rows.all()):
-        if index and index % _YIELD_EVERY_SCHEDULES == 0:
+        if index and index % settings.rules_engine_yield_every_schedules == 0:
             # Pure Python work for thousands of schedules: let requests run in between.
             await asyncio.sleep(0)
         tz = zone(device.timezone)
@@ -134,7 +132,17 @@ async def _not_yet_materialized(session: AsyncSession, due: list[dict[str, Any]]
 
 
 async def decide_missed(session: AsyncSession, now: datetime, settings: Settings) -> int:
+    """Decides one chunk (RULES_ENGINE_DECIDE_CHUNK_SIZE) of due PENDING doses and commits.
+    Returns how many were decided; run_once repeats while chunks come back full."""
     grace = timedelta(seconds=settings.missed_decision_grace_seconds)
+    # can_decide_missed() in SQL, so doses of a device still offline (waiting for its flush) are
+    # neither locked nor loaded on every pass, and cannot fill a chunk that decides nothing.
+    flushed = and_(
+        Device.status == Connectivity.ONLINE.value,
+        Device.online_since.is_not(None),
+        Device.online_since <= now - timedelta(seconds=settings.offline_flush_wait_seconds),
+    )
+    gave_up_waiting = TelemetryLog.deadline_at <= now - timedelta(minutes=settings.offline_max_wait_minutes)
     rows = await session.execute(
         select(TelemetryLog, Device)
         .join(Device, Device.id == TelemetryLog.device_id)
@@ -142,11 +150,12 @@ async def decide_missed(session: AsyncSession, now: datetime, settings: Settings
             TelemetryLog.status == DoseStatus.PENDING.value,
             TelemetryLog.deadline_at.is_not(None),
             or_(
-                TelemetryLog.deadline_at <= device_now_sql(now, settings) - grace,
-                TelemetryLog.deadline_at <= now - timedelta(minutes=settings.offline_max_wait_minutes),
+                and_(TelemetryLog.deadline_at <= device_now_sql(now, settings) - grace, flushed),
+                gave_up_waiting,
             ),
         )
         .order_by(TelemetryLog.deadline_at)
+        .limit(settings.rules_engine_decide_chunk_size)
         # Rows being updated by telemetry right now are skipped this round.
         .with_for_update(of=TelemetryLog, skip_locked=True)
     )
@@ -177,32 +186,37 @@ async def decide_missed(session: AsyncSession, now: datetime, settings: Settings
     return len(missed)
 
 
-async def run_once(sessionmaker: async_sessionmaker[AsyncSession], now: datetime, settings: Settings) -> tuple[int, int]:
+@dataclass
+class RulesPass:
+    created: int = 0
+    missed: int = 0
+    # Materialization failed this pass (decide_missed still ran): reported, so /health does not
+    # call a loop "ok" whose doses are never created.
+    materialize_failed: bool = False
+
+
+async def run_once(sessionmaker: async_sessionmaker[AsyncSession], now: datetime, settings: Settings) -> RulesPass:
     created = 0
+    materialize_failed = False
     try:
         async with sessionmaker() as session:
             if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
-                return 0, 0  # another backend instance runs this pass
+                return RulesPass()  # another backend instance runs this pass
             created = await materialize_due_doses(session, now, settings)
     except Exception:
         # Doses already materialized must still be judged: a failed materialization (e.g. a
         # lock conflict with telemetry) must not also hold back MISSED alerts this pass.
         logger.exception("rules_engine_materialize_failed")
-    async with sessionmaker() as session:
-        if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
-            return created, 0
-        missed = await decide_missed(session, now, settings)
-    return created, missed
-
-
-async def rules_engine_loop(sessionmaker: async_sessionmaker[AsyncSession], settings: Settings) -> None:
-    logger.info("rules_engine_started", extra={"interval_s": settings.rules_engine_interval_seconds})
+        materialize_failed = True
+    missed = 0
     while True:
-        try:
-            created, missed = await run_once(sessionmaker, datetime.now(UTC), settings)
-            if created or missed:
-                logger.info("rules_engine_pass", extra={"pending_created": created, "missed": missed})
-        except Exception:
-            # Keep the loop alive (DB blips); the next pass retries idempotently.
-            logger.exception("rules_engine_pass_failed")
-        await asyncio.sleep(settings.rules_engine_interval_seconds)
+        # One transaction (and one leader check) per chunk: a backlog after an outage never holds
+        # thousands of row locks, and requests get the event loop between chunks.
+        async with sessionmaker() as session:
+            if not await try_lead(session, RULES_ENGINE_LOCK_KEY):
+                return RulesPass(created, missed, materialize_failed)
+            decided = await decide_missed(session, now, settings)
+        missed += decided
+        if decided < settings.rules_engine_decide_chunk_size:
+            return RulesPass(created, missed, materialize_failed)
+        await asyncio.sleep(0)

@@ -9,9 +9,10 @@ from uuid import UUID
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import AppError, conflict, not_found, unprocessable
+from app.core.errors import AppError, conflict, forbidden, not_found, unprocessable
 from app.models import Device, Elderly, Invitation, Notification, NotificationPreference, User, UserElderlyRole
 from app.models.enums import ALL_ROLES, EDITOR_ROLES, Connectivity, Gender, InvitationStatus, Role, Severity
 from app.schemas.elderly import (
@@ -27,6 +28,7 @@ from app.schemas.elderly import (
     TodaySummary,
     TransferOwnershipOut,
 )
+from app.schemas.common import E164_PATTERN
 from app.services.access import require_role
 from app.services.app_hub import queue_roles_changed
 from app.services.device_management import unpair
@@ -35,7 +37,7 @@ from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
 
-_E164 = re.compile(r"^\+[1-9]\d{6,14}$")
+_E164 = re.compile(E164_PATTERN)
 
 
 async def create(session: AsyncSession, user: User, body: ElderlyIn, now: datetime) -> ElderlyCreated:
@@ -177,7 +179,9 @@ async def detail(session: AsyncSession, user: User, elderly_id: UUID) -> Elderly
 
 async def update(session: AsyncSession, user: User, elderly_id: UUID, body: ElderlyIn) -> ElderlyDetail:
     await require_role(session, user.id, elderly_id, EDITOR_ROLES)
-    elderly = await session.get(Elderly, elderly_id, with_for_update=True)
+    # FOR NO KEY UPDATE: a plain FOR UPDATE would also block (and can deadlock with) the
+    # FOR KEY SHARE that every FK insert referencing this elderly takes (rules engine, telemetry).
+    elderly = await session.get(Elderly, elderly_id, with_for_update={"key_share": True})
     if elderly is None:
         raise not_found(message="Elderly not found")
     # API List: same body as POST, i.e. a full replacement of the profile.
@@ -193,11 +197,13 @@ async def update(session: AsyncSession, user: User, elderly_id: UUID, body: Elde
 
 async def soft_delete(session: AsyncSession, user: User, elderly_id: UUID, now: datetime) -> None:
     await require_role(session, user.id, elderly_id, {Role.OWNER})
-    elderly = await session.get(Elderly, elderly_id, with_for_update=True)
+    elderly = await session.get(Elderly, elderly_id, with_for_update={"key_share": True})  # see update()
     if elderly is None:
         raise not_found(message="Elderly not found")
     devices = (
-        await session.execute(select(Device).where(Device.elderly_id == elderly_id).with_for_update())
+        await session.execute(
+            select(Device).where(Device.elderly_id == elderly_id).with_for_update(key_share=True)
+        )
     ).scalars().all()
     for device in devices:
         await unpair(session, device, now)
@@ -251,7 +257,12 @@ async def invite(
         )
     )
     queue_roles_changed(session, invitee.id)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        # Two invites of the same person raced past the check above.
+        await session.rollback()
+        raise conflict("ALREADY_CAREGIVER", "This user is already a caregiver of this elderly") from exc
     logger.info("caregiver_added", extra={"elderly_id": str(elderly_id), "caregiver_id": str(invitee.id)})
     return CaregiverOut(
         caregiver_id=invitee.id,
@@ -262,21 +273,38 @@ async def invite(
     )
 
 
-async def list_caregivers(session: AsyncSession, user: User, elderly_id: UUID) -> list[CaregiverOut]:
+async def list_caregivers(
+    session: AsyncSession, user: User, elderly_id: UUID, offset: int, limit: int
+) -> tuple[list[CaregiverOut], int]:
     await require_role(session, user.id, elderly_id, ALL_ROLES)
-    rows = await session.execute(
-        select(UserElderlyRole, User.full_name)
-        .join(User, User.id == UserElderlyRole.user_id)
-        .where(UserElderlyRole.elderly_id == elderly_id)
-        .order_by(UserElderlyRole.created_at)
-    )
+    rows = (
+        await session.execute(
+            select(UserElderlyRole, User.full_name, func.count().over().label("total"))
+            .join(User, User.id == UserElderlyRole.user_id)
+            .where(UserElderlyRole.elderly_id == elderly_id)
+            .order_by(UserElderlyRole.created_at, UserElderlyRole.user_id)
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    if rows:
+        total = rows[0].total
+    elif offset == 0:
+        total = 0
+    else:
+        total = int(
+            await session.scalar(
+                select(func.count()).select_from(UserElderlyRole).where(UserElderlyRole.elderly_id == elderly_id)
+            )
+            or 0
+        )
     return [
         CaregiverOut(
             caregiver_id=r.user_id, full_name=name, role=Role(r.role),
             relationship_label=r.relationship_label, added_at=r.created_at,
         )
-        for r, name in rows.all()
-    ]
+        for r, name, _ in rows
+    ], total
 
 
 async def remove_caregiver(session: AsyncSession, user: User, elderly_id: UUID, caregiver_id: UUID) -> None:
@@ -316,10 +344,13 @@ async def transfer_ownership(
             )
         ).scalars()
     }
+    mine = roles.get(user.id)
+    if mine is None or mine.role != Role.OWNER:
+        # Checked again under the lock: a parallel transfer may have demoted the caller meanwhile.
+        raise forbidden("OWNER_ONLY", "Only the owner can do this")
     target = roles.get(new_owner_id)
     if target is None or new_owner_id == user.id:
         raise not_found("CAREGIVER_NOT_FOUND", "The new owner must be another caregiver of this elderly")
-    mine = roles[user.id]
     # Demote first: the partial unique index allows only one OWNER at a time.
     mine.role = Role.ADMIN.value
     await session.flush()

@@ -4,13 +4,13 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import Select, delete, func, select, tuple_, update
+from sqlalchemy import Select, and_, delete, func, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.errors import conflict, not_found
 from app.models import Device, Elderly, Notification, TelemetryLog, User
-from app.models.enums import DoseStatus, NotificationType, Severity
+from app.models.enums import EDITOR_ROLES, DoseStatus, NotificationType, Severity
 from app.schemas.notifications import (
     NotificationDetail,
     NotificationItem,
@@ -18,6 +18,7 @@ from app.schemas.notifications import (
     ReadOut,
     ResolveOut,
 )
+from app.services.access import require_role
 from app.services.late_dose import CONFIRM_TAKEN, LATE_RELEASE
 
 Tab = Literal["ALL", "LATE_MISSED", "RESOLVED"]
@@ -80,11 +81,30 @@ def actions_for(n: Notification, dose_status: str | None) -> list[str]:
 
 
 async def list_feed(
-    session: AsyncSession, user: User, tab: Tab, elderly_id: UUID | None, offset: int, limit: int
+    session: AsyncSession,
+    user: User,
+    tab: Tab,
+    elderly_id: UUID | None,
+    offset: int,
+    limit: int,
+    device_id: UUID | None = None,
 ) -> tuple[list[NotificationItem], int, int]:
     conditions = [Notification.user_id == user.id]
     if elderly_id is not None:
         conditions.append(Notification.elderly_id == elderly_id)
+    if device_id is not None:
+        # One pillbox's feed (Mobile/BACKEND_HANDOFF.md item 4): its own rows, plus elderly-level
+        # rows (no device) of the elderly it is paired to. Only the caller's own rows are read,
+        # so a foreign device_id just gives an empty page.
+        device_elderly = select(Device.elderly_id).where(Device.id == device_id).scalar_subquery()
+        conditions.append(
+            or_(
+                Notification.device_id == device_id,
+                and_(Notification.device_id.is_(None), Notification.elderly_id == device_elderly),
+            )
+        )
+    # The unread badge follows the same pillbox/elderly scope, not the tab.
+    scope = list(conditions)
     if tab == "LATE_MISSED":
         # ASSUMPTION: the "Terlambat & Terlewat" tab shows open (unresolved) incidents.
         conditions += [Notification.type.in_(_LATE_MISSED), Notification.is_resolved.is_(False)]
@@ -97,7 +117,7 @@ async def list_feed(
     unread_q = (
         select(func.count())
         .select_from(Notification)
-        .where(Notification.user_id == user.id, Notification.is_read.is_(False))
+        .where(*scope, Notification.is_read.is_(False))
         .scalar_subquery()
     )
     # The counts ride along as two extra columns of the page query: one round trip per poll.
@@ -161,15 +181,19 @@ async def mark_all_read(session: AsyncSession, user: User) -> ReadAllOut:
         update(Notification)
         .where(Notification.user_id == user.id, Notification.is_read.is_(False))
         .values(is_read=True)
-        .returning(Notification.id)
+        .execution_options(synchronize_session=False)
     )
-    count = len(result.all())
+    count = result.rowcount
     await session.commit()
     return ReadAllOut(marked_read=count)
 
 
 async def resolve(session: AsyncSession, user: User, notification_id: UUID, note: str | None, now: datetime) -> ResolveOut:
     n = await _own(session, user, notification_id)
+    if n.elderly_id is not None:
+        # Resolving closes the incident for every caregiver: a read-only PEMANTAU must not hide
+        # a DOSE_MISSED alert from the OWNER and ADMINs.
+        await require_role(session, user.id, n.elderly_id, EDITOR_ROLES)
     if n.is_resolved:
         raise conflict("ALREADY_RESOLVED", "This notification is already resolved")
     values = {"is_resolved": True, "resolved_by_user_id": user.id, "resolved_at": now, "resolution_note": note}

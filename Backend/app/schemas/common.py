@@ -7,6 +7,10 @@ from pydantic import AfterValidator, BeforeValidator, PlainSerializer, StringCon
 from app.core.config import get_settings
 from app.services.timeutil import is_valid_timezone
 
+# Largest value of a Postgres INTEGER column. A bigger number from a client would fail the
+# INSERT with a DataError (a 500 the client retries forever), so int fields are bounded by it.
+PG_INT_MAX = 2_147_483_647
+
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
@@ -33,7 +37,8 @@ def _check_tz(value: str) -> str:
 
 
 TimeZoneName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64), AfterValidator(_check_tz)]
-E164 = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^\+[1-9]\d{6,14}$")]
+E164_PATTERN = r"^\+[1-9]\d{6,14}$"
+E164 = Annotated[str, StringConstraints(strip_whitespace=True, pattern=E164_PATTERN)]
 Name100 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 Label50 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 FreeText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]

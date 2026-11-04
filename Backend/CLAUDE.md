@@ -25,7 +25,7 @@ app/
   api/routes/        thin routers: device_protocol, devices, schedules, elderly, journal, notifications, admin, ws, health, me
   services/          all business logic and queries: telemetry, doses, adherence, rules_engine, presence, background,
                      leader (advisory lock), connection_manager + app_hub (WebSockets), notifications, schedules, stock, ...
-migrations/          NNNN_name.sql; 0001-0006 exist, so the next is 0007
+migrations/          NNNN_name.sql; 0001-0009 exist, so the next is 0010
 scripts/             migrate.py, fake_device.py, pair_device.py
 tests/               pytest + pytest-asyncio (asyncio_mode=auto) + httpx against real Postgres
 ```

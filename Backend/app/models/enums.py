@@ -13,6 +13,18 @@ EDITOR_ROLES = frozenset({Role.OWNER, Role.ADMIN})
 ALL_ROLES = frozenset(Role)
 
 
+# notification_preferences.device_offline_after_minutes upper bound (CHECK in migration 0001).
+MAX_DEVICE_OFFLINE_AFTER_MINUTES = 1440
+
+
+class AttemptScope(StrEnum):
+    """attempt_counters.scope (migration 0007)."""
+
+    DEVICE_PIN = "DEVICE_PIN"  # PIN actions of a device's caregivers
+    DEVICE_PIN_JOIN = "DEVICE_PIN_JOIN"  # join by callers who are not caregivers yet
+    PAIRING_SCAN = "PAIRING_SCAN"
+
+
 class Gender(StrEnum):
     MALE = "MALE"
     FEMALE = "FEMALE"

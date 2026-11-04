@@ -40,6 +40,7 @@ from app.services.access import get_device_for_user
 from app.services.adherence import dose_instants, is_scheduled_on
 from app.services.connection_manager import DeviceCommand
 from app.services.device_clock import device_now
+from app.services.error_messages import DOSE_NOT_MISSED, LATE_DOSE_TOO_LATE, error_text
 from app.services.notifications import NOTE_CONFIRMED_FROM_NOTIFICATION, note_texts, text_for
 from app.services.timeutil import zone
 
@@ -54,7 +55,8 @@ async def release_cutoff(
     session: AsyncSession, device_id: UUID, log: TelemetryLog, tz: ZoneInfo, settings: Settings
 ) -> datetime:
     """Latest moment a missed dose may still be taken."""
-    assert log.scheduled_for is not None and log.scheduled_date is not None
+    if log.scheduled_for is None or log.scheduled_date is None:
+        raise conflict("NOT_A_DOSE_NOTIFICATION", "This notification is not about a scheduled dose")
     schedules = (
         await session.execute(
             select(Schedule).where(
@@ -64,13 +66,14 @@ async def release_cutoff(
     ).scalars().all()
     upcoming = []
     for schedule in schedules:
-        for offset in range(3):
+        for offset in range(settings.late_release_lookahead_days + 1):
             day = log.scheduled_date + timedelta(days=offset)
             if not is_scheduled_on(schedule.days_of_week, day):
                 continue
             inst = dose_instants(day, schedule.window_start, schedule.window_end, schedule.tolerance_minutes, tz)
             if inst.scheduled_for > log.scheduled_for:
                 upcoming.append(inst.scheduled_for)
+    # No other dose in the lookahead: the same slot tomorrow is the next one.
     next_dose = min(upcoming, default=log.scheduled_for + timedelta(days=1))
     return log.scheduled_for + (next_dose - log.scheduled_for) * settings.late_release_cutoff_fraction
 
@@ -78,8 +81,7 @@ async def release_cutoff(
 def _too_late(cutoff: datetime, tz: ZoneInfo) -> Exception:
     return conflict(
         "LATE_DOSE_TOO_LATE",
-        f"Sudah lewat batas aman (pukul {cutoff.astimezone(tz):%H:%M}): terlalu dekat dengan jadwal berikutnya. "
-        "Jangan diminum, tunggu jadwal berikutnya.",
+        error_text(LATE_DOSE_TOO_LATE, cutoff=f"{cutoff.astimezone(tz):%H:%M}"),
         details={"cutoff_at": cutoff.isoformat()},
     )
 
@@ -99,7 +101,7 @@ async def _missed_dose(
     if log is None or log.scheduled_for is None or log.slot_number is None:
         raise conflict("NOT_A_DOSE_NOTIFICATION", "This notification is not about a scheduled dose")
     if log.status != DoseStatus.MISSED:
-        raise conflict("DOSE_NOT_MISSED", "Dosis ini sudah tercatat diminum.")
+        raise conflict("DOSE_NOT_MISSED", error_text(DOSE_NOT_MISSED))
     device, _ = await get_device_for_user(session, user.id, log.device_id, EDITOR_ROLES)
     return n, log, device
 

@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     db_pool_recycle_seconds: int = -1
 
     cors_origins: list[str] = ["http://localhost:8081"]
+    # Bodies above this are refused with 413 before parsing. A full telemetry batch
+    # (TELEMETRY_MAX_BATCH_SIZE events) is far below it.
+    max_request_body_bytes: int = Field(1_048_576, ge=1)
 
     # --- Caregiver auth -------------------------------------------------
     # "app_jwt": HS256 access tokens issued by the Mobile server
@@ -106,10 +109,21 @@ class Settings(BaseSettings):
     # often per device (real changes go at once). Matches the app's poll while the socket is live.
     app_ws_device_push_min_interval_seconds: int = 60
     command_ack_timeout_seconds: float = 10.0
+    # /ws/device: a send (or close) that takes longer drops that socket, so a stalled pillbox
+    # connection cannot hang the caregiver request that notifies it. The device reconnects.
+    device_ws_send_timeout_seconds: float = Field(5.0, gt=0)
+    # Recent device commands kept in memory for diagnostics.
+    device_command_history_size: int = Field(200, ge=1)
 
     # --- Rules engine ---------------------------------------------------
     rules_engine_interval_seconds: int = 30
     rules_engine_lookback_days: int = 1
+    # Schedules handled between event-loop yields in materialize_due_doses (bounds the stall a
+    # pass causes for requests to a few milliseconds).
+    rules_engine_yield_every_schedules: int = Field(500, ge=1)
+    # PENDING doses decided MISSED per transaction; a backlog pass commits in chunks so it never
+    # holds thousands of row locks (and one pooled connection) at once.
+    rules_engine_decide_chunk_size: int = Field(500, ge=1)
     # Extra wait after a dose deadline for in-flight telemetry.
     missed_decision_grace_seconds: int = 60
     # After a device reconnects, wait this long for its buffered flush.
@@ -135,6 +149,9 @@ class Settings(BaseSettings):
     # creating dose rows for a date the device clock invented. Long enough for a multi-day
     # offline buffer flush.
     telemetry_max_past_skew_minutes: int = 10080
+    # A buffered BATTERY_STATUS older than this many heartbeat intervals does not overwrite the
+    # battery level a fresher heartbeat already reported.
+    telemetry_fresh_heartbeat_intervals: int = Field(2, ge=1)
 
     # --- Thresholds -----------------------------------------------------
     low_battery_threshold_percent: int = 20
@@ -167,11 +184,17 @@ class Settings(BaseSettings):
     # time to the device's next dose (any slot); later it would come too close to the next
     # dose (double dose). 0.5 = halfway.
     late_release_cutoff_fraction: float = Field(0.5, gt=0, le=1)
+    # Days after a missed dose searched for "the next dose" that bounds its late release.
+    late_release_lookahead_days: int = Field(2, ge=1)
     # Rated runtime of a full battery, used for estimated_battery_days_remaining.
     # Unset = the estimate is returned as null.
     battery_rated_days: float | None = None
-    pin_max_attempts: int = 5
-    pin_lockout_seconds: int = 300
+    # Wrong device PINs allowed per device (all users together) per window (attempt_counters).
+    pin_max_attempts: int = Field(5, ge=1)
+    pin_lockout_seconds: int = Field(300, ge=1)
+    # POST /pairing/scan calls allowed per user per window.
+    pairing_scan_max_attempts: int = Field(30, ge=1)
+    pairing_scan_window_seconds: int = Field(300, ge=1)
 
     # Used when pairing a device and neither the request nor the caregiver
     # profile has a valid IANA timezone.
@@ -183,6 +206,13 @@ class Settings(BaseSettings):
     elderly_name_min_length: int = Field(2, ge=1)
 
     enable_background_tasks: bool = True
+    # A failing background pass waits interval * 2^failures (capped) before the next try.
+    background_max_backoff_exponent: int = Field(4, ge=0)
+    background_max_backoff_seconds: float = Field(300.0, gt=0)
+    # /health reports a loop "stale" when it finished no pass for this many of its intervals.
+    background_stale_after_intervals: int = Field(4, ge=1)
+    # GET /journal/summary: longest period allowed in one request.
+    journal_max_summary_days: int = Field(366, ge=1)
     default_page_limit: int = 20
     max_page_limit: int = 100
 

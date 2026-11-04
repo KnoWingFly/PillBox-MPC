@@ -15,6 +15,8 @@ from app.core.errors import conflict, not_found, unprocessable
 from app.models import Device, Schedule, TelemetryLog, User
 from app.models.enums import ALL_ROLES, EDITOR_ROLES, DoseStatus
 from app.schemas.schedules import (
+    ALL_DAYS_OF_WEEK,
+    DEFAULT_TOLERANCE_MINUTES,
     Conflict,
     ScheduleCreateIn,
     ScheduleOut,
@@ -25,6 +27,16 @@ from app.schemas.schedules import (
     ValidateOut,
 )
 from app.services.access import get_device_for_user
+from app.services.error_messages import (
+    SCHEDULE_TOO_CLOSE,
+    SLOT_DOOR_OPEN,
+    SLOT_RELEASED,
+    SLOT_RINGING,
+    THIS_SCHEDULE,
+    THIS_SLOT,
+    WINDOW_OVERLAP,
+    error_text,
+)
 from app.services.adherence import dose_instants, is_scheduled_on
 from app.services.device_clock import device_now
 from app.services.device_management import bump_config, drop_undecided_doses, notify_config_changed
@@ -127,9 +139,7 @@ async def ensure_not_in_progress(
     label = slot_label(schedule.slot_number)
     doors = {int(c["slot_number"]): c["door"] for c in (device.chamber_doors or [])}
     if doors.get(schedule.slot_number) == "OPEN":
-        raise conflict(
-            "SLOT_IN_PROGRESS", f"Pintu bilik {label} sedang terbuka di pillbox. Tutup dulu, lalu simpan lagi."
-        )
+        raise conflict("SLOT_IN_PROGRESS", error_text(SLOT_DOOR_OPEN, label=label))
     tz = zone(device.timezone)
     clock = device_now(device, now, settings)
     today = clock.astimezone(tz).date()
@@ -147,9 +157,7 @@ async def ensure_not_in_progress(
     for scheduled_for, status, released_until in rows.all():
         if status == DoseStatus.MISSED and released_until is not None and released_until > clock:
             raise conflict(
-                "SLOT_IN_PROGRESS",
-                f"Bilik {label} sedang dibuka lagi untuk dosis yang terlewat (sampai "
-                f"{released_until.astimezone(tz):%H:%M}). Ubah setelah itu selesai.",
+                "SLOT_IN_PROGRESS", error_text(SLOT_RELEASED, label=label, until=f"{released_until.astimezone(tz):%H:%M}")
             )
         if status in (DoseStatus.TAKEN, DoseStatus.MISSED):
             decided[scheduled_for] = status
@@ -160,8 +168,10 @@ async def ensure_not_in_progress(
         if inst.scheduled_for <= clock < inst.deadline_at and inst.scheduled_for not in decided:
             raise conflict(
                 "SLOT_IN_PROGRESS",
-                f"Slot {label} sedang berbunyi di pillbox (jadwal {inst.scheduled_for.astimezone(tz):%H:%M}, "
-                f"sampai {inst.deadline_at.astimezone(tz):%H:%M}). Ubah setelah obatnya diambil atau waktunya lewat.",
+                error_text(
+                    SLOT_RINGING, label=label,
+                    start=f"{inst.scheduled_for.astimezone(tz):%H:%M}", end=f"{inst.deadline_at.astimezone(tz):%H:%M}",
+                ),
             )
 
 
@@ -229,16 +239,13 @@ def _raise_overlap(conflicts: list[Conflict]) -> None:
         return
     first = conflicts[0]
     other = slot_label(first.with_slot_number)
-    me = f"Slot {slot_label(first.slot_number)}" if first.slot_number else "Jadwal ini"
+    me = error_text(THIS_SLOT, label=slot_label(first.slot_number)) if first.slot_number else error_text(THIS_SCHEDULE)
     if first.type == "WINDOW_OVERLAP":
         code = "WINDOW_OVERLAP"
-        message = f"{me} bentrok dengan slot {other} pada {first.overlap_from:%H:%M}. Pilih jam lain."
+        message = error_text(WINDOW_OVERLAP, me=me, other=other, at=f"{first.overlap_from:%H:%M}")
     else:
         code = "SCHEDULE_TOO_CLOSE"
-        message = (
-            f"{me} terlalu dekat dengan slot {other}: pillbox hanya membuka satu bilik sekaligus, "
-            f"jadi beri jarak minimal {first.required_gap_minutes} menit (selama waktu toleransinya)."
-        )
+        message = error_text(SCHEDULE_TOO_CLOSE, me=me, other=other, gap=first.required_gap_minutes)
     raise conflict(code, message, details=[c.model_dump(mode="json") for c in conflicts])
 
 
@@ -410,8 +417,8 @@ async def save_slots(
                 dosage_info=item.dosage_info,
                 window_start=item.window_start,
                 window_end=item.window_end,
-                tolerance_minutes=item.tolerance_minutes or 30,
-                days_of_week=item.days_of_week or [1, 2, 3, 4, 5, 6, 7],
+                tolerance_minutes=item.tolerance_minutes or DEFAULT_TOLERANCE_MINUTES,
+                days_of_week=item.days_of_week or list(ALL_DAYS_OF_WEEK),
                 is_active=True if item.active is None else item.active,
                 effective_from=now,
             )

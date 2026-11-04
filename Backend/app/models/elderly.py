@@ -45,7 +45,7 @@ class NotificationPreference(Base):
     whatsapp_enabled: Mapped[bool] = mapped_column(Boolean, server_default="false")
     whatsapp_number: Mapped[str | None] = mapped_column(String(20))
     notify_on_missed: Mapped[bool] = mapped_column(Boolean, server_default="true")
-    notify_on_taken: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    notify_on_taken: Mapped[bool] = mapped_column(Boolean, server_default="true")  # migration 0009
     notify_on_device_offline: Mapped[bool] = mapped_column(Boolean, server_default="true")
     device_offline_after_minutes: Mapped[int] = mapped_column(Integer, server_default="10")
     notify_on_low_battery: Mapped[bool] = mapped_column(Boolean, server_default="true")
