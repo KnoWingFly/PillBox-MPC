@@ -5,6 +5,6 @@ import { rotateRefreshToken } from '@/server/tokens';
 
 export const POST = route(async (request) => {
   const body = await parseBody(request, refreshSchema);
-  // 4 sequential DB round trips (find, claim, insert, link): see tokens.ts.
+  // One transaction: find, claim, insert, link (see tokens.ts).
   return json(await timed(request, 'rotate_refresh_token', () => rotateRefreshToken(body.refresh_token, userAgent(request))));
 });

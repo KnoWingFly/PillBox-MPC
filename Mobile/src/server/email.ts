@@ -1,15 +1,29 @@
+import { serverConfig } from './config';
 import { env } from './env';
 
 type Email = { to: string; subject: string; text: string };
 
 const DEV_OTP_FILE = '.dev-last-otp.json';
 
+const RESEND_URL = 'https://api.resend.com/emails';
+
 async function sendWithResend(apiKey: string, email: Email): Promise<void> {
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: env.emailFrom, to: [email.to], subject: email.subject, text: email.text }),
-  });
+  // A hung provider must not hold the request (and its DB connection) open indefinitely.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), serverConfig.emailSendTimeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(RESEND_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: env.emailFrom, to: [email.to], subject: email.subject, text: email.text }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    throw new Error(controller.signal.aborted ? 'Resend request timed out' : `Resend request failed (${String(err)})`);
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     // Resend's error body ({ name, message }) explains the cause, e.g. test-mode recipient limits.
     let reason = '';
@@ -23,7 +37,8 @@ async function sendWithResend(apiKey: string, email: Email): Promise<void> {
   }
 }
 
-// Dev-only driver: prints the OTP and records it for the smoke test. Never used in production.
+// Dev-only driver: prints the OTP and records it for the smoke test. Used only when NODE_ENV is
+// explicitly "development" (a staging or test server with an unset NODE_ENV never logs codes).
 async function sendWithConsole(email: Email, otpCode: string): Promise<void> {
   console.log(`[email:dev] to=${email.to} subject="${email.subject}" otp=${otpCode}`);
   const fs = await import('node:fs/promises');
@@ -52,14 +67,14 @@ export async function sendPasswordResetOtp(to: string, code: string): Promise<vo
 
   const apiKey = env.resendApiKey;
   if (!apiKey) {
-    if (env.isProduction) throw new Error('RESEND_API_KEY is required in production');
+    if (!env.isDevelopment) throw new Error('RESEND_API_KEY is required outside NODE_ENV=development');
     return sendWithConsole(email, code);
   }
 
   try {
     await sendWithResend(apiKey, email);
   } catch (err) {
-    if (env.isProduction) throw err;
+    if (!env.isDevelopment) throw err;
     // Dev: keep the flow testable even when Resend rejects the recipient (test mode only
     // delivers to the Resend account owner's address without a verified domain).
     console.warn(`[email:dev] ${err instanceof Error ? err.message : err} -> falling back to console`);
