@@ -14,10 +14,9 @@ import {
   getMockNotifications,
   USE_MOCK,
 } from './api';
-import { jakartaMinutesNow } from './schedule-time';
+import { scheduleDateKey, scheduleMinutesNow, scheduleParts, setScheduleTimezone } from './schedule-time';
 import { SLOT_IDS, type SlotId } from './types';
 
-const JAKARTA_OFFSET_MS = 7 * 3600_000;
 const DAY_MS = 86_400_000;
 /** Days in the missed-dose chart (Monday to Sunday). */
 export const WEEK_DAYS = 7;
@@ -91,10 +90,6 @@ type BackendElderly = {
 type BackendClock = { is_accurate: boolean | null; auto_sync_timezone: boolean };
 type BackendDeviceDetail = { timezone: string; auto_sync_timezone: boolean };
 
-/** "YYYY-MM-DD" of `ms` in WIB (the schedule timezone, see lib/schedule-time.ts). */
-function jakartaDay(ms: number): string {
-  return new Date(ms + JAKARTA_OFFSET_MS).toISOString().slice(0, 10);
-}
 
 function elderly(): string {
   const id = activePillboxElderlyId();
@@ -118,7 +113,7 @@ function formatHHmm(minutes: number): string {
  */
 export async function getTodayDoses(dayMs: number): Promise<TodayDose[]> {
   if (!USE_MOCK) {
-    const res = await backendRequest<BackendDay>(`/elderly/${elderly()}/journal/${jakartaDay(dayMs)}`);
+    const res = await backendRequest<BackendDay>(`/elderly/${elderly()}/journal/${scheduleDateKey(dayMs)}`);
     const deviceId = activePillboxDeviceId();
     return res.doses
       .filter((d) => !deviceId || d.device_id === deviceId)
@@ -133,7 +128,7 @@ export async function getTodayDoses(dayMs: number): Promise<TodayDose[]> {
       .sort((a, b) => a.scheduledTime.localeCompare(b.scheduledTime));
   }
   // Mock: active slots, already-passed ones counted as taken on time.
-  const now = jakartaMinutesNow(dayMs);
+  const now = scheduleMinutesNow(dayMs);
   const slots = await getSchedules();
   return slots
     .filter((s) => s.enabled && s.timeMinutes !== null)
@@ -153,11 +148,10 @@ export async function getTodayDoses(dayMs: number): Promise<TodayDose[]> {
  * Backend: GET /elderly/{id}/journal/calendar?month=YYYY-MM for each month the two weeks touch.
  */
 export async function getWeekMissed(dayMs: number): Promise<WeekMissed> {
-  const today = new Date(dayMs + JAKARTA_OFFSET_MS);
-  const todayIndex = (today.getUTCDay() + WEEK_DAYS - 1) % WEEK_DAYS; // Monday = 0
+  const todayIndex = (scheduleParts(dayMs).weekday + WEEK_DAYS - 1) % WEEK_DAYS; // Monday = 0
   const monday = dayMs - todayIndex * DAY_MS;
-  const dates = Array.from({ length: WEEK_DAYS }, (_, i) => jakartaDay(monday + i * DAY_MS));
-  const previous = Array.from({ length: WEEK_DAYS }, (_, i) => jakartaDay(monday - (WEEK_DAYS - i) * DAY_MS));
+  const dates = Array.from({ length: WEEK_DAYS }, (_, i) => scheduleDateKey(monday + i * DAY_MS));
+  const previous = Array.from({ length: WEEK_DAYS }, (_, i) => scheduleDateKey(monday - (WEEK_DAYS - i) * DAY_MS));
   if (USE_MOCK) {
     return { days: dates.map((date) => ({ date, missed: 0 })), todayIndex, previousTotal: null };
   }
@@ -185,7 +179,10 @@ export async function getElderlyDetail(): Promise<ElderlyDetail | null> {
   };
 }
 
-/** Clock accuracy and timezone of the active pillbox. Backend: GET /devices/{id}/clock and /devices/{id}. */
+/**
+ * Clock accuracy and timezone of the active pillbox. Backend: GET /devices/{id}/clock and /devices/{id}.
+ * Also makes the pillbox's timezone the one every dose time and "today" is computed in.
+ */
 export async function getDeviceClock(): Promise<DeviceClock> {
   if (USE_MOCK) return { isAccurate: true, autoSyncTimezone: true, timezone: AppConfig.fallbackTimezone };
   const id = device();
@@ -193,7 +190,12 @@ export async function getDeviceClock(): Promise<DeviceClock> {
     backendRequest<BackendClock>(`/devices/${id}/clock`),
     backendRequest<BackendDeviceDetail>(`/devices/${id}`),
   ]);
-  return { isAccurate: clock.is_accurate, autoSyncTimezone: clock.auto_sync_timezone, timezone: detail.timezone };
+  if (id === activePillboxDeviceId()) setScheduleTimezone(detail.timezone);
+  return {
+    isAccurate: clock.is_accurate,
+    autoSyncTimezone: clock.auto_sync_timezone,
+    timezone: detail.timezone || AppConfig.fallbackTimezone,
+  };
 }
 
 /** Sets the pillbox clock from the server. Backend: POST /devices/{id}/clock/calibrate (device PIN). */

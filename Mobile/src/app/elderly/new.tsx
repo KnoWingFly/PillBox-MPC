@@ -1,16 +1,18 @@
 import { useRouter } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, View } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { ElderlySavedSheet } from '@/components/elderly/elderly-saved-sheet';
 import { ElderlyIdentitySection } from '@/components/elderly/elderly-identity-section';
 import { PillboxAssignSection } from '@/components/elderly/pillbox-assign-section';
 import { makeToast, Toast, type ToastData } from '@/components/pillbox/toast';
-import { Button } from '@/components/pillbox/ui';
+import { Button, StatusPill } from '@/components/pillbox/ui';
 import { BackHeader } from '@/components/ui/back-header';
 import { Strings } from '@/constants/strings';
 import { useCreateElderly } from '@/hooks/use-create-elderly';
 import { usePillboxOptions } from '@/hooks/use-pillbox-options';
+import type { ElderlyFormValues } from '@/lib/elderly-form';
 
 const S = Strings.elderlyForm;
 
@@ -24,7 +26,12 @@ export default function NewElderlyScreen() {
   // (Toast restarts its animation when onDone changes).
   const leavingRef = useRef(false);
   const [leaving, setLeaving] = useState(false);
-  const busy = form.submitting !== null || leaving;
+  /**
+   * Complete save done: the success sheet shows these values until the caregiver picks a way out.
+   * `phone` is the number as the server stored it (normalized to E.164), not what was typed.
+   */
+  const [saved, setSaved] = useState<{ id: string; values: ElderlyFormValues; phone: string | null } | null>(null);
+  const busy = form.submitting !== null || leaving || saved !== null;
 
   const goBack = useCallback(() => {
     if (router.canGoBack()) router.back();
@@ -42,7 +49,7 @@ export default function NewElderlyScreen() {
   const saveComplete = async () => {
     const result = await form.save('complete');
     if (!result) return;
-    if (result.ok) router.replace({ pathname: '/elderly/[id]/schedule', params: { id: result.elderly.id } });
+    if (result.ok) setSaved({ id: result.elderly.id, values: form.values, phone: result.elderly.contact_phone });
     else setToast(makeToast(result.message, 'error'));
   };
 
@@ -63,6 +70,12 @@ export default function NewElderlyScreen() {
       <BackHeader title={S.title} onBack={goBack} />
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} className="flex-1">
         <ScrollView contentContainerClassName="gap-4 px-4 pb-8 pt-4" keyboardShouldPersistTaps="handled">
+          <View className="gap-2">
+            <View className="self-start">
+              <StatusPill label={S.badge} tone="primary" icon="heart" />
+            </View>
+            <Text className="text-body-sm text-ink-muted">{S.intro}</Text>
+          </View>
           <ElderlyIdentitySection values={form.values} errors={form.errors} onChange={form.setField} required />
           <PillboxAssignSection
             pillboxes={pillboxes.pillboxes}
@@ -74,6 +87,7 @@ export default function NewElderlyScreen() {
           <View className="gap-3">
             <Button
               label={S.submitComplete}
+              icon="save-outline"
               onPress={saveComplete}
               loading={form.submitting === 'complete'}
               disabled={busy}
@@ -88,6 +102,13 @@ export default function NewElderlyScreen() {
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
+      <ElderlySavedSheet
+        values={saved?.values ?? null}
+        phone={saved?.phone ?? null}
+        // Schedules live on the pillbox: open the dashboard's schedule tab (`at` makes a repeat count).
+        onSchedule={() => router.dismissTo({ pathname: '/', params: { tab: 'schedule', at: String(Date.now()) } })}
+        onHome={() => router.dismissTo('/')}
+      />
       {toast && <Toast key={toast.id} toast={toast} onDone={onToastDone} />}
     </SafeAreaView>
   );

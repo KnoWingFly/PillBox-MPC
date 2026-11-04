@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ActivityIndicator, Alert, Image, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Image, Text, TouchableOpacity, View } from 'react-native';
 
 import { Strings } from '@/constants/strings';
 import { useAuth } from '@/hooks/use-auth';
@@ -7,29 +7,34 @@ import { errorMessage } from '@/lib/api/error-message';
 import { isGoogleSignInAvailable } from '@/lib/google-signin';
 import * as tokens from '@/theme/tokens';
 
-const GOOGLE_LOGO_URI = 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png';
+// Bundled, so the button never depends on a third-party host (offline, blocked, tracking).
+const GOOGLE_LOGO = require('@/assets/images/google-g.png');
 const GOOGLE_LOGO_SIZE = 24;
 
 export default function GoogleSignInButton({
   disabled,
   remember = true,
   label = Strings.auth.continueWithGoogle,
+  onError,
 }: {
   disabled?: boolean;
   remember?: boolean;
   label?: string;
+  /** Shows a failed sign-in (the screen's toast; Alert.alert does nothing on web). */
+  onError: (message: string) => void;
 }) {
   const { signInWithGoogle, clearSessionNotice } = useAuth();
   const [loading, setLoading] = useState(false);
   const available = isGoogleSignInAvailable();
 
   const onPress = async () => {
+    if (loading) return;
     setLoading(true);
     try {
       clearSessionNotice();
       await signInWithGoogle(remember); // false = cancelled, stays silent
     } catch (err) {
-      Alert.alert(Strings.common.error, errorMessage(err));
+      onError(errorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -52,7 +57,7 @@ export default function GoogleSignInButton({
         ) : (
           <>
             <Image
-              source={{ uri: GOOGLE_LOGO_URI }}
+              source={GOOGLE_LOGO}
               style={{ width: GOOGLE_LOGO_SIZE, height: GOOGLE_LOGO_SIZE }}
               resizeMode="contain"
             />

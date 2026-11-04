@@ -24,11 +24,16 @@ export function passwordStrength(password: string): number {
   return Math.max(1, checks.filter(Boolean).length);
 }
 
+/** bcrypt only reads the first 72 BYTES; emoji and accented letters take several bytes each. */
+function utf8Length(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
 /** Validation message for a new password, or null when it is acceptable. */
 export function newPasswordProblem(password: string): string | null {
   const v = Strings.validation;
-  if (password.length < AppConfig.passwordMinLength) return v.passwordTooShort;
-  if (password.length > AppConfig.passwordMaxLength) return v.passwordTooLong(AppConfig.passwordMaxLength);
+  if (password.length < AppConfig.passwordMinLength) return v.passwordTooShort(AppConfig.passwordMinLength);
+  if (utf8Length(password) > AppConfig.passwordMaxLength) return v.passwordTooLong(AppConfig.passwordMaxLength);
   if (!HAS_DIGIT.test(password)) return v.passwordNeedsDigit;
   return null;
 }

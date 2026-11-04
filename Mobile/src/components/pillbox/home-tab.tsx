@@ -19,8 +19,9 @@ import {
   deviceLook,
   doseLook,
   firstName,
-  formatJakartaDate,
-  LOW_BATTERY_PERCENT,
+  formatPillboxDate,
+  formatBattery,
+  isLowBattery,
 } from './helpers';
 import type { TabKey } from './tab-bar';
 import { Button, Card, Icon, IconBadge, LoadErrorBox, StatusPill, TONE } from './ui';
@@ -132,7 +133,8 @@ function MissedWarning({
   elderlyName: string;
   remindBusy: boolean;
   alarm: AlarmControl;
-  onCall: () => void;
+  /** Omitted when the elderly profile has no phone number: nothing is dialed then. */
+  onCall?: () => void;
   onRemind: (slotId: SlotId) => void;
 }) {
   const period = COLUMNS[columnIndex(dose.slotId)].label;
@@ -146,7 +148,7 @@ function MissedWarning({
         </View>
       </View>
       <View className="gap-2">
-        <Button label={S.callNow} icon="call-outline" variant="danger" size="sm" onPress={onCall} />
+        {onCall && <Button label={S.callNow} icon="call-outline" variant="danger" size="sm" onPress={onCall} />}
         <AlarmButton
             label={S.sendReminder}
             icon="alarm-outline"
@@ -256,11 +258,11 @@ function PillboxCard({
     );
   }
   const look = deviceLook(device, now);
-  const lowBattery = device.batteryPercent <= LOW_BATTERY_PERCENT;
+  const lowBattery = isLowBattery(device.batteryPercent);
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={S.pillboxA11y(device.deviceName, look.label, device.batteryPercent)}
+      accessibilityLabel={S.pillboxA11y(device.deviceName, look.label, formatBattery(device.batteryPercent))}
       onPress={onOpen}
       className="flex-row items-center gap-3 rounded-3xl border border-line bg-surface p-4 active:opacity-80"
       style={{ boxShadow: tokens.shadow.card }}>
@@ -277,7 +279,7 @@ function PillboxCard({
               size={16}
               color={lowBattery ? tokens.colors.missed.fg : tokens.colors.ink.muted}
             />
-            <Text className={`text-body-sm ${lowBattery ? 'text-missed-fg' : 'text-ink-muted'}`}>{device.batteryPercent}%</Text>
+            <Text className={`text-body-sm ${lowBattery ? 'text-missed-fg' : 'text-ink-muted'}`}>{formatBattery(device.batteryPercent)}</Text>
           </View>
           <View className="flex-1 flex-row items-center gap-1">
             <Icon name={device.online ? 'wifi' : 'cloud-offline-outline'} size={16} color={tokens.colors.ink.muted} />
@@ -330,7 +332,8 @@ export function HomeTab({
   onOpenTab: (tab: TabKey) => void;
   /** Omitted when profiles cannot be created (mock mode). */
   onAddElderly?: () => void;
-  onCall: () => void;
+  /** Omitted when the elderly profile has no phone number. */
+  onCall?: () => void;
   onRemind: (slotId: SlotId) => void;
 }) {
   const elderlyName = insights.elderly?.fullName ?? pillbox?.elderlyName ?? Strings.shell.elderlyFallback;
@@ -364,7 +367,7 @@ export function HomeTab({
       <TodayCard
         doses={doses}
         error={insights.dosesError}
-        dateLabel={formatJakartaDate(pillboxNow)}
+        dateLabel={formatPillboxDate(pillboxNow)}
         onRetry={insights.refreshDoses}
         onOpenSchedule={() => onOpenTab('schedule')}
         warning={

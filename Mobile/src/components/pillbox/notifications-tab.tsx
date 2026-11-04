@@ -6,7 +6,7 @@ import type { FeedError, FeedLoading } from '@/hooks/use-notification-feed';
 import * as tokens from '@/theme/tokens';
 import * as api from '@root/lib/api';
 import { NOTIFICATION_FILTERS, type NotificationFilter } from '@root/lib/notifications';
-import { formatJakartaTimestamp } from '@root/lib/schedule-time';
+import { formatScheduleTimestamp } from '@root/lib/schedule-time';
 import type { AppNotification, NotificationAction } from '@root/lib/types';
 
 import { EMPTY_TEXT, formatRelative, notificationLook } from './helpers';
@@ -49,7 +49,8 @@ const NotificationItem = memo(function NotificationItem({
   alarm: AlarmControl;
   actionBusy: NotificationAction | null;
   onPress: (n: AppNotification) => void;
-  onCall: (n: AppNotification) => void;
+  /** Omitted when the elderly profile has no phone number: the call button is hidden. */
+  onCall?: (n: AppNotification) => void;
   onAlarm: (n: AppNotification) => void;
   onAction: (n: AppNotification, action: NotificationAction) => void;
   /** Omitted when deleting is not supported. */
@@ -62,7 +63,7 @@ const NotificationItem = memo(function NotificationItem({
   const actions = notification.actions ?? [];
   const canRelease = actions.includes('LATE_RELEASE');
   const canConfirm = actions.includes('CONFIRM_TAKEN');
-  const when = `${formatJakartaTimestamp(notification.createdAt, now)} · ${formatRelative(notification.createdAt, now)}`;
+  const when = `${formatScheduleTimestamp(notification.createdAt, now)} · ${formatRelative(notification.createdAt, now)}`;
   const slot = notification.slotId
     ? Strings.shell.slotLabel(
         notification.slotId,
@@ -130,9 +131,11 @@ const NotificationItem = memo(function NotificationItem({
       )}
       {(needsAction || canRelease || canConfirm) && (
         <View className="gap-2 px-4 pb-4">
-          <View>
-            <Button label={N.callElder} icon="call-outline" variant="secondary" size="sm" onPress={() => onCall(notification)} />
-          </View>
+          {onCall && (
+            <View>
+              <Button label={N.callElder} icon="call-outline" variant="secondary" size="sm" onPress={() => onCall(notification)} />
+            </View>
+          )}
           {needsAction && (
             <View>
               <AlarmButton
@@ -326,7 +329,8 @@ export function NotificationsTab({
   heading: string;
   onMarkRead: (id: string) => void;
   onMarkAllRead: () => void;
-  onCall: (n: AppNotification) => void;
+  /** Omitted when the elderly profile has no phone number: the call button is hidden. */
+  onCall?: (n: AppNotification) => void;
   onAlarm: (n: AppNotification) => void;
   onAction: (n: AppNotification, action: NotificationAction) => void;
   onDelete: (n: AppNotification) => void;

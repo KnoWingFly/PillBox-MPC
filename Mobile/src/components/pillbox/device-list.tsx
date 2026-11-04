@@ -1,13 +1,16 @@
 // "Pillbox Anda" list (Perangkat tab), the rename dialog and the active-pillbox switcher.
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ScrollView, Text, TextInput, View } from 'react-native';
 
+import { Strings } from '@/constants/strings';
 import * as tokens from '@/theme/tokens';
 import { canEdit, canUnpair, PILLBOX_NAME_MAX, type Pillbox } from '@root/lib/devices';
 
 import { Dialog, DialogActions, DialogHeader } from './dialog';
 import { formatRelative, LOW_BATTERY_PERCENT } from './helpers';
 import { Button, Card, Chip, Icon, StatusPill } from './ui';
+
+const R = Strings.renamePillbox;
 
 const ROLE_LABEL = { OWNER: 'Pemilik', ADMIN: 'Admin', PEMANTAU: 'Pemantau' } as const;
 
@@ -135,22 +138,26 @@ export function RenamePillboxDialog({
 }) {
   const [name, setName] = useState(pillbox.name);
   const [busy, setBusy] = useState(false);
+  // Enter on the keyboard and the button can both fire before `busy` re-renders.
+  const saving = useRef(false);
   const trimmed = name.trim();
   const valid = trimmed.length > 0 && trimmed.length <= PILLBOX_NAME_MAX && trimmed !== pillbox.name;
 
   const save = async () => {
-    if (!valid) return;
+    if (!valid || saving.current) return;
+    saving.current = true;
     setBusy(true);
     try {
       await onSave(trimmed);
     } finally {
+      saving.current = false;
       setBusy(false);
     }
   };
 
   return (
     <Dialog visible busy={busy} onCancel={onCancel}>
-      <DialogHeader icon="create-outline" tone="primary" title="Ubah nama pillbox" message={pillbox.code} />
+      <DialogHeader icon="create-outline" tone="primary" title={R.title} message={pillbox.code} />
       <TextInput
         className="min-h-[52px] rounded-2xl border border-line-strong bg-surface px-4 text-body text-ink"
         placeholderTextColor={tokens.colors.ink.subtle}
@@ -159,10 +166,10 @@ export function RenamePillboxDialog({
         maxLength={PILLBOX_NAME_MAX}
         autoFocus
         editable={!busy}
-        accessibilityLabel="Nama pillbox"
+        accessibilityLabel={R.label}
         onSubmitEditing={() => void save()}
       />
-      <DialogActions tone="primary" confirmLabel="Simpan" busy={busy} confirmDisabled={!valid} onConfirm={() => void save()} onCancel={onCancel} />
+      <DialogActions tone="primary" confirmLabel={R.save} cancelLabel={Strings.connect.cancel} busy={busy} confirmDisabled={!valid} onConfirm={() => void save()} onCancel={onCancel} />
     </Dialog>
   );
 }

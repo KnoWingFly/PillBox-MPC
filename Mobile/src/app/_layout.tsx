@@ -1,14 +1,20 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { SplashScreen, Stack } from 'expo-router';
+import { router, SplashScreen, Stack } from 'expo-router';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import AuthProvider from '@root/context/auth-context';
+import { useEffect } from 'react';
 import { AppLoading } from '@/components/ui/app-loading';
+import { ErrorFallback } from '@/components/ui/error-fallback';
 import { useAuth } from '@/hooks/use-auth';
+import { watchPushNotifications } from '@/lib/push-token';
 import '@root/global.css';
 import { useOnboardingState } from '@/lib/onboarding';
 import { perfLoginStep } from '@/lib/perf';
 
 SplashScreen.preventAutoHideAsync();
+
+// A render error anywhere below shows a retry screen instead of a blank app (Expo Router convention).
+export const ErrorBoundary = ErrorFallback;
 perfLoginStep('app_start');
 
 // Load the icon font once, before any icon mounts. On web, expo-font stops waiting after 12 s
@@ -31,8 +37,16 @@ function SplashScreenController() {
 function RootNavigator() {
   const { status } = useAuth();
   const onboarding = useOnboardingState();
-  if (status === 'loading' || onboarding === 'loading') return <AppLoading />;
   const signedIn = status === 'signedIn';
+
+  // Foreground display, token rotation and taps on pushes, only while a caregiver is signed in.
+  // A tap opens the dashboard (the notification list is a tab there).
+  useEffect(() => {
+    if (!signedIn) return;
+    return watchPushNotifications(() => router.navigate('/'));
+  }, [signedIn]);
+
+  if (status === 'loading' || onboarding === 'loading') return <AppLoading />;
   // Signed out: onboarding until it was finished once on this phone, then Masuk. Onboarding stays
   // reachable afterwards (the debug button on Masuk opens it).
   const signedOutHome = onboarding === 'unseen' ? '/onboarding' : '/auth/login';

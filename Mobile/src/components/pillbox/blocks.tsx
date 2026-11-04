@@ -46,10 +46,11 @@ export function Avatar({ name, size = 'md', online }: { name: string; size?: 'md
 }
 
 /** Brand bar at the top of every dashboard tab. */
-export function TopBar({ userName }: { userName: string }) {
+/** `online` = the server answers (the avatar dot turns grey while the app is cut off). */
+export function TopBar({ userName, online = true }: { userName: string; online?: boolean }) {
   return (
     <View className="border-b border-line bg-surface px-4">
-      <BrandHeader right={<Avatar name={userName} online />} />
+      <BrandHeader right={<Avatar name={userName} online={online} />} />
     </View>
   );
 }

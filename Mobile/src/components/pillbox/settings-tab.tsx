@@ -8,8 +8,8 @@ import type { ElderlyDetail, NotificationPreferences, PreferenceToggle } from '@
 import { SLOT_IDS, type DeviceStatus } from '@root/lib/types';
 
 import { Avatar, ListRow, SectionTitle, SwitchRow } from './blocks';
-import { ageInYears, deviceLook, LOW_BATTERY_PERCENT } from './helpers';
-import { Button, Card, Divider, ScreenHeader, StatusPill } from './ui';
+import { ageInYears, batteryText, deviceLook } from './helpers';
+import { Button, Card, Divider, LoadErrorBox, ScreenHeader, StatusPill } from './ui';
 
 const S = Strings.settings;
 const PREFERENCE_KEYS: PreferenceToggle[] = ['notify_on_missed', 'notify_on_taken', 'notify_on_device_offline', 'notify_on_low_battery'];
@@ -115,9 +115,7 @@ function DeviceCard({
           icon="cube"
           tone={look.tone}
           title={device.deviceName}
-          subtitle={`${
-            device.batteryPercent <= LOW_BATTERY_PERCENT ? Strings.device.batteryLow(device.batteryPercent) : `${device.batteryPercent}%`
-          } · ${device.online ? device.wifiLabel : Strings.device.noNetwork}`}
+          subtitle={`${batteryText(device.batteryPercent)} · ${device.online ? device.wifiLabel : Strings.device.noNetwork}`}
           onPress={onOpen}
         />
       )}
@@ -139,16 +137,23 @@ function DeviceCard({
 
 function PreferencesCard({
   prefs,
+  error,
   busy,
   onToggle,
+  onRetry,
 }: {
   prefs: NotificationPreferences | null;
+  /** The last load failed (shown instead of an endless spinner). */
+  error: boolean;
   busy: PreferenceToggle | null;
   onToggle: (key: PreferenceToggle, value: boolean) => void;
+  onRetry: () => void;
 }) {
   return (
     <Card>
-      {prefs === null ? (
+      {prefs === null && error ? (
+        <LoadErrorBox text={S.prefsLoadError} onRetry={onRetry} />
+      ) : prefs === null ? (
         <ActivityIndicator color={tokens.colors.primary.DEFAULT} accessibilityLabel={S.prefsLoading} />
       ) : (
         PREFERENCE_KEYS.map((key) => (
@@ -176,8 +181,10 @@ export function SettingsTab({
   elderly,
   device,
   prefs,
+  prefsError,
   prefsBusy,
   onTogglePreference,
+  onRetryPrefs,
   onCallElder,
   onOpenDevice,
   onAddElderly,
@@ -193,8 +200,10 @@ export function SettingsTab({
   elderly: ElderlyDetail | null;
   device: DeviceStatus | null;
   prefs: NotificationPreferences | null;
+  prefsError: boolean;
   prefsBusy: PreferenceToggle | null;
   onTogglePreference: (key: PreferenceToggle, value: boolean) => void;
+  onRetryPrefs: () => void;
   onCallElder: () => void;
   onOpenDevice: () => void;
   /** Omitted when profiles or pairing are unavailable (mock mode). */
@@ -223,7 +232,7 @@ export function SettingsTab({
       <DeviceCard device={device} now={now} onOpen={onOpenDevice} onAdd={onAddDevice} />
 
       <SectionTitle icon="notifications-outline" title={S.notifyTitle} right={<Text className="text-caption text-ink-muted">{S.notifyHint}</Text>} />
-      <PreferencesCard prefs={prefs} busy={prefsBusy} onToggle={onTogglePreference} />
+      <PreferencesCard prefs={prefs} error={prefsError} busy={prefsBusy} onToggle={onTogglePreference} onRetry={onRetryPrefs} />
 
       <SectionTitle icon="help-circle-outline" title={S.aboutTitle} />
       <Card>
