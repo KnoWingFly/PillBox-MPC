@@ -117,3 +117,16 @@ model PushToken {
 
   @@map("push_tokens")
 }
+
+/// Attempt counters for rate-limited auth endpoints (login, register, forgot/reset password).
+/// `key` is SHA-256 hex of "<action>:<scope>:<value>" (e.g. login per email or per IP), so no
+/// email or IP address is stored in clear. Written only by src/server/rate-limit.ts.
+model AuthAttempt {
+  key         String    @id @db.VarChar(64)
+  count       Int       @default(0)
+  windowStart DateTime  @default(now()) @map("window_start") @db.Timestamptz(6)
+  lockedUntil DateTime? @map("locked_until") @db.Timestamptz(6)
+
+  @@index([windowStart])
+  @@map("auth_attempts")
+}
