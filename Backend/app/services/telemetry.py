@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,13 +59,23 @@ from app.services.device_clock import device_now
 from app.services.device_protocol import is_fresh, status_builder
 from app.services.doses import forget_dose, get_or_create_dose, notify_dose, report_taken_after_missed, slot_label
 from app.services.late_dose import CONFIRM_TAKEN, missed_dose_before_cutoff
-from app.services.notifications import NotificationSpec, notify
+from app.services.notifications import (
+    NOTE_BY_SENSOR,
+    NOTE_DOSE_REPLAYED,
+    NotificationSpec,
+    cache_recipients,
+    note_texts,
+    notify,
+)
 from app.services.presence import device_label, mark_seen
 from app.services.timeutil import as_aware, zone
 
 logger = logging.getLogger(__name__)
 
 _KNOWN_TYPES = {t.value for t in DeviceEventType}
+_EVENT_ID_MAX_LENGTH = next(
+    m.max_length for m in TelemetryEvent.model_fields["event_id"].metadata if getattr(m, "max_length", None)
+)
 _DOSE_TYPES = {
     DeviceEventType.POPUP_ACTIVATED,
     DeviceEventType.COMPARTMENT_OPENED,
@@ -72,6 +83,7 @@ _DOSE_TYPES = {
     DeviceEventType.ALARM_TIMEOUT,
 }
 _SLOT_REQUIRED = _DOSE_TYPES | {DeviceEventType.UNSCHEDULED_OPEN}
+_DOSE_TYPE_VALUES = {t.value for t in _DOSE_TYPES}
 
 
 @dataclass
@@ -82,7 +94,10 @@ class _Prepared:
     reject_reason: str | None
 
 
-def _validate(ev: TelemetryEvent, occurred_at: datetime, now: datetime, settings: Settings) -> str | None:
+def _validate(
+    ev: TelemetryEvent, occurred_at: datetime, now: datetime, earliest: datetime, settings: Settings
+) -> str | None:
+    """now: latest acceptable device time; earliest: oldest acceptable time for a dose/door event."""
     if ev.event_type not in _KNOWN_TYPES:
         return f"unknown event_type {ev.event_type!r}"
     etype = DeviceEventType(ev.event_type)
@@ -90,6 +105,9 @@ def _validate(ev: TelemetryEvent, occurred_at: datetime, now: datetime, settings
         return f"slot_number is required for {etype.value}"
     if occurred_at > now + timedelta(minutes=settings.telemetry_max_future_skew_minutes):
         return "occurred_at is too far in the future (check the device clock)"
+    if etype in _SLOT_REQUIRED and occurred_at < earliest:
+        # Would otherwise create a dose row (or a forced-open alert) for a date the clock invented.
+        return "occurred_at is too far in the past (check the device clock)"
     return None
 
 
@@ -110,11 +128,20 @@ async def ingest_batch(
     await mark_seen(session, device, now)
     tz = zone(device.timezone)
     # A lab clock moved ahead on purpose is not "too far in the future".
-    clock = max(now, device_now(device, now, settings))
+    device_clock = device_now(device, now, settings)
+    clock = max(now, device_clock)
+    earliest = min(now, device_clock) - timedelta(minutes=settings.telemetry_max_past_skew_minutes)
 
     results: list[EventResult | None] = [None] * len(req.events)
+    events: list[TelemetryEvent | None] = [None] * len(req.events)
     first_index: dict[str, int] = {}
-    for i, ev in enumerate(req.events):
+    for i, raw in enumerate(req.events):
+        try:
+            ev = events[i] = raw if isinstance(raw, TelemetryEvent) else TelemetryEvent.model_validate(raw)
+        except ValidationError as exc:
+            # Not stored (no valid key to store it under); a resend gets the same answer.
+            results[i] = EventResult(event_id=_raw_event_id(raw), status="rejected", reason=_field_errors(exc))
+            continue
         if ev.event_id in first_index:
             results[i] = EventResult(event_id=ev.event_id, status="duplicate", reason="repeated within batch")
         else:
@@ -125,10 +152,21 @@ async def ingest_batch(
     # saved on the normal, all-new path).
     prepared = []
     for i in first_index.values():
-        ev = req.events[i]
+        ev = events[i]
+        assert ev is not None  # only valid events are indexed
         occurred = as_aware(ev.occurred_at, tz)
-        prepared.append(_Prepared(i, ev, occurred, _validate(ev, occurred, clock, settings)))
+        prepared.append(_Prepared(i, ev, occurred, _validate(ev, occurred, clock, earliest, settings)))
     prepared.sort(key=lambda p: (p.occurred_at, p.event.event_id))
+
+    # Round trips per batch, not per event: one claim INSERT, one lookup of re-sent events'
+    # original outcomes, one load of the device's schedules; recipients are reused per elderly.
+    claimed = await _claim_all(session, device, req.batch_id, prepared)
+    resent = [p.event.event_id for p in prepared if p.event.event_id not in claimed]
+    stored = await _stored_events(session, device, resent)
+    schedules = await _ScheduleIndex.load(session, device.id) if any(
+        p.reject_reason is None and p.event.event_type in _DOSE_TYPE_VALUES for p in prepared
+    ) else _ScheduleIndex([])
+    cache_recipients(session)
 
     log_links: list[dict[str, UUID]] = []  # device_events.id -> telemetry_logs.id
     for item in prepared:
@@ -139,18 +177,12 @@ async def ingest_batch(
                 # Device clock vs server clock: meaningful only with a real-time RTC.
                 lag_ms=round((now - item.occurred_at).total_seconds() * 1000),
             )
-        claimed_id = await _claim(session, device, req.batch_id, item)
+        claimed_id = claimed.get(item.event.event_id)
         if claimed_id is None:
-            stored = (
-                await session.execute(
-                    select(DeviceEvent).where(
-                        DeviceEvent.device_id == device.id, DeviceEvent.event_id == item.event.event_id
-                    )
-                )
-            ).scalar_one_or_none()
+            original = stored.get(item.event.event_id)
             results[item.index] = (
-                _duplicate_result(stored)
-                if stored is not None
+                _duplicate_result(original)
+                if original is not None
                 else EventResult(event_id=item.event.event_id, status="duplicate")
             )
             continue
@@ -161,7 +193,9 @@ async def ingest_batch(
             continue
         token = timing.correlation_id_var.set(item.event.event_id)
         try:
-            log_id = await _apply(session, device, item.event, item.occurred_at, tz, now, settings, req.is_offline_flush)
+            log_id = await _apply(
+                session, device, item.event, item.occurred_at, tz, now, settings, schedules, req.is_offline_flush
+            )
         finally:
             timing.correlation_id_var.reset(token)
         if log_id is not None:
@@ -205,6 +239,19 @@ async def ingest_batch(
     )
 
 
+def _raw_event_id(raw: object) -> str:
+    """The event_id of an event that failed validation, so the device can match the answer."""
+    value = raw.get("event_id") if isinstance(raw, dict) else None
+    return value[:_EVENT_ID_MAX_LENGTH] if isinstance(value, str) else ""
+
+
+def _field_errors(exc: ValidationError) -> str:
+    """Field paths and messages only, never the submitted values."""
+    return "invalid fields: " + "; ".join(
+        f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in exc.errors(include_url=False)
+    )
+
+
 def _duplicate_result(stored: DeviceEvent) -> EventResult:
     return EventResult(
         event_id=stored.event_id,
@@ -214,31 +261,46 @@ def _duplicate_result(stored: DeviceEvent) -> EventResult:
     )
 
 
-async def _claim(
-    session: AsyncSession, device: Device, batch_id: str | None, item: _Prepared
-) -> UUID | None:
-    """Inserts the idempotency claim. Returns its id, or None if the event_id
-    was already claimed."""
-    ev = item.event
+async def _claim_all(
+    session: AsyncSession, device: Device, batch_id: str | None, items: list[_Prepared]
+) -> dict[str, UUID]:
+    """Inserts the idempotency claims in one executemany (compiled once, rows batched). Returns
+    {event_id: claim id} for the events claimed now; a missing event_id was claimed before."""
+    if not items:
+        return {}
+    rows = [
+        {
+            "device_id": device.id,
+            "event_id": item.event.event_id,
+            "batch_id": batch_id,
+            "event_type": item.event.event_type,
+            "slot_number": item.event.slot_number,
+            "schedule_ref": item.event.schedule_id,
+            "occurred_at": item.occurred_at,
+            "chime_count": item.event.chime_count,
+            "payload": item.event.model_dump(mode="json"),
+            "outcome": "REJECTED" if item.reject_reason else "ACCEPTED",
+            "reject_reason": item.reject_reason,
+        }
+        for item in items
+    ]
+    table = DeviceEvent.__table__
     stmt = (
-        insert(DeviceEvent)
-        .values(
-            device_id=device.id,
-            event_id=ev.event_id,
-            batch_id=batch_id,
-            event_type=ev.event_type,
-            slot_number=ev.slot_number,
-            schedule_ref=ev.schedule_id,
-            occurred_at=item.occurred_at,
-            chime_count=ev.chime_count,
-            payload=ev.model_dump(mode="json"),
-            outcome="REJECTED" if item.reject_reason else "ACCEPTED",
-            reject_reason=item.reject_reason,
-        )
-        .on_conflict_do_nothing(index_elements=[DeviceEvent.device_id, DeviceEvent.event_id])
-        .returning(DeviceEvent.id)
+        insert(table)
+        .on_conflict_do_nothing(index_elements=[table.c.device_id, table.c.event_id])
+        .returning(table.c.event_id, table.c.id)
     )
-    return (await session.execute(stmt)).scalar_one_or_none()
+    return {event_id: claim_id for event_id, claim_id in (await session.execute(stmt, rows)).all()}
+
+
+async def _stored_events(session: AsyncSession, device: Device, event_ids: list[str]) -> dict[str, DeviceEvent]:
+    """The stored claims of re-sent events, for their original outcome."""
+    if not event_ids:
+        return {}
+    rows = await session.execute(
+        select(DeviceEvent).where(DeviceEvent.device_id == device.id, DeviceEvent.event_id.in_(event_ids))
+    )
+    return {stored.event_id: stored for stored in rows.scalars().all()}
 
 
 async def _apply(
@@ -249,11 +311,14 @@ async def _apply(
     tz: ZoneInfo,
     now: datetime,
     settings: Settings,
+    schedules: "_ScheduleIndex",
     offline_flush: bool = False,
 ) -> UUID | None:
     etype = DeviceEventType(ev.event_type)
     if etype in _DOSE_TYPES:
-        return await _apply_dose_event(session, device, ev, etype, occurred_at, tz, now, settings, offline_flush)
+        return await _apply_dose_event(
+            session, device, ev, etype, occurred_at, tz, now, settings, schedules, offline_flush
+        )
     if etype is DeviceEventType.UNSCHEDULED_OPEN:
         return await _apply_unscheduled_open(session, device, ev, occurred_at, tz, settings)
     if etype is DeviceEventType.BATTERY_STATUS and ev.battery_percent is not None:
@@ -265,34 +330,30 @@ async def _apply(
     return None
 
 
-async def resolve_schedule(
-    session: AsyncSession, device_id: UUID, slot_number: int | None, schedule_ref: str | None
-) -> Schedule | None:
-    if schedule_ref:
-        try:
-            ref = UUID(schedule_ref)
-        except ValueError:
-            ref = None
-        if ref is not None:
-            by_id = await session.execute(
-                select(Schedule).where(
-                    Schedule.id == ref, Schedule.device_id == device_id, Schedule.deleted_at.is_(None)
-                )
-            )
-            schedule = by_id.scalar_one_or_none()
-            if schedule is not None and schedule.is_active:
-                return schedule
-    if slot_number is None:
-        return None
-    by_slot = await session.execute(
-        select(Schedule).where(
-            Schedule.device_id == device_id,
-            Schedule.slot_number == slot_number,
-            Schedule.deleted_at.is_(None),
-            Schedule.is_active.is_(True),
+class _ScheduleIndex:
+    """The device's live schedules, loaded once per telemetry batch."""
+
+    def __init__(self, schedules: list[Schedule]) -> None:
+        self._by_id = {s.id: s for s in schedules}
+        self._active_by_slot = {s.slot_number: s for s in schedules if s.is_active}
+
+    @classmethod
+    async def load(cls, session: AsyncSession, device_id: UUID) -> "_ScheduleIndex":
+        rows = await session.execute(
+            select(Schedule).where(Schedule.device_id == device_id, Schedule.deleted_at.is_(None))
         )
-    )
-    return by_slot.scalar_one_or_none()
+        return cls(list(rows.scalars().all()))
+
+    def resolve(self, slot_number: int | None, schedule_ref: str | None) -> Schedule | None:
+        """By schedule_id when it names an active schedule of this device, else by slot."""
+        if schedule_ref:
+            try:
+                by_id = self._by_id.get(UUID(schedule_ref))
+            except ValueError:
+                by_id = None
+            if by_id is not None and by_id.is_active:
+                return by_id
+        return self._active_by_slot.get(slot_number) if slot_number is not None else None
 
 
 async def _apply_dose_event(
@@ -304,9 +365,10 @@ async def _apply_dose_event(
     tz: ZoneInfo,
     now: datetime,
     settings: Settings,
+    schedules: _ScheduleIndex,
     offline_flush: bool = False,
 ) -> UUID | None:
-    schedule = await resolve_schedule(session, device.id, ev.slot_number, ev.schedule_id)
+    schedule = schedules.resolve(ev.slot_number, ev.schedule_id)
     if schedule is None:
         logger.info("dose_event_without_schedule", extra={"device_id": str(device.id), "slot": ev.slot_number})
         return None
@@ -343,7 +405,7 @@ async def _apply_dose_event(
     if log is None:
         log = await get_or_create_dose(session, device.id, device.elderly_id, schedule, inst, etype.value)
         if etype is DeviceEventType.POPUP_ACTIVATED and _is_replay(log, occurred_at, offline_flush):
-            await forget_dose(session, log, now, "Jam pillbox dimundurkan; dosis ini diulang.")
+            await forget_dose(session, log, now, note_texts(NOTE_DOSE_REPLAYED))
             logger.info("dose_replayed", extra={"device_id": str(device.id), "slot": ev.slot_number})
             log = await get_or_create_dose(session, device.id, device.elderly_id, schedule, inst, etype.value)
     grace = on_time_grace(schedule.tolerance_minutes, settings.on_time_grace_minutes)
@@ -450,7 +512,7 @@ async def _mark_taken(
     await session.flush()
 
     if previous == DoseStatus.MISSED:
-        await report_taken_after_missed(session, log, tz, now, "tercatat oleh sensor pillbox")
+        await report_taken_after_missed(session, log, tz, now, note_texts(NOTE_BY_SENSOR))
         return
     ntype = NotificationType.DOSE_LATE if (log.delay_minutes or 0) > 0 else NotificationType.DOSE_TAKEN
     await notify_dose(session, log, ntype, tz)

@@ -35,7 +35,7 @@ export function IconBadge({ icon, tone, size = 'md' }: { icon: IconName; tone: T
   );
 }
 
-type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'danger-soft' | 'success' | 'warning' | 'ghost';
+export type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'danger-soft' | 'success' | 'warning' | 'ghost';
 
 const BUTTON: Record<ButtonVariant, { box: string; text: string; color: string }> = {
   primary: { box: 'bg-primary', text: 'text-white', color: '#FFFFFF' },

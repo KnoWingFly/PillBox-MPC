@@ -32,16 +32,37 @@ def uses_transaction_pooler(settings: Settings) -> bool:
 # "max clients reached in session mode") is no longer hit when several people
 # run the backend against the same project. Each transaction may land on a
 # different server connection, so prepared statements must not be cached and
-# their names must be unique.
+# their names must be unique. The price: asyncpg then prepares every query again
+# (one round trip) before running it (another), so a deployed backend should use
+# the session pooler or the direct connection instead.
 @lru_cache
 def get_engine() -> AsyncEngine:
+    """Engine for requests and WebSocket handlers."""
     settings = get_settings()
+    return _create_engine(settings, settings.db_pool_size, settings.db_max_overflow)
+
+
+@lru_cache
+def get_background_engine() -> AsyncEngine:
+    """Separate small pool for the background passes (rules engine, presence), so a burst of
+    device requests cannot starve them (pool timeouts used to fail whole passes) and a long
+    pass cannot hold connections that requests need."""
+    settings = get_settings()
+    return _create_engine(settings, settings.background_db_pool_size, settings.background_db_max_overflow)
+
+
+def _create_engine(settings: Settings, pool_size: int, max_overflow: int) -> AsyncEngine:
     url = make_url(settings.database_url)
     connect_args: dict[str, Any] = {
         "timeout": settings.db_connect_timeout_seconds,
         "command_timeout": settings.db_command_timeout_seconds,
         "server_settings": {"application_name": settings.app_name},
     }
+    if settings.db_lock_timeout_ms and not uses_transaction_pooler(settings):
+        # One stuck transaction must not hold every pooled connection for the whole command
+        # timeout (all devices got 503). Startup parameters may be refused by a transaction
+        # pooler, so there it has to be set on the database role (see .env.example).
+        connect_args["server_settings"]["lock_timeout"] = str(settings.db_lock_timeout_ms)
     if uses_transaction_pooler(settings):
         url = url.update_query_dict({"prepared_statement_cache_size": "0"})
         connect_args["statement_cache_size"] = 0
@@ -54,8 +75,8 @@ def get_engine() -> AsyncEngine:
         connect_args=connect_args,
         pool_pre_ping=settings.db_pool_pre_ping,
         pool_recycle=settings.db_pool_recycle_seconds,
-        pool_size=settings.db_pool_size,
-        max_overflow=settings.db_max_overflow,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         # Fail fast with a 503 instead of queueing requests for 30 s when the pool is exhausted.
         pool_timeout=settings.db_pool_timeout_seconds,
     )
@@ -64,6 +85,11 @@ def get_engine() -> AsyncEngine:
 @lru_cache
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_engine(), expire_on_commit=False)
+
+
+@lru_cache
+def get_background_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(get_background_engine(), expire_on_commit=False)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
@@ -91,7 +117,8 @@ async def warm_pool() -> None:
     # All connections stay checked out until every one is open, so each is new.
     try:
         results = await asyncio.wait_for(
-            asyncio.gather(*(_open(c) for c in conns), return_exceptions=True), timeout=15
+            asyncio.gather(*(_open(c) for c in conns), return_exceptions=True),
+            timeout=settings.db_pool_warm_timeout_seconds,
         )
     except TimeoutError as exc:
         results = [exc]

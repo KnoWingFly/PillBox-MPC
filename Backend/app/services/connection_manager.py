@@ -27,9 +27,14 @@ from app.core import timing
 
 logger = logging.getLogger(__name__)
 
+# WebSocket close codes (docs/DEVICE_CONTRACT.md §3).
+WS_CLOSE_AUTH_FAILED = 4401
+WS_CLOSE_REPLACED = 4000
+
 
 class DeviceCommand(StrEnum):
     TRIGGER_ALARM = "trigger_alarm"
+    STOP_ALARM = "stop_alarm"
     SCHEDULE_UPDATED = "schedule_updated"
     TIME_SYNC = "time_sync"
     REFILL_MODE = "refill_mode"
@@ -101,9 +106,13 @@ class ConnectionManager:
         return self._connections.get(device_id)
 
     def register(self, conn: DeviceConnection) -> DeviceConnection | None:
-        """Returns the connection this one replaced (caller should close it)."""
+        """Returns the connection this one replaced (caller should close it). Commands sent on
+        the replaced socket are failed now (502 DEVICE_DISCONNECTED) instead of waiting for the
+        ack timeout: the old socket will never deliver their acks."""
         previous = self._connections.get(conn.device_id)
         self._connections[conn.device_id] = conn
+        if previous is not None:
+            self._fail_pending(conn.device_id)
         return previous
 
     def unregister(self, conn: DeviceConnection) -> bool:
@@ -111,9 +120,27 @@ class ConnectionManager:
         if self._connections.get(conn.device_id) is not conn:
             return False
         del self._connections[conn.device_id]
+        self._fail_pending(conn.device_id)
+        return True
+
+    def _fail_pending(self, device_id: UUID) -> None:
         for command_id, pending in list(self._pending.items()):
-            if pending.device_id == conn.device_id and not pending.future.done():
+            if pending.device_id == device_id and not pending.future.done():
                 pending.future.set_exception(DeviceDisconnectedError(command_id))
+
+    async def close(self, device_id: UUID, code: int, reason: str) -> bool:
+        """Closes the device's socket (e.g. its secret was rotated). The socket handler then
+        unregisters it, fails its pending commands and marks the device offline.
+        Returns False when the device had no socket."""
+        conn = self._connections.get(device_id)
+        if conn is None:
+            return False
+        try:
+            async with conn.send_lock:
+                await conn.websocket.close(code=code, reason=reason)
+        except (WebSocketDisconnect, RuntimeError, OSError):
+            pass  # already gone
+        logger.info("device_ws_closed_by_server", extra={"device_id": str(device_id), "code": code})
         return True
 
     # --- commands -----------------------------------------------------

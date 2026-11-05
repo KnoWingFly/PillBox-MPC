@@ -5,8 +5,20 @@ import { Strings } from '@/constants/strings';
 import { useAuth } from '@/hooks/use-auth';
 import { errorMessage } from '@/lib/api/error-message';
 import { isGoogleSignInAvailable } from '@/lib/google-signin';
+import * as tokens from '@/theme/tokens';
 
-export default function GoogleSignInButton({ disabled, remember = true }: { disabled?: boolean; remember?: boolean }) {
+const GOOGLE_LOGO_URI = 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png';
+const GOOGLE_LOGO_SIZE = 24;
+
+export default function GoogleSignInButton({
+  disabled,
+  remember = true,
+  label = Strings.auth.continueWithGoogle,
+}: {
+  disabled?: boolean;
+  remember?: boolean;
+  label?: string;
+}) {
   const { signInWithGoogle, clearSessionNotice } = useAuth();
   const [loading, setLoading] = useState(false);
   const available = isGoogleSignInAvailable();
@@ -30,21 +42,25 @@ export default function GoogleSignInButton({ disabled, remember = true }: { disa
       <TouchableOpacity
         onPress={onPress}
         disabled={isDisabled}
-        className={`w-full bg-white border border-gray-300 rounded-xl py-3.5 flex-row items-center justify-center shadow-sm ${isDisabled ? 'opacity-50' : 'opacity-100'}`}>
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        accessibilityState={{ disabled: isDisabled, busy: loading }}
+        className={`min-h-[52px] w-full flex-row items-center justify-center gap-3 rounded-2xl border border-line bg-surface ${isDisabled ? 'opacity-50' : 'opacity-100'}`}
+        style={{ boxShadow: tokens.shadow.card }}>
         {loading ? (
-          <ActivityIndicator color="#4b5563" />
+          <ActivityIndicator color={tokens.colors.ink.muted} />
         ) : (
           <>
             <Image
-              source={{ uri: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png' }}
-              style={{ width: 24, height: 24 }}
+              source={{ uri: GOOGLE_LOGO_URI }}
+              style={{ width: GOOGLE_LOGO_SIZE, height: GOOGLE_LOGO_SIZE }}
               resizeMode="contain"
             />
-            <Text className="text-gray-700 font-semibold text-lg ml-2">{Strings.auth.continueWithGoogle}</Text>
+            <Text className="text-body font-semibold text-ink">{label}</Text>
           </>
         )}
       </TouchableOpacity>
-      {!available && <Text className="text-xs text-gray-500 text-center mt-2">{Strings.auth.googleUnavailable}</Text>}
+      {!available && <Text className="mt-2 text-center text-caption text-ink-muted">{Strings.auth.googleUnavailable}</Text>}
     </View>
   );
 }

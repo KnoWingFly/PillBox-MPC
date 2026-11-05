@@ -6,7 +6,9 @@ from sqlalchemy.orm import DeclarativeBase, MappedColumn, mapped_column
 
 
 class Base(DeclarativeBase):
-    pass
+    # Server-side values (ids, created_at, updated_at onupdate=now()) come back with RETURNING in
+    # the same INSERT/UPDATE, so services never need a refresh() round trip to read them.
+    __mapper_args__ = {"eager_defaults": True}
 
 
 def uuid_pk() -> MappedColumn[Any]:

@@ -8,7 +8,7 @@ PEMANTAU is read-only. A caller with no role on the elderly gets 404 (not
 from collections.abc import Collection
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import forbidden, not_found
@@ -55,15 +55,23 @@ async def get_device_for_user(
     *,
     for_update: bool = False,
 ) -> tuple[Device, Role]:
-    stmt = select(Device).where(Device.id == device_id)
+    # Device and the caller's role in one query (every device route runs this first; each query
+    # is one or two round trips to the remote database).
+    stmt = (
+        select(Device, UserElderlyRole.role, Elderly.id)
+        .outerjoin(
+            UserElderlyRole,
+            and_(UserElderlyRole.elderly_id == Device.elderly_id, UserElderlyRole.user_id == user_id),
+        )
+        .outerjoin(Elderly, and_(Elderly.id == Device.elderly_id, Elderly.deleted_at.is_(None)))
+        .where(Device.id == device_id)
+    )
     if for_update:
-        stmt = stmt.with_for_update()
-    device = (await session.execute(stmt)).scalar_one_or_none()
-    if device is None or device.elderly_id is None:
+        stmt = stmt.with_for_update(of=Device, key_share=True)  # see device_protocol.find_device
+    row = (await session.execute(stmt)).one_or_none()
+    if row is None or row[0].elderly_id is None or row[1] is None or row[2] is None:
         raise not_found(message="Device not found")
-    role = await get_role(session, user_id, device.elderly_id)
-    if role is None:
-        raise not_found(message="Device not found")
+    device, role = row[0], Role(row[1])
     if role not in allowed:
         raise _deny(allowed)
     return device, role

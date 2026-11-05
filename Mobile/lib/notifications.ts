@@ -3,8 +3,10 @@
 // The hook and UI (src/hooks/use-notification-feed.ts) are the same for both.
 
 import {
+  activePillboxDeviceId,
   activePillboxElderlyId,
   deleteBackendNotification,
+  deleteBackendNotificationsForDevice,
   inActiveScope,
   fetchBackendNotifications,
   getMockNotifications,
@@ -13,7 +15,6 @@ import {
   USE_MOCK,
   type BackendFeedTab,
 } from './api';
-import { deleteMyNotificationsWhere } from './devices';
 import {
   compareFeed,
   matchesFilter,
@@ -143,18 +144,14 @@ export async function deleteNotification(id: string): Promise<void> {
 /**
  * Permanently deletes the active pillbox's notifications up to and including `upTo` (the newest
  * one the user saw when confirming), so anything that arrives after the confirmation survives.
- * Other pillboxes' notifications are kept. Backend: one DELETE /notifications/{id} per row; the
- * bulk DELETE /notifications?up_to_created_at has no device filter and would clear every pillbox.
- * TODO(backend-branch): DELETE /notifications?device_id=&up_to_created_at= (handoff item 3).
+ * Other pillboxes' notifications are kept. Backend: one DELETE /notifications?device_id=&up_to_*
+ * (it used to page through the feed and send one DELETE per row).
  */
 export async function clearNotifications(upTo: FeedPosition): Promise<{ deleted: number }> {
   if (!USE_MOCK) {
-    const result = await deleteMyNotificationsWhere(
-      (n) => inActiveScope(n) && isAtOrOlder(n, upTo),
-      activePillboxElderlyId(),
-    );
-    if (result.failed > 0) throw new Error(`${result.failed} notifications could not be deleted`);
-    return { deleted: result.deleted };
+    const deviceId = activePillboxDeviceId();
+    if (!deviceId) return { deleted: 0 };
+    return { deleted: await deleteBackendNotificationsForDevice(deviceId, upTo) };
   }
   await mockDelay();
   if (MOCK_FAIL_DELETES) throw new Error('mock clear failure');

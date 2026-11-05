@@ -65,11 +65,17 @@ BACKEND_ROOT_URL = os.environ.get("PILLCARE_BACKEND_URL", "http://localhost:8000
 BACKEND_BASE_URL = BACKEND_ROOT_URL + "/api/v1"
 # Periodic heartbeat + retry. Events do not wait for it: logging one schedules a sync after
 # SYNC_DEBOUNCE_MS (so an open + close burst goes out as one batch).
-SYNC_INTERVAL_SECONDS = 15
+SYNC_INTERVAL_SECONDS = 15  # until the backend sends heartbeat_interval_seconds
 SYNC_DEBOUNCE_MS = 300
 # Command channel (docs/DEVICE_CONTRACT.md §3); reconnects with capped exponential backoff.
 WS_RECONNECT_MIN_MS = 1_000
 WS_RECONNECT_MAX_MS = 30_000
+# Each reconnect delay is randomized by +/- this fraction, so many pillboxes reconnecting after a
+# backend restart do not all hit it in the same second.
+WS_RECONNECT_JITTER = 0.2
+# Close codes from the backend (docs/DEVICE_CONTRACT.md §3).
+WS_CLOSE_AUTH_FAILED = 4401  # key rejected or rotated: retrying soon cannot help
+WS_CLOSE_REPLACED = 4000  # a newer connection with the same identity took over
 
 
 def device_ws_url(device_code: str) -> str:
@@ -79,6 +85,13 @@ def device_ws_url(device_code: str) -> str:
 # take several seconds; a short timeout would drop responses the server already handled.
 # Retrying before the server finished only re-sends the same events and adds load.
 SYNC_HTTP_TIMEOUT_SECONDS = 40
+# Used until the backend's config (or welcome message) told the device its timezone.
+DEFAULT_DEVICE_TIMEZONE = "Asia/Jakarta"
+# Simulated hardware readings sent in every heartbeat (no real radio or backup battery).
+SIMULATED_WIFI_RSSI_DBM = -50
+SIMULATED_RTC_BACKUP_ACTIVE = True
+# Command ids remembered to answer a re-delivered command with its first ack instead of running it twice.
+COMMAND_DEDUPE_SIZE = 64
 REGISTER_HTTP_TIMEOUT_SECONDS = 30
 
 # Files searched (in order) for PROVISIONING_TOKEN when the "Daftarkan Perangkat"

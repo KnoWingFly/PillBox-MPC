@@ -10,12 +10,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   BackendError,
   backendRequest as backend,
-  deleteBackendNotification,
-  fetchBackendNotifications,
+  deleteBackendNotificationsForDevice,
   getDeviceStatus,
   USE_MOCK,
 } from './api';
-import type { AppNotification } from './types';
 
 export type PillboxRole = 'OWNER' | 'ADMIN' | 'PEMANTAU';
 
@@ -184,24 +182,27 @@ export async function connectPillbox(input: ConnectPillboxInput): Promise<Connec
   const { code, deviceId, mode } = input.check;
   if (mode === 'join') {
     await backend(`/devices/${deviceId}/join`, 'POST', { device_pin: input.pin });
+    // The join answer has no connectivity: ask for it. Pairing succeeds even if the pillbox has
+    // never connected, so the UI can warn.
+    const online = await backend<{ connectivity: 'ONLINE' | 'OFFLINE' }>(`/devices/${deviceId}/status`)
+      .then((s) => s.connectivity === 'ONLINE')
+      .catch(() => null);
+    return { deviceId, joined: true, online };
   } else {
     const elderlyId =
       'id' in input.elderly
         ? input.elderly.id
         : (await backend<{ id: string }>('/elderly', 'POST', { full_name: input.elderly.newName.trim() || 'Lansia' })).id;
     // timezone omitted: the backend uses the caregiver's own timezone from their profile.
-    await backend('/devices', 'POST', {
+    // The answer already carries connectivity (PairDeviceOut), so no status request follows.
+    const paired = await backend<{ connectivity: 'ONLINE' | 'OFFLINE' }>('/devices', 'POST', {
       device_qr_payload: code,
       elderly_id: elderlyId,
       device_nickname: input.nickname.trim() || 'Pillbox Lansia',
       device_pin: input.pin,
     });
+    return { deviceId, joined: false, online: paired.connectivity === 'ONLINE' };
   }
-  // Pairing succeeds even if the pillbox has never connected: report it so the UI can warn.
-  const online = await backend<{ connectivity: 'ONLINE' | 'OFFLINE' }>(`/devices/${deviceId}/status`)
-    .then((s) => s.connectivity === 'ONLINE')
-    .catch(() => null);
-  return { deviceId, joined: mode === 'join', online };
 }
 
 // --- rename -----------------------------------------------------------------------
@@ -217,44 +218,13 @@ export async function renamePillbox(id: string, name: string): Promise<void> {
 // --- remove -----------------------------------------------------------------------
 
 /** Most notifications scanned when deleting by device (100 per page). */
-const MAX_SCAN_PAGES = 30;
-const DELETE_CONCURRENCY = 4;
-
-/**
- * Deletes the CALLER's notifications that `match` (never other caregivers' copies: the backend
- * scopes DELETE /notifications/{id} to the owner). Collects ids first, then deletes, so paging
- * offsets do not shift under the scan.
- * TODO(backend-branch): replace with DELETE /notifications?device_id= (handoff item 3).
- */
-export async function deleteMyNotificationsWhere(
-  match: (n: AppNotification) => boolean,
-  elderlyId: string | null,
-): Promise<{ deleted: number; failed: number }> {
-  const ids: string[] = [];
-  for (let page = 1; page <= MAX_SCAN_PAGES; page++) {
-    const res = await fetchBackendNotifications('ALL', page, 100, elderlyId);
-    ids.push(...res.items.filter(match).map((n) => n.id));
-    if (res.items.length < 100) break;
-  }
-  let deleted = 0;
-  let failed = 0;
-  for (let i = 0; i < ids.length; i += DELETE_CONCURRENCY) {
-    const results = await Promise.allSettled(ids.slice(i, i + DELETE_CONCURRENCY).map(deleteBackendNotification));
-    for (const r of results) {
-      if (r.status === 'fulfilled') deleted++;
-      else failed++;
-    }
-  }
-  return { deleted, failed };
-}
-
 /**
  * Unpairs a pillbox for EVERY caregiver of its elderly profile (OWNER only, server-enforced), then
  * deletes this caregiver's notification history for it.
  * The unpair itself (Backend device_management.unpair) soft-deletes the pillbox's schedules,
  * removes pending doses and clears its PIN and nickname. Notifications are not touched by the
- * backend, so the history purge is a second, best-effort step: `notificationsFailed` > 0 means
- * some rows are left and can be deleted from the Notifikasi tab.
+ * backend, so the history purge is a second, best-effort request (one DELETE for all rows):
+ * `notificationsFailed` > 0 means it failed and the rows can be deleted from the Notifikasi tab.
  * TODO(backend-branch): DELETE /devices/{id}?purge_my_notifications=true (handoff item 5).
  */
 export async function unpairPillbox(
@@ -262,8 +232,9 @@ export async function unpairPillbox(
 ): Promise<{ notificationsDeleted: number; notificationsFailed: number }> {
   if (USE_MOCK) return mockUnsupported();
   await backend(`/devices/${pillbox.id}`, 'DELETE');
-  const purge = await deleteMyNotificationsWhere((n) => n.deviceId === pillbox.id, pillbox.elderlyId).catch(
-    () => ({ deleted: 0, failed: -1 }),
+  const purge = await deleteBackendNotificationsForDevice(pillbox.id).then(
+    (deleted) => ({ deleted, failed: 0 }),
+    () => ({ deleted: 0, failed: 1 }),
   );
   return { notificationsDeleted: purge.deleted, notificationsFailed: purge.failed };
 }

@@ -3,7 +3,7 @@ Field names follow the API List "[Perangkat]" rows; extra fields are additive
 so the existing emulator keeps working. See docs/DEVICE_CONTRACT.md."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -90,7 +90,10 @@ class TelemetryRequest(BaseModel):
     batch_id: str | None = Field(None, max_length=64)
     # True when the batch is a post-reconnect flush of the offline buffer.
     is_offline_flush: bool = False
-    events: list[TelemetryEvent]
+    # An item that is not a valid TelemetryEvent is kept as sent and answered "rejected" with a
+    # reason (services/telemetry.py) instead of failing the whole batch with 422, which would
+    # block the device's outbox behind that one event.
+    events: list[Annotated[TelemetryEvent | Any, Field(union_mode="left_to_right")]]
 
 
 class RejectedEvent(BaseModel):

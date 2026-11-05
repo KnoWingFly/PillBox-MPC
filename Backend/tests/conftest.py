@@ -48,6 +48,9 @@ os.environ.update(
         "LOG_JSON": "false",
         "LOG_LEVEL": "WARNING",
         "COMMAND_ACK_TIMEOUT_SECONDS": "1",
+        # Tests use fixed historic dates (e.g. 2026-09-28); the past-skew rule has its own test.
+        "TELEMETRY_MAX_PAST_SKEW_MINUTES": str(100 * 365 * 24 * 60),
+        "DB_LOCK_TIMEOUT_MS": "1000",
     }
 )
 

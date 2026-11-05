@@ -1,215 +1,99 @@
-import { Link } from 'expo-router';
+import { Link, router } from 'expo-router';
 import { useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import Ionicons from '@expo/vector-icons/Ionicons';
+import { Pressable, Text, View } from 'react-native';
 
+import AuthScreen from '@root/components/auth/auth-screen';
+import CheckboxRow from '@root/components/auth/checkbox-row';
 import FormField from '@root/components/auth/form-field';
 import GoogleSignInButton from '@root/components/auth/google-sign-in-button';
+import LegalLine from '@root/components/auth/legal-line';
+import SessionNotice from '@root/components/auth/session-notice';
+import { Button } from '@/components/pillbox/ui';
+import { DividerLabel } from '@/components/ui/divider-label';
+import { LinkPrompt } from '@/components/ui/link-prompt';
+import { SecurityNote } from '@/components/ui/security-note';
+import { AppConfig } from '@/config';
 import { Strings } from '@/constants/strings';
 import { useAuth } from '@/hooks/use-auth';
-import { errorMessage } from '@/lib/api/error-message';
+import { useAuthSubmit } from '@/hooks/use-auth-submit';
+import { validateSignIn } from '@/lib/auth-form';
+import { resetOnboarding } from '@/lib/onboarding';
 
-type Mode = 'signIn' | 'signUp';
-const E164 = /^\+[1-9]\d{6,14}$/;
+const S = Strings.signIn;
+
+function replayOnboarding() {
+  resetOnboarding();
+  router.replace('/onboarding');
+}
 
 export default function LoginScreen() {
-  const { signIn, signUp, sessionNotice, clearSessionNotice } = useAuth();
-  const [remember, setRemember] = useState(true);
-  const [mode, setMode] = useState<Mode>('signIn');
-  const [fullName, setFullName] = useState('');
+  const { signIn, sessionNotice } = useAuth();
+  const { loading, submit } = useAuthSubmit();
   const [email, setEmail] = useState('');
-  const [phoneNumber, setPhoneNumber] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const t = Strings.auth;
+  const [remember, setRemember] = useState(true);
 
-  function validate(): string | null {
-    if (!email.trim() || !password) return Strings.validation.required;
-    if (mode === 'signIn') return null;
-    if (!fullName.trim() || !phoneNumber.trim()) return Strings.validation.required;
-    if (!E164.test(phoneNumber.trim())) return Strings.validation.phoneFormat;
-    if (password.length < 8) return Strings.validation.passwordTooShort;
-    if (password !== confirmPassword) return Strings.validation.passwordMismatch;
-    return null;
-  }
-
-  async function onSubmit() {
-    const problem = validate();
-    if (problem) return Alert.alert(Strings.common.error, problem);
-
-    setLoading(true);
-    try {
-      clearSessionNotice();
-      if (mode === 'signIn') await signIn(email.trim(), password, remember);
-      else
-        await signUp({
-          full_name: fullName.trim(),
-          email: email.trim(),
-          phone_number: phoneNumber.trim(),
-          password,
-        });
-      // On success the auth gate swaps this screen out.
-    } catch (err) {
-      Alert.alert(Strings.common.error, errorMessage(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function switchMode(next: Mode) {
-    setMode(next);
-    setConfirmPassword('');
-  }
+  const onSubmit = () =>
+    submit(validateSignIn({ email, password }), () => signIn(email.trim(), password, remember));
 
   return (
-    <SafeAreaView className="flex-1 bg-white">
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} className="flex-1">
-        <ScrollView contentContainerClassName="flex-grow justify-center px-6 py-8" keyboardShouldPersistTaps="handled">
-          <View className="mb-8 items-center">
-            <View className="h-16 w-16 bg-blue-500 rounded-2xl items-center justify-center mb-4">
-              <Text className="text-white text-3xl font-bold">P</Text>
-            </View>
-            <Text className="text-3xl font-bold text-gray-900 mb-2 text-center">{t.welcome}</Text>
-            <Text className="text-gray-500 text-center">
-              {mode === 'signIn' ? t.signInSubtitle : t.signUpSubtitle}
-            </Text>
-          </View>
+    <AuthScreen title={S.title} subtitle={S.subtitle}>
+      {sessionNotice && <SessionNotice text={sessionNotice} />}
 
-          {sessionNotice && (
-            <View accessibilityRole="alert" className="flex-row items-start bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-6">
-              <Ionicons name="time-outline" size={18} color="#b45309" style={{ marginTop: 1 }} />
-              <Text className="flex-1 ml-2 text-sm text-amber-800">{sessionNotice}</Text>
-            </View>
-          )}
+      <FormField
+        label={S.email}
+        icon="mail-outline"
+        placeholder={S.emailPlaceholder}
+        autoCapitalize="none"
+        keyboardType="email-address"
+        autoComplete="email"
+        value={email}
+        onChangeText={setEmail}
+        editable={!loading}
+      />
+      <FormField
+        label={S.password}
+        icon="lock-closed-outline"
+        placeholder={S.passwordPlaceholder}
+        secureToggle
+        autoCapitalize="none"
+        autoComplete="current-password"
+        value={password}
+        onChangeText={setPassword}
+        editable={!loading}
+        onSubmitEditing={onSubmit}
+      />
 
-          {/* Segmented control: Daftar | Masuk */}
-          <View className="flex-row bg-gray-100 rounded-xl p-1 mb-6">
-            {(['signUp', 'signIn'] as const).map((m) => (
-              <TouchableOpacity
-                key={m}
-                onPress={() => switchMode(m)}
-                disabled={loading}
-                accessibilityRole="tab"
-                accessibilityState={{ selected: mode === m }}
-                // Keep the class list structurally identical between states: toggling classes that use
-                // CSS variables (e.g. shadow-*) at runtime crashes NativeWind's component upgrade.
-                className={`flex-1 py-2.5 rounded-lg items-center border ${mode === m ? 'bg-white border-gray-200' : 'bg-transparent border-transparent'}`}>
-                <Text className={`font-semibold ${mode === m ? 'text-gray-900' : 'text-gray-500'}`}>
-                  {m === 'signUp' ? t.tabSignUp : t.tabSignIn}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+      <View className="mb-4 flex-row items-center justify-between gap-2">
+        <CheckboxRow
+          checked={remember}
+          onToggle={() => setRemember((v) => !v)}
+          disabled={loading}
+          label={<Text className="text-body-sm text-ink">{Strings.auth.rememberMe}</Text>}
+          accessibilityLabel={Strings.auth.rememberMe}
+          accessibilityHint={Strings.auth.rememberMeHint}
+        />
+        <Link href="/auth/forgot-password" asChild>
+          <Pressable disabled={loading} accessibilityRole="link" className="min-h-[44px] justify-center active:opacity-75">
+            <Text className="text-body-sm font-bold text-primary">{S.forgotPassword}</Text>
+          </Pressable>
+        </Link>
+      </View>
 
-          {mode === 'signUp' && (
-            <FormField
-              label={t.fullName}
-              placeholder={t.fullNamePlaceholder}
-              autoCapitalize="words"
-              autoComplete="name"
-              value={fullName}
-              onChangeText={setFullName}
-              editable={!loading}
-            />
-          )}
-          <FormField
-            label={t.email}
-            placeholder={t.emailPlaceholder}
-            autoCapitalize="none"
-            keyboardType="email-address"
-            autoComplete="email"
-            value={email}
-            onChangeText={setEmail}
-            editable={!loading}
-          />
-          {mode === 'signUp' && (
-            <FormField
-              label={t.phoneNumber}
-              placeholder={t.phoneNumberPlaceholder}
-              keyboardType="phone-pad"
-              autoComplete="tel"
-              value={phoneNumber}
-              onChangeText={setPhoneNumber}
-              editable={!loading}
-            />
-          )}
-          <FormField
-            label={t.password}
-            placeholder={t.passwordPlaceholder}
-            secureToggle
-            autoCapitalize="none"
-            autoComplete={mode === 'signIn' ? 'current-password' : 'new-password'}
-            value={password}
-            onChangeText={setPassword}
-            editable={!loading}
-          />
-          {mode === 'signUp' && (
-            <FormField
-              label={t.confirmPassword}
-              placeholder={t.confirmPasswordPlaceholder}
-              secureToggle
-              autoCapitalize="none"
-              autoComplete="new-password"
-              value={confirmPassword}
-              onChangeText={setConfirmPassword}
-              editable={!loading}
-            />
-          )}
-
-          {mode === 'signIn' && (
-            <View className="flex-row items-center justify-between mb-2">
-              <TouchableOpacity
-                onPress={() => setRemember((v) => !v)}
-                disabled={loading}
-                accessibilityRole="checkbox"
-                accessibilityState={{ checked: remember, disabled: loading }}
-                accessibilityHint={t.rememberMeHint}
-                hitSlop={8}
-                className="flex-row items-center">
-                <Ionicons name={remember ? 'checkbox' : 'square-outline'} size={22} color={remember ? '#2563eb' : '#6b7280'} />
-                <Text className="ml-2 text-sm text-gray-700">{t.rememberMe}</Text>
-              </TouchableOpacity>
-              <Link href="/auth/forgot-password" asChild>
-                <TouchableOpacity disabled={loading}>
-                  <Text className="text-sm font-medium text-blue-600">{t.forgotPasswordLink}</Text>
-                </TouchableOpacity>
-              </Link>
-            </View>
-          )}
-
-          <TouchableOpacity
-            onPress={onSubmit}
-            disabled={loading}
-            className={`w-full bg-blue-600 rounded-xl py-4 items-center justify-center mt-2 ${loading ? 'opacity-70' : ''}`}>
-            {loading ? (
-              <ActivityIndicator color="white" />
-            ) : (
-              <Text className="text-white font-semibold text-lg">
-                {mode === 'signIn' ? t.submitSignIn : t.submitSignUp}
-              </Text>
-            )}
-          </TouchableOpacity>
-
-          <View className="flex-row items-center my-6">
-            <View className="flex-1 h-[1px] bg-gray-200" />
-            <Text className="mx-4 text-gray-500 font-medium">{t.or}</Text>
-            <View className="flex-1 h-[1px] bg-gray-200" />
-          </View>
-
-          <GoogleSignInButton disabled={loading} remember={mode === 'signIn' ? remember : true} />
-        </ScrollView>
-      </KeyboardAvoidingView>
-    </SafeAreaView>
+      <View className="gap-5">
+        <Button label={S.submit} onPress={onSubmit} loading={loading} />
+        <DividerLabel label={S.divider} />
+        <GoogleSignInButton disabled={loading} remember={remember} />
+        <LinkPrompt question={S.noAccount} link={S.signUpLink} onPress={() => router.push('/auth/register')} />
+        <SecurityNote text={S.encrypted} />
+        <LegalLine
+          centered
+          parts={{ prefix: S.legalPrefix, terms: S.terms, join: S.legalJoin, privacy: S.privacy, suffix: S.legalSuffix }}
+        />
+        {AppConfig.showDebugTools && (
+          <Button label={S.debugOnboarding} icon="bug-outline" variant="secondary" size="sm" onPress={replayOnboarding} />
+        )}
+      </View>
+    </AuthScreen>
   );
 }

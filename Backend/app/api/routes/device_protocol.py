@@ -31,7 +31,7 @@ async def heartbeat(
 @router.get(
     "/{device_id}/config",
     response_model=ConfigResponse,
-    responses={304: {"description": "since_version is already the latest"}},
+    responses={304: {"description": "since_version is the latest"}},
 )
 async def get_config(
     device: AuthenticatedDevice,
@@ -40,7 +40,9 @@ async def get_config(
 ) -> ConfigResponse | Response:
     await mark_seen(db, device, datetime.now(UTC))
     await db.commit()
-    if since_version is not None and since_version >= device.config_version:
+    # Only an exact match is current: a since_version above the latest was never issued
+    # (stale device state), so the device gets the full config and re-syncs.
+    if since_version is not None and since_version == device.config_version:
         return Response(status_code=status.HTTP_304_NOT_MODIFIED)
     return await device_protocol.build_config(db, device)
 

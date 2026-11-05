@@ -251,7 +251,9 @@ class PillboxScheduler:
             
             # Estimate chime count (assume 1 chime per second, up to 60 per minute)
             elapsed_seconds = (now - compartment.activated_at).total_seconds()
-            chimes = int(elapsed_seconds / 2) # approx 1 every 2 seconds
+            # Never negative: the RTC may have been set back while the chamber was up, and the
+            # backend rejects a negative chime_count.
+            chimes = max(0, int(elapsed_seconds / 2))  # approx 1 every 2 seconds
             
             self.db.log_event(compartment_id, compartment.slot_number, "COMPARTMENT_OPENED", now, chime_count=chimes)
             

@@ -51,12 +51,41 @@ export const AppConfig = {
   /** Refresh the access token this long before its `exp` (ms), so a request never starts with a dead token. */
   tokenRefreshSkewMs: 30_000,
 
+  /**
+   * How long the pillbox rings for "Bunyikan Alarm" and "Tes Pengingat" (seconds; the backend
+   * accepts 5-600). While it rings the app offers "Hentikan Alarm".
+   */
+  alarmDurationSeconds: 60,
+  testAlarmDurationSeconds: 10,
+
   /** Sachets per compartment; keep equal to the backend's STOCK_CAPACITY_PER_SLOT. */
   slotCapacity: intFromEnv(process.env.EXPO_PUBLIC_SLOT_CAPACITY, 30, 1),
   /** Placeholder phone number for the "call" action until elderly profiles carry one. */
   elderPhone: process.env.EXPO_PUBLIC_ELDER_PHONE || '+620000000000',
   /** Used when the device reports no IANA timezone. */
   fallbackTimezone: 'Asia/Jakarta',
+
+  /** Elderly profile limits; keep equal to the backend's ELDERLY_NAME_MIN_LENGTH / ELDERLY_MAX_AGE_YEARS. */
+  elderlyNameMinLength: 2,
+  elderlyNameMaxLength: 100,
+  elderlyMaxAgeYears: 120,
+  /** Where the birth-date picker opens when nothing is picked yet (a typical elderly age). */
+  elderlyPickerDefaultAgeYears: 70,
+  /**
+   * Indonesian phone numbers: country code and the national digit count (after 0 / 62 / +62).
+   * Client-only UX rule; the backend accepts any E.164 number.
+   */
+  phoneCountryCode: '62',
+  phoneNationalMinDigits: 9,
+  phoneNationalMaxDigits: 13,
+
+  /** Account password length; keep equal to the auth server's rule in src/server/schemas.ts. */
+  passwordMinLength: 8,
+  passwordMaxLength: 72,
+  /** Startup takes longer than this (ms) = the loading screen explains it is waiting for the server. */
+  slowLoadingHintMs: intFromEnv(process.env.EXPO_PUBLIC_SLOW_LOADING_HINT_MS, 3_000, 0),
+  /** Show developer shortcuts (e.g. "replay onboarding" on the sign-in screen). Dev builds only. */
+  showDebugTools: __DEV__,
 
   /** true = log "[perf]" timing lines (see src/lib/perf.ts). */
   perfTimingLogs: process.env.EXPO_PUBLIC_PERF_TIMING_LOGS === 'true',

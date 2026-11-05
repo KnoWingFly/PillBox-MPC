@@ -30,7 +30,7 @@ from app.core.config import Settings
 from app.models import Device, Elderly, Notification
 from app.models.enums import Connectivity, NotificationType, Severity
 from app.services.app_hub import queue_device_change
-from app.services.notifications import NotificationSpec, load_recipients, notify, ts_key
+from app.services.notifications import NotificationSpec, load_recipients_many, notify, ts_key
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ async def mark_seen(session: AsyncSession, device: Device, now: datetime) -> boo
     """Records a liveness signal. Returns True on an OFFLINE -> ONLINE transition.
     Locks the device row (unless this transaction already did); does not commit."""
     if session.info.get(_LOCKED_DEVICE_KEY) != device.id:
-        await session.refresh(device, with_for_update=True)
+        await session.refresh(device, with_for_update={"key_share": True})  # see find_device
         mark_row_locked(session, device)
     device.last_heartbeat = now
     if device.status == Connectivity.ONLINE:
@@ -153,12 +153,15 @@ async def sweep(session: AsyncSession, now: datetime, settings: Settings) -> Non
             Elderly.deleted_at.is_(None),
         )
     )
-    for device in candidates.scalars().all():
+    devices = candidates.scalars().all()
+    # One recipients query per sweep instead of one per offline device.
+    recipients_by_elderly = await load_recipients_many(session, {d.elderly_id for d in devices if d.elderly_id})
+    for device in devices:
         offline_since = device.offline_since
         elderly_id = device.elderly_id
         if offline_since is None or elderly_id is None:
             continue
-        recipients = await load_recipients(session, elderly_id)
+        recipients = recipients_by_elderly.get(elderly_id, [])
         due = {
             r.user_id
             for r in recipients

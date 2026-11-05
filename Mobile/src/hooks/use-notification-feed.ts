@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import * as api from '@root/lib/api';
+import { markAllNotificationsRead } from '@root/lib/insights';
 import {
   clearNotifications,
   compareFeed,
@@ -212,6 +213,13 @@ export function useNotificationFeed({ onArrive }: { onArrive?: (n: AppNotificati
     markNotificationRead(id).catch(() => undefined);
   };
 
+  /** "Tandai dibaca" for everything; optimistic, the next refresh shows the real state. */
+  const markAllRead = () => {
+    setItems((prev) => prev.map((n) => (n.read ? n : { ...n, read: true })));
+    setUnreadCount(0);
+    markAllNotificationsRead().catch(() => undefined);
+  };
+
   return {
     filter,
     setFilter,
@@ -229,5 +237,6 @@ export function useNotificationFeed({ onArrive }: { onArrive?: (n: AppNotificati
     remove,
     clearAll,
     markRead,
+    markAllRead,
   };
 }

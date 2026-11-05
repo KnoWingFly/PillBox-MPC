@@ -5,7 +5,7 @@ Caregiver mobile app + cloud backend + emulated smart pillbox. The elderly perso
 ## Monorepo
 | Folder | Role | Stack | Guide |
 |---|---|---|---|
-| `Mobile/` | PillCare caregiver app + auth server (Expo API routes) | Expo SDK 57, TypeScript, Expo Router, NativeWind, Prisma, Supabase Auth (Google only), pnpm | `Mobile/CLAUDE.md` |
+| `Mobile/` | PillCare caregiver app + auth server (Expo API routes) | Expo SDK 58, TypeScript, Expo Router, NativeWind, Prisma, Supabase Auth (Google only), pnpm | `Mobile/CLAUDE.md` |
 | `Backend/` | REST + WebSocket API, rules engine | Python 3.11+, FastAPI, uv, SQLAlchemy async + asyncpg, Supabase Postgres | `Backend/CLAUDE.md` |
 | `SmartDevice/` | Smart Pillbox emulator (no real hardware) | Python 3.11+, PySide6, SQLite, pip + venv (`requirements.txt`) | `SmartDevice/CLAUDE.md` |
 

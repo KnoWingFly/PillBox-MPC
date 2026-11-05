@@ -88,14 +88,17 @@ def test_missed_after_tolerance_window_expires(tmp_path):
     assert scheduler.active_chamber_id is None
 
 
-def test_interact_ignored_when_not_active(tmp_path):
+def test_opening_a_chamber_that_is_not_active_is_an_unscheduled_open(tmp_path):
+    """SmartDevice/CLAUDE.md: opening any chamber that is not the ACTIVE one logs UNSCHEDULED_OPEN
+    (the backend raises a critical alert); the chamber's dose state does not change."""
     scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 0))
     compartment = next(iter(scheduler.compartments.values()))
 
     scheduler.interact(compartment.id)  # never activated
 
     assert compartment.state == ChamberState.IDLE
-    assert scheduler.db.get_unsynced_events() == []
+    events = scheduler.db.get_unsynced_events()
+    assert [(e["event_type"], e["slot_number"]) for e in events] == [("UNSCHEDULED_OPEN", compartment.slot_number)]
 
 
 def _take_slot_one_at_seven(tmp_path):
@@ -266,3 +269,20 @@ def test_release_late_refuses_while_another_chamber_is_active(tmp_path):
     assert scheduler.active_chamber_id == other.id
 
     assert scheduler.release_late(1, datetime(2026, 1, 1, 9, 15)) is not None
+
+
+def test_opening_after_the_clock_moved_back_logs_no_negative_chime_count(tmp_path):
+    """The backend rejects chime_count < 0; it used to go negative when the RTC was set back
+    while a chamber was up (time_sync, "Sync Jam Nyata")."""
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 59))
+    compartment = next(iter(scheduler.compartments.values()))
+    compartment.schedule_time = "07:00"
+    scheduler.clock.jump(timedelta(minutes=2))
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+
+    scheduler.clock.jump(timedelta(minutes=-1))
+    scheduler.interact(compartment.id)
+
+    opened = [e for e in scheduler.db.get_unsynced_events() if e["event_type"] == "COMPARTMENT_OPENED"]
+    assert opened and opened[-1]["chime_count"] == 0

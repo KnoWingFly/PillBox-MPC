@@ -39,6 +39,7 @@ from app.schemas.devices import (
 )
 from app.services import stock_cache
 from app.services.access import get_device_for_user, require_role
+from app.services.app_hub import queue_roles_changed
 from app.services.connection_manager import (
     CommandAck,
     CommandError,
@@ -54,6 +55,9 @@ from app.services.slots import SLOT_NUMBERS, all_slots
 from app.services.timeutil import as_aware, is_valid_timezone, zone
 
 logger = logging.getLogger(__name__)
+
+# `reason` sent with alarm commands started from the app (docs/DEVICE_CONTRACT.md §3).
+ALARM_REASON_CAREGIVER = "caregiver_request"
 
 _PIN = re.compile(r"^\d{4}$")
 
@@ -218,8 +222,12 @@ async def pair(
 ) -> PairDeviceOut:
     check_pin_format(body.device_pin)
     code = parse_qr_payload(body.device_qr_payload)
+    # scrypt takes tens of ms: hash before taking the row lock, with no transaction (and so no
+    # pooled connection) held. The caller's user lookup opened one; nothing was written yet.
+    await session.commit()
+    pin_hash = await asyncio.to_thread(hash_pin, body.device_pin)
     device = (
-        await session.execute(select(Device).where(Device.device_code == code).with_for_update())
+        await session.execute(select(Device).where(Device.device_code == code).with_for_update(key_share=True))
     ).scalar_one_or_none()
     if device is None:
         raise not_found("QR_CODE_NOT_RECOGNIZED", "QR code is not a known PillCare device")
@@ -234,7 +242,7 @@ async def pair(
     device.elderly_id = body.elderly_id
     device.device_nickname = body.device_nickname
     device.timezone = timezone
-    device.device_pin_hash = await asyncio.to_thread(hash_pin, body.device_pin)
+    device.device_pin_hash = pin_hash
     device.pin_updated_at = now
     device.paired_at = now
     device.is_refill_mode = False
@@ -265,6 +273,7 @@ async def join(
     device = await session.get(Device, device_id)
     if device is None or device.elderly_id is None:
         raise not_found(message="Device not found")
+    await session.commit()  # read only so far: hold no pooled connection during the slow PIN check
     await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT")
     elderly_id = device.elderly_id
     existing = (
@@ -280,6 +289,7 @@ async def join(
         )
     role = UserElderlyRole(user_id=user.id, elderly_id=elderly_id, role=Role.PEMANTAU.value, created_at=now)
     session.add(role)
+    queue_roles_changed(session, user.id)
     await session.commit()
     logger.info("caregiver_joined_device", extra={"device_id": str(device.id), "user_id": str(user.id)})
     return JoinDeviceOut(device_id=device.id, elderly_id=elderly_id, my_role=Role.PEMANTAU, joined_at=now)
@@ -288,10 +298,18 @@ async def join(
 async def change_pin(
     session: AsyncSession, user: User, device_id: UUID, current: str, new: str, settings: Settings, now: datetime
 ) -> datetime:
-    device, _ = await get_device_for_user(session, user.id, device_id, {Role.OWNER}, for_update=True)
+    device, _ = await get_device_for_user(session, user.id, device_id, {Role.OWNER})
     check_pin_format(new)
+    checked_hash = device.device_pin_hash
+    # Both scrypt calls run with no transaction or row lock held; the row is locked only to write.
+    await session.commit()
     await _check_pin(user.id, device, current, settings, "CURRENT_PIN_INCORRECT")
-    device.device_pin_hash = await asyncio.to_thread(hash_pin, new)
+    new_hash = await asyncio.to_thread(hash_pin, new)
+    await session.refresh(device, with_for_update={"key_share": True})
+    if device.device_pin_hash != checked_hash:
+        # The PIN changed meanwhile (another request): check against the PIN now in force.
+        await _check_pin(user.id, device, current, settings, "CURRENT_PIN_INCORRECT")
+    device.device_pin_hash = new_hash
     device.pin_updated_at = now
     await session.commit()
     return now
@@ -386,7 +404,6 @@ async def update_settings(
     if config_changed:
         await bump_config(session, device)
     await session.commit()
-    await session.refresh(device)
     if config_changed:
         await notify_config_changed(device.id, device.config_version)
     assert device.elderly_id is not None
@@ -463,8 +480,8 @@ async def calibrate(
     session: AsyncSession, user: User, device_id: UUID, pin: str, settings: Settings, now: datetime
 ) -> tuple[Device, CommandAck]:
     device, _ = await get_device_for_user(session, user.id, device_id, EDITOR_ROLES)
+    await session.commit()  # end the read transaction before the PIN check and the device wait
     await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT")
-    await session.commit()  # end the read transaction before waiting on the device
     ack = await send_command_or_raise(
         device,
         DeviceCommand.TIME_SYNC,
@@ -478,7 +495,7 @@ async def calibrate(
         except ValueError:
             device_time = None
         if device_time is not None:
-            await session.refresh(device, with_for_update=True)
+            await session.refresh(device, with_for_update={"key_share": True})
             device.rtc_time = device_time
             device.rtc_reported_at = ack.acked_at
             device.rtc_speed = 1.0  # time_sync also puts the emulator's lab clock back to 1x
@@ -489,21 +506,36 @@ async def calibrate(
 async def trigger_alarm(
     session: AsyncSession, user: User, device_id: UUID, slot_number: int | None, duration_seconds: int, settings: Settings
 ) -> CommandResultOut:
+    payload = {"slot_number": slot_number, "duration_seconds": duration_seconds, "reason": ALARM_REASON_CAREGIVER}
+    return await _alarm_command(session, user, device_id, DeviceCommand.TRIGGER_ALARM, payload, settings)
+
+
+async def stop_alarm(session: AsyncSession, user: User, device_id: UUID, settings: Settings) -> CommandResultOut:
+    """Silences an alarm a caregiver started (trigger_alarm). A dose reminder keeps ringing:
+    the device ignores stop_alarm for it (docs/DEVICE_CONTRACT.md §3)."""
+    payload = {"reason": ALARM_REASON_CAREGIVER}
+    return await _alarm_command(session, user, device_id, DeviceCommand.STOP_ALARM, payload, settings)
+
+
+async def _alarm_command(
+    session: AsyncSession,
+    user: User,
+    device_id: UUID,
+    command: DeviceCommand,
+    payload: dict[str, Any],
+    settings: Settings,
+) -> CommandResultOut:
+    """OWNER/ADMIN; succeeds only after the device acks (errors: command_error_to_app_error)."""
     started = timing.now_ms()
-    timing.log_timing("app_to_iot", "backend_received", command=DeviceCommand.TRIGGER_ALARM.value)
+    timing.log_timing("app_to_iot", "backend_received", command=command.value)
     device, _ = await get_device_for_user(session, user.id, device_id, EDITOR_ROLES)
     await session.commit()  # do not hold a transaction while waiting for the ack
     timing.log_timing("app_to_iot", "access_checked", db_ms=timing.since_ms(started))
-    ack = await send_command_or_raise(
-        device,
-        DeviceCommand.TRIGGER_ALARM,
-        {"slot_number": slot_number, "duration_seconds": duration_seconds, "reason": "caregiver_request"},
-        settings,
-    )
-    logger.info("alarm_triggered", extra={"device_id": str(device.id), "user_id": str(user.id)})
+    ack = await send_command_or_raise(device, command, payload, settings)
+    logger.info("alarm_command", extra={"device_id": str(device.id), "user_id": str(user.id), "command": command.value})
     return CommandResultOut(
         device_id=device.id,
-        command=DeviceCommand.TRIGGER_ALARM.value,
+        command=command.value,
         command_id=ack.command_id,
         acknowledged=True,
         acked_at=ack.acked_at,

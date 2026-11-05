@@ -135,6 +135,21 @@ async def trigger_alarm(
     return await svc.trigger_alarm(db, user, device_id, body.slot_number, body.duration_seconds, settings)
 
 
+@router.delete(
+    "/{device_id}/alarm",
+    response_model=CommandResultOut,
+    responses={
+        409: {"description": "DEVICE_OFFLINE or DEVICE_COMMAND_CHANNEL_UNAVAILABLE"},
+        502: {"description": "DEVICE_DISCONNECTED or DEVICE_REJECTED_COMMAND"},
+        504: {"description": "DEVICE_ACK_TIMEOUT"},
+    },
+)
+async def stop_alarm(device_id: UUID, user: CurrentUser, db: DbSession, settings: SettingsDep) -> CommandResultOut:
+    """Stops an alarm a caregiver started (OWNER/ADMIN); dose reminders keep ringing.
+    Succeeds only after the device acks."""
+    return await svc.stop_alarm(db, user, device_id, settings)
+
+
 @router.get("/{device_id}/events", response_model=DeviceEventPage)
 async def device_events(device_id: UUID, user: CurrentUser, db: DbSession, pagination: PaginationDep) -> DeviceEventPage:
     """Raw device event log (debugging / audit), newest first."""

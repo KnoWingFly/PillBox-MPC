@@ -2,19 +2,23 @@
 
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from collections.abc import Iterator
 from typing import Any
 
 import asyncpg
 import httpx
+import jwt
 import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.core.config import get_settings
 from app.db.session import get_sessionmaker
 from app.main import app
 from app.services.app_hub import AppConnection, app_hub, queue_device_change, queue_notifications
+from app.services.connection_manager import WS_CLOSE_AUTH_FAILED
+from tests.constants import TEST_JWT_SECRET
 from tests.helpers import API, create_caregiver, create_schedule, event, paired_device, send_telemetry
 
 DAY = "2026-09-30"
@@ -30,9 +34,9 @@ class _FakeSocket:
 
 @pytest.fixture(autouse=True)
 def _clean_hub() -> Iterator[None]:
-    app_hub._connections.clear()
+    app_hub.clear()
     yield
-    app_hub._connections.clear()
+    app_hub.clear()
 
 
 async def _drain() -> None:
@@ -176,3 +180,104 @@ async def test_app_socket_auth(db: asyncpg.Connection) -> None:
     ready, bad_code = await asyncio.to_thread(_connect)
     assert ready == {"type": "ready"}
     assert bad_code == 4401
+
+
+async def test_unchanged_heartbeat_status_is_throttled(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """A heartbeat that changes only last_seen_at is not fanned out to every follower again;
+    a real change (battery) is pushed at once."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    socket = _FakeSocket()
+    app_hub.register(AppConnection(owner.id, {uuid.UUID(device.elderly_id)}, socket))  # type: ignore[arg-type]
+
+    await _heartbeat(client, device, battery=80, stock=5)
+    await _drain()
+    first = len(socket.sent)
+    await _heartbeat(client, device, battery=80, stock=5)
+    await _drain()
+    assert len(socket.sent) == first
+    await _heartbeat(client, device, battery=79, stock=5)
+    await _drain()
+    assert len(socket.sent) == first + 1 and socket.sent[-1]["status"]["battery_percent"] == 79
+
+
+async def test_pushes_reach_only_followers_and_follow_resubscribe(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    follower, stranger = _FakeSocket(), _FakeSocket()
+    follower_conn = AppConnection(owner.id, set(), follower)  # type: ignore[arg-type]
+    app_hub.register(follower_conn)
+    app_hub.register(AppConnection(uuid.uuid4(), set(), stranger))  # type: ignore[arg-type]
+
+    await _heartbeat(client, device, battery=60, stock=5)
+    await _drain()
+    assert follower.sent == [] and stranger.sent == []
+
+    app_hub.set_elderly(follower_conn, {uuid.UUID(device.elderly_id)})
+    await _heartbeat(client, device, battery=59, stock=5)
+    await _drain()
+    assert [m["type"] for m in follower.sent] == ["device"] and stranger.sent == []
+
+
+async def test_a_socket_that_does_not_read_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StuckSocket(_FakeSocket):
+        closed = False
+
+        async def send_json(self, message: dict[str, Any]) -> None:
+            await asyncio.sleep(3600)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(get_settings(), "app_ws_send_timeout_seconds", 0.01)
+    stuck = _StuckSocket()
+    conn = AppConnection(uuid.uuid4(), set(), stuck)  # type: ignore[arg-type]
+    app_hub.register(conn)
+
+    await app_hub.publish({conn.user_id: [{"id": "n1"}]}, [])
+
+    assert stuck.closed and conn not in app_hub._connections
+
+
+async def test_removed_caregiver_stops_receiving_device_pushes(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    """Roles are re-read after the commit that changes them; the app does not have to resubscribe."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    viewer = await create_caregiver(db, "Viewer")
+    joined = await client.post(f"{API}/devices/{device.id}/join", json={"device_pin": device.pin}, headers=viewer.headers)
+    assert joined.status_code == 200
+    socket = _FakeSocket()
+    app_hub.register(AppConnection(viewer.id, {uuid.UUID(device.elderly_id)}, socket))  # type: ignore[arg-type]
+
+    res = await client.delete(f"{API}/elderly/{device.elderly_id}/caregivers/{viewer.id}", headers=owner.headers)
+    assert res.status_code == 204, res.text
+    await _drain()
+    await _heartbeat(client, device, battery=55, stock=5)
+    await _drain()
+
+    assert [m for m in socket.sent if m["type"] == "device"] == []
+
+
+async def test_app_socket_closes_when_the_access_token_expires(db: asyncpg.Connection) -> None:
+    """The token is not trusted past its exp; the app reconnects with a refreshed one."""
+    owner = await create_caregiver(db, "Owner")
+    now = datetime.now(UTC)
+    claims = {"sub": str(owner.id), "iat": now, "exp": now + timedelta(seconds=1)}
+    token = jwt.encode(claims, TEST_JWT_SECRET, algorithm="HS256")
+
+    def _connect() -> tuple[str, int | None]:
+        with TestClient(app).websocket_connect("/ws/app") as ws:
+            ws.send_json({"type": "auth", "token": token})
+            ready = ws.receive_json()["type"]
+            try:
+                ws.receive_json()
+            except WebSocketDisconnect as exc:
+                return ready, exc.code
+        return ready, None
+
+    ready, code = await asyncio.to_thread(_connect)
+    assert ready == "ready" and code == WS_CLOSE_AUTH_FAILED

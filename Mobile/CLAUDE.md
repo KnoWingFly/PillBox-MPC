@@ -1,10 +1,10 @@
 # Mobile — PillCare caregiver app + auth server
 
-Expo SDK 57, React Native 0.86, React 19, TypeScript (strict), Expo Router (typed routes, React Compiler on), NativeWind 4 + Tailwind 3, pnpm, Prisma 6 (server code only), Supabase Auth (Google SSO only), zod. Caregiver-only: elderly never use this app. app.json scheme: `pillcareapp`.
+Expo SDK 58, React Native 0.88, React 19.3, TypeScript (strict), Expo Router (typed routes, React Compiler on), NativeWind 4 + Tailwind 3, pnpm, Prisma 6 (server code only), Supabase Auth (Google SSO only), zod. Caregiver-only: elderly never use this app. app.json scheme: `pillcareapp`.
 Read `docs/ai/domain.md` before changing anything about roles, doses, schedules or notifications. Open backend work that the app already expects: `Mobile/BACKEND_HANDOFF.md`.
 
 ## Expo changes every SDK: do not trust memory
-Before touching an Expo or React Native API, read the version in `package.json` and check the versioned docs (`https://docs.expo.dev/versions/v57.0.0/`, index at `https://docs.expo.dev/llms.txt`). Add packages with `pnpm exec expo install <pkg>` (picks SDK-compatible versions), never plain `pnpm add`. `ios/` and `android/` are generated (CNG): configure native behavior in `app.json` and config plugins only. Libraries with native code need a development build, not Expo Go (Google sign-in already does).
+Before touching an Expo or React Native API, read the version in `package.json` and check the versioned docs (`https://docs.expo.dev/versions/v58.0.0/`, index at `https://docs.expo.dev/llms.txt`). Add packages with `pnpm exec expo install <pkg>` (picks SDK-compatible versions), never plain `pnpm add`. `ios/` and `android/` are generated (CNG): configure native behavior in `app.json` and config plugins only. Libraries with native code need a development build, not Expo Go (Google sign-in already does).
 
 ## Two runtimes in one folder
 1. **App (React Native)**: screens, components, hooks. No secrets, no Prisma, no direct Supabase table access (RLS is on with no policies).

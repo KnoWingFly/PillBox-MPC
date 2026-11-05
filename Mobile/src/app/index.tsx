@@ -4,6 +4,7 @@
 // One screen with four sections (Beranda, Jadwal, Notifikasi, Perangkat) swapped by a bottom tab
 // bar. State lives here so the sections share it (e.g. an unsaved schedule survives a tab switch).
 
+import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, BackHandler, Linking, Modal, View } from 'react-native';
@@ -11,7 +12,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppConfig } from '@/config';
 import { ConnectPillboxScreen } from '@/components/pillbox/connect-card';
-import { PillboxListCard, PillboxSwitcher, RenamePillboxDialog } from '@/components/pillbox/device-list';
+import { TopBar } from '@/components/pillbox/blocks';
+import { PillboxListCard, RenamePillboxDialog } from '@/components/pillbox/device-list';
 import { DeviceTab } from '@/components/pillbox/device-tab';
 import { deviceLook, isDraftDirty, isSlotActive, notificationLook, pillboxNow, type ToastTone } from '@/components/pillbox/helpers';
 import { HomeTab } from '@/components/pillbox/home-tab';
@@ -19,17 +21,22 @@ import { NotificationsTab, type DoseActionBusy } from '@/components/pillbox/noti
 import { ConfirmDialog, type ConfirmRequest } from '@/components/pillbox/dialog';
 import { PinPrompt } from '@/components/pillbox/pin-prompt';
 import { ScheduleTab } from '@/components/pillbox/schedule-tab';
+import { SettingsTab } from '@/components/pillbox/settings-tab';
+import { BackHeader } from '@/components/ui/back-header';
 import { TabBar, type TabKey } from '@/components/pillbox/tab-bar';
 import { makeToast, Toast, type ToastData } from '@/components/pillbox/toast';
 import { LoadErrorBox } from '@/components/pillbox/ui';
 import * as tokens from '@/theme/tokens';
 import { useAuth } from '@/hooks/use-auth';
+import { useDashboardInsights } from '@/hooks/use-dashboard-insights';
+import { Strings } from '@/constants/strings';
 import { useNotificationFeed } from '@/hooks/use-notification-feed';
+import { usePillboxAlarm } from '@/hooks/use-pillbox-alarm';
 import { perfLog, perfLoginStep } from '@/lib/perf';
 import { DevicesProvider, useDevices } from '@root/context/devices-context';
 import * as api from '@root/lib/api';
-import type { ConnectPillboxResult, Pillbox } from '@root/lib/devices';
-import { fetchNotificationPage, NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
+import { canEdit, type ConnectPillboxResult, type Pillbox } from '@root/lib/devices';
+import { NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
 import { findAllConflicts } from '@root/lib/schedule-time';
 import type {
   AdherenceSummary,
@@ -40,8 +47,6 @@ import type {
   Slot,
   SlotId,
 } from '@root/lib/types';
-
-const RECENT_COUNT = 3;
 
 /** The active pillbox no longer exists for this account (unpaired here or by another caregiver). */
 function pillboxGone(err: unknown): boolean {
@@ -122,6 +127,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const [selectedSlotId, setSelectedSlotId] = useState<SlotId | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const pillboxAlarm = usePillboxAlarm();
 
   const [alarmBusyId, setAlarmBusyId] = useState<string | null>(null);
   const [doseActionBusy, setDoseActionBusy] = useState<DoseActionBusy>(null);
@@ -132,7 +138,14 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [adherence, setAdherence] = useState<AdherenceSummary | null>(null);
-  const [recent, setRecent] = useState<AppNotification[]>([]);
+
+  const router = useRouter();
+  // Today's doses, weekly chart, elderly profile, clock and preferences; days follow the pillbox clock.
+  const insights = useDashboardInsights(pillboxNow(device, now), !needsPairing);
+  const refreshDoses = insights.refreshDoses;
+  const [remindBusy, setRemindBusy] = useState(false);
+  const [calibrateOpen, setCalibrateOpen] = useState(false);
+  const [calibrateBusy, setCalibrateBusy] = useState(false);
 
   const [simSlotId, setSimSlotId] = useState<SlotId | null>(null);
   const [minutesLate, setMinutesLate] = useState(25);
@@ -146,23 +159,18 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       .catch(() => {});
   }, []);
 
-  /** The few newest notifications (any type) shown on Beranda. */
-  const refreshRecent = useCallback(() => {
-    fetchNotificationPage({ filter: 'all', cursor: null, limit: RECENT_COUNT })
-      .then((page) => setRecent(page.items))
-      .catch(() => {});
-  }, []);
-
   // New notifications trigger the banner; dose events also change adherence.
   const handleArrive = useCallback(
     (n: AppNotification) => {
       perfLog('iot_to_app', 'shown_on_screen', { notification_id: n.id });
       setToast(makeToast(n.slotId ? `${n.title} · ${n.slotId}` : n.title, notificationLook(n).toast));
       setNow(Date.now());
-      refreshRecent();
-      if (n.type !== 'system') refreshAdherence();
+      if (n.type !== 'system') {
+        refreshAdherence();
+        refreshDoses();
+      }
     },
-    [refreshAdherence, refreshRecent],
+    [refreshAdherence, refreshDoses],
   );
   const feed = useNotificationFeed({ onArrive: handleArrive });
 
@@ -197,11 +205,6 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       .getAdherenceSummary()
       .then((summary) => {
         if (!cancelled) setAdherence(summary);
-      })
-      .catch(() => {});
-    fetchNotificationPage({ filter: 'all', cursor: null, limit: RECENT_COUNT })
-      .then((page) => {
-        if (!cancelled) setRecent(page.items);
       })
       .catch(() => {});
     return () => {
@@ -262,11 +265,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     return () => clearInterval(timer);
   }, [clockSpeed]);
 
-  // Android back: return to Beranda before leaving the app.
+  // Android back: Jadwal returns to PillBox, other tabs to Beranda, before leaving the app.
   useEffect(() => {
     if (tab === 'home') return;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      setTab('home');
+      setTab(tab === 'schedule' ? 'device' : 'home');
       return true;
     });
     return () => sub.remove();
@@ -284,7 +287,6 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     setTab(next);
     if (next === 'home') {
       setNow(Date.now());
-      refreshRecent();
     }
   };
 
@@ -403,7 +405,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     setRefreshing(true);
     setNow(Date.now());
     refreshAdherence();
-    refreshRecent();
+    insights.refreshAll();
     // An unsaved schedule draft is never thrown away by a refresh.
     await Promise.allSettled([feed.refresh(), loadDashboard(draftDirty), devices.refresh()]);
     setRefreshing(false);
@@ -445,7 +447,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       await api.seedMockHistory(45);
       await feed.refresh();
       refreshAdherence();
-      refreshRecent();
+      insights.refreshDoses();
       showToast('45 riwayat contoh ditambahkan', 'success');
     } catch {
       showToast('Gagal menambah riwayat contoh', 'error');
@@ -454,14 +456,16 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     }
   };
 
+  const handleMarkAllRead = () => {
+    feed.markAllRead();
+  };
+
   const markRead = (id: string) => {
     feed.markRead(id);
-    setRecent((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
   };
 
   const handleDelete = async (n: AppNotification) => {
-    if (await feed.remove(n.id)) refreshRecent();
-    else showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
+    if (!(await feed.remove(n.id))) showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
   };
 
   const runConfirm = async () => {
@@ -497,8 +501,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       icon: 'trash-outline',
       onConfirm: async () => {
         if (await feed.clearAll()) {
-          refreshRecent();
-          showToast('Semua notifikasi dihapus', 'success');
+              showToast('Semua notifikasi dihapus', 'success');
         } else {
           showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
         }
@@ -506,34 +509,73 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     });
   };
 
-  const handleCall = async (n: AppNotification) => {
-    markRead(n.id);
+  /** Calls the elderly's own number when the profile has one, else the configured placeholder. */
+  const callElder = async () => {
     try {
-      await Linking.openURL(`tel:${AppConfig.elderPhone}`);
+      await Linking.openURL(`tel:${insights.elderly?.contactPhone ?? AppConfig.elderPhone}`);
     } catch {
       showToast('Tidak dapat membuka aplikasi telepon', 'error');
+    }
+  };
+
+  const handleCall = async (n: AppNotification) => {
+    markRead(n.id);
+    await callElder();
+  };
+
+  /** Rings the pillbox (optionally at one compartment). Resolves false when the command failed. */
+  const ringAlarm = async (slotId: SlotId | null) => {
+    try {
+      await api.triggerAlarm(slotId);
+      pillboxAlarm.started(AppConfig.alarmDurationSeconds);
+      showToast(`Alarm dibunyikan di ${device?.deviceName ?? 'Pillbox'}`, 'success');
+    } catch (err) {
+      // e.g. "Device is offline; the command was not sent" from the backend
+      showToast(failMessage('Gagal membunyikan alarm', err), 'error');
     }
   };
 
   const handleAlarm = async (n: AppNotification) => {
     markRead(n.id);
     setAlarmBusyId(n.id);
+    await ringAlarm(n.slotId);
+    setAlarmBusyId(null);
+  };
+
+  const handleRemind = async (slotId: SlotId) => {
+    setRemindBusy(true);
+    await ringAlarm(slotId);
+    setRemindBusy(false);
+  };
+
+  const handleCalibrate = async (pin: string) => {
+    setCalibrateBusy(true);
     try {
-      await api.triggerAlarm(n.slotId);
-      showToast(`Alarm dibunyikan di ${device?.deviceName ?? 'Pillbox'}`, 'success');
+      await insights.calibrate(pin);
+      setCalibrateOpen(false);
+      showToast(Strings.device.calibrated, 'success');
     } catch (err) {
-      // e.g. "Device is offline; the command was not sent" from the backend
-      showToast(failMessage('Gagal membunyikan alarm', err), 'error');
+      const wrongPin = err instanceof api.BackendError && err.code === 'DEVICE_PIN_INCORRECT';
+      if (!wrongPin) setCalibrateOpen(false);
+      showToast(wrongPin ? Strings.device.pinIncorrect : failMessage(Strings.device.calibrateFailed, err), 'error');
     } finally {
-      setAlarmBusyId(null);
+      setCalibrateBusy(false);
     }
+  };
+
+  const handleAutoSync = async (value: boolean) => {
+    if (!(await insights.setAutoSync(value))) showToast(Strings.device.autoSyncFailed, 'error');
+  };
+
+  const handleTogglePreference = async (key: Parameters<typeof insights.togglePreference>[0], value: boolean) => {
+    if (!(await insights.togglePreference(key, value))) showToast(Strings.settings.prefsFailed, 'error');
   };
 
   /** A late-dose action changed the dose: refresh what shows it. */
   const afterDoseAction = () => {
     void feed.refresh();
-    refreshRecent();
     refreshAdherence();
+    insights.refreshDoses();
   };
 
   const confirmTaken = async (n: AppNotification) => {
@@ -603,10 +645,21 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     });
   };
 
+  const handleStopAlarm = async () => {
+    try {
+      await pillboxAlarm.stop();
+      showToast(Strings.alarm.stopped, 'success');
+    } catch (err) {
+      showToast(failMessage(Strings.alarm.stopFailed, err), 'error');
+    }
+  };
+  const alarmControl = { ringing: pillboxAlarm.ringing, stopping: pillboxAlarm.stopping, onStop: handleStopAlarm };
+
   const handleTestSlot = async (id: SlotId) => {
     setTesting(true);
     try {
       await api.triggerTestSlot(id);
+      pillboxAlarm.started(AppConfig.testAlarmDurationSeconds);
       showToast(`Tes pengingat dikirim ke slot ${id}`, 'success');
     } catch (err) {
       showToast(failMessage('Gagal mengirim tes pengingat', err), 'error');
@@ -626,8 +679,8 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       const saved = await api.saveSchedule(draftSlots);
       setSavedSlots(saved);
       setDraftSlots(saved);
+      // No status re-read: a schedule save does not change it, and /ws/app pushes status changes.
       if (device?.online) {
-        setDevice(await api.getDeviceStatus());
         showToast('Jadwal berhasil disimpan ke Pillbox', 'success');
       } else {
         showToast('Jadwal disimpan, akan dikirim saat Pillbox terhubung kembali', 'warning');
@@ -653,21 +706,29 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
           />
         ) : (
           <>
-            <PillboxSwitcher pillboxes={devices.pillboxes ?? []} activeId={devices.active?.id ?? null} onSelect={handleSelectPillbox} />
+            <TopBar userName={user?.full_name ?? Strings.shell.caregiverFallback} />
+            {tab === 'schedule' && <BackHeader title={Strings.tabs.backToDevice} onBack={() => openTab('device')} />}
             <View className="flex-1">
               {tab === 'home' && (
                 <HomeTab
                   now={now}
                   pillboxNow={pillboxNowMs}
+                  userName={user?.full_name ?? null}
+                  pillbox={devices.active}
                   device={device}
                   deviceLoadError={dashboardError}
                   onRetryDevice={handleRetryDashboard}
                   adherence={adherence}
-                  savedSlots={savedSlots}
-                  recent={recent}
+                  insights={insights}
+                  unreadCount={feed.unreadCount}
+                  remindBusy={remindBusy}
+                  alarm={alarmControl}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
                   onOpenTab={openTab}
+                  onAddElderly={api.USE_MOCK ? undefined : () => router.push('/elderly/new')}
+                  onCall={() => void callElder()}
+                  onRemind={(slotId) => void handleRemind(slotId)}
                 />
               )}
               {tab === 'schedule' && (
@@ -681,6 +742,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   onRetry={handleRetryDashboard}
                   now={pillboxNowMs}
                   testing={testing}
+                  alarm={alarmControl}
                   onTest={handleTestSlot}
                   saving={saving}
                   onSave={handleSave}
@@ -692,12 +754,15 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   feed={feed}
                   canDelete={NOTIFICATION_DELETE_SUPPORTED}
                   now={now}
+                  heading={insights.elderly?.fullName ?? devices.active?.elderlyName ?? Strings.shell.elderlyFallback}
                   alarmBusyId={alarmBusyId}
+                  alarm={alarmControl}
                   actionBusy={doseActionBusy}
                   onAction={handleDoseAction}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
                   onMarkRead={markRead}
+                  onMarkAllRead={handleMarkAllRead}
                   onCall={handleCall}
                   onAlarm={handleAlarm}
                   onDelete={handleDelete}
@@ -707,6 +772,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
               {tab === 'device' && (
                 <DeviceTab
                   device={device}
+                  pillboxes={devices.pillboxes ?? []}
+                  activeId={devices.active?.id ?? null}
+                  elderlyName={insights.elderly?.fullName ?? devices.active?.elderlyName ?? null}
+                  clock={insights.clock}
+                  canEditDevice={api.USE_MOCK || canEdit(devices.active?.myRole ?? null)}
                   connectionBusy={connectionBusy}
                   now={now}
                   loadError={dashboardError}
@@ -714,8 +784,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   onToggleConnection={handleToggleConnection}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
-                  userName={user?.full_name ?? null}
-                  onSignOut={handleSignOut}
+                  onSelectPillbox={handleSelectPillbox}
+                  onAdd={api.USE_MOCK ? undefined : () => setAddOpen(true)}
+                  onCalibrate={() => setCalibrateOpen(true)}
+                  onToggleAutoSync={(value) => void handleAutoSync(value)}
+                  onOpenSchedule={() => openTab('schedule')}
                   pillboxList={
                     api.USE_MOCK ? null : (
                       <PillboxListCard
@@ -745,6 +818,26 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   }}
                 />
               )}
+              {tab === 'settings' && (
+                <SettingsTab
+                  now={now}
+                  pillboxNow={pillboxNowMs}
+                  userName={user?.full_name ?? Strings.shell.caregiverFallback}
+                  email={user?.email ?? null}
+                  accountId={user?.id ?? null}
+                  pillbox={devices.active}
+                  elderly={insights.elderly}
+                  device={device}
+                  prefs={insights.prefs}
+                  prefsBusy={insights.prefsBusy}
+                  onTogglePreference={(key, value) => void handleTogglePreference(key, value)}
+                  onCallElder={() => void callElder()}
+                  onOpenDevice={() => openTab('device')}
+                  onAddElderly={api.USE_MOCK ? undefined : () => router.push('/elderly/new')}
+                  onAddDevice={api.USE_MOCK ? undefined : () => setAddOpen(true)}
+                  onSignOut={handleSignOut}
+                />
+              )}
             </View>
             <TabBar
               active={tab}
@@ -759,6 +852,15 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
         )}
       </SafeAreaView>
 
+      <PinPrompt
+        visible={calibrateOpen}
+        title={Strings.device.calibrateTitle}
+        message={Strings.device.calibrateMessage}
+        confirmLabel={Strings.device.calibrateConfirm}
+        busy={calibrateBusy}
+        onSubmit={(pin) => void handleCalibrate(pin)}
+        onCancel={() => setCalibrateOpen(false)}
+      />
       <PinPrompt
         visible={releaseTarget !== null}
         title="Buka bilik sekarang?"

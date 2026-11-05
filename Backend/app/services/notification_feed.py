@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import Select, and_, delete, func, select, tuple_, update
+from sqlalchemy import Select, delete, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -90,23 +90,33 @@ async def list_feed(
         conditions += [Notification.type.in_(_LATE_MISSED), Notification.is_resolved.is_(False)]
     elif tab == "RESOLVED":
         conditions.append(Notification.is_resolved.is_(True))
-    # Both counts in one round trip (the app polls this endpoint).
-    counts = await session.execute(
-        select(
-            func.count().filter(and_(*conditions)),
-            func.count().filter(Notification.is_read.is_(False)),
-        ).where(Notification.user_id == user.id)
+    # Both counts in one round trip (the app polls this endpoint), as separate scalar subqueries
+    # so each can use its own index (unread: index-only on notifications_user_unread_idx) instead
+    # of one filtered aggregate reading every notification row the user ever had.
+    total_q = select(func.count()).select_from(Notification).where(*conditions).scalar_subquery()
+    unread_q = (
+        select(func.count())
+        .select_from(Notification)
+        .where(Notification.user_id == user.id, Notification.is_read.is_(False))
+        .scalar_subquery()
     )
-    total, unread = counts.one()
-    rows = await session.execute(
-        # id breaks ties like the app's feed order (Mobile/lib/feed.ts compareFeed).
-        _base()
-        .where(*conditions)
-        .order_by(Notification.created_at.desc(), Notification.id.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-    return [_item(*row) for row in rows.all()], total, unread
+    # The counts ride along as two extra columns of the page query: one round trip per poll.
+    rows = (
+        await session.execute(
+            # id breaks ties like the app's feed order (Mobile/lib/feed.ts compareFeed).
+            _base()
+            .add_columns(total_q, unread_q)
+            .where(*conditions)
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    if rows:
+        total, unread = rows[0][-2], rows[0][-1]
+    else:  # empty page (nothing yet, or past the end): the counts on their own
+        total, unread = (await session.execute(select(total_q, unread_q))).one()
+    return [_item(*row[:-2]) for row in rows], total, unread
 
 
 async def _own(session: AsyncSession, user: User, notification_id: UUID) -> Notification:
@@ -190,19 +200,21 @@ async def delete_one(session: AsyncSession, user: User, notification_id: UUID) -
     await session.commit()
 
 
-async def delete_up_to(session: AsyncSession, user: User, up_to_created_at: datetime, up_to_id: UUID) -> int:
+async def delete_up_to(
+    session: AsyncSession, user: User, boundary: tuple[datetime, UUID] | None, device_id: UUID | None
+) -> int:
     """ "Hapus semua": deletes the caller's notifications at or older than the newest one they saw
-    when confirming, so anything that arrived afterwards survives. Feed order is (created_at, id)
-    descending; created_at is compared to the millisecond because that is what the app holds."""
-    created_ms = func.date_trunc("milliseconds", Notification.created_at)
-    result = await session.execute(
-        delete(Notification)
-        .where(
-            Notification.user_id == user.id,
-            tuple_(created_ms, Notification.id) <= tuple_(up_to_created_at, up_to_id),
-        )
-        .returning(Notification.id)
-    )
-    deleted = len(result.all())
+    when confirming (boundary), so anything that arrived afterwards survives; with device_id only
+    that pillbox's (another caregiver's copies are never touched; an unknown or foreign device just
+    matches nothing). Feed order is (created_at, id) descending; created_at is compared to the
+    millisecond because that is what the app holds."""
+    conditions = [Notification.user_id == user.id]
+    if boundary is not None:
+        created_ms = func.date_trunc("milliseconds", Notification.created_at)
+        conditions.append(tuple_(created_ms, Notification.id) <= tuple_(*boundary))
+    if device_id is not None:
+        conditions.append(Notification.device_id == device_id)
+    result = await session.execute(delete(Notification).where(*conditions))
+    deleted = result.rowcount or 0
     await session.commit()
     return deleted

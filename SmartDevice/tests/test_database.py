@@ -29,7 +29,7 @@ def test_log_event_and_sync_cycle(tmp_path):
     compartment_id = db.get_compartments()[0].id
     now = datetime(2026, 1, 1, 7, 0, 0)
 
-    event_id = db.log_event(compartment_id, "POP_UP", now)
+    event_id = db.log_event(compartment_id, 1, "POPUP_ACTIVATED", now)
     unsynced = db.get_unsynced_events()
     assert len(unsynced) == 1
     assert unsynced[0]["id"] == event_id
@@ -39,13 +39,28 @@ def test_log_event_and_sync_cycle(tmp_path):
     assert db.get_unsynced_events() == []
 
 
-def test_update_schedule(tmp_path):
+def test_update_schedules_applies_a_pulled_config(tmp_path):
     db = make_db(tmp_path)
     compartment = db.get_compartments()[0]
-    db.update_schedule(compartment.id, "08:15", 45)
-    updated = next(c for c in db.get_compartments() if c.id == compartment.id)
+    db.update_schedules([
+        {"slot_number": compartment.slot_number, "window_start": "08:15", "window_end": "08:15", "tolerance_minutes": 45},
+    ])
+    compartments = {c.id: c for c in db.get_compartments()}
+    updated = compartments[compartment.id]
     assert updated.schedule_time == "08:15"
     assert updated.tolerance_minutes == 45
+    # A slot missing from the config has no schedule (contract §2.2).
+    assert all(not c.is_active for c in compartments.values() if c.id != compartment.id)
+
+
+def test_unsynced_events_are_read_oldest_first_in_chunks(tmp_path):
+    db = make_db(tmp_path)
+    compartment_id = db.get_compartments()[0].id
+    base = datetime(2026, 1, 1, 7, 0, 0)
+    for minute in (3, 1, 2):
+        db.log_event(compartment_id, 1, "REFILL_MAINTENANCE", base.replace(minute=minute))
+    first_two = db.get_unsynced_events(limit=2)
+    assert [row["occurred_at"] for row in first_two] == [base.replace(minute=1).isoformat(), base.replace(minute=2).isoformat()]
 
 
 CONTRACT_EVENT_TYPES = [

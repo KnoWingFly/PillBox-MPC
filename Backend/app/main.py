@@ -24,7 +24,7 @@ from app.core.config import get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging, request_id_var
 from app.core.timing import correlation_id_var
-from app.db.session import get_engine, get_sessionmaker, warm_pool
+from app.db.session import get_background_engine, get_background_sessionmaker, get_engine, warm_pool
 from app.services.background import start_background_tasks, stop_background_tasks
 
 settings = get_settings()  # only used to configure the app object itself
@@ -35,13 +35,14 @@ logger = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await warm_pool()
-    tasks = start_background_tasks(get_sessionmaker(), settings) if settings.enable_background_tasks else []
+    tasks = start_background_tasks(get_background_sessionmaker(), settings) if settings.enable_background_tasks else []
     logger.info("startup", extra={"background_tasks": len(tasks), "auth_mode": settings.auth_mode})
     try:
         yield
     finally:
         await stop_background_tasks(tasks)
         await get_engine().dispose()  # creating the engine is lazy; no connection is opened
+        await get_background_engine().dispose()
 
 
 app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)

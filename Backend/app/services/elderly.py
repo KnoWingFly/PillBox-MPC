@@ -28,8 +28,9 @@ from app.schemas.elderly import (
     TransferOwnershipOut,
 )
 from app.services.access import require_role
+from app.services.app_hub import queue_roles_changed
 from app.services.device_management import unpair
-from app.services.journal import day_doses, summarize
+from app.services.journal import day_doses_many, summarize
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
@@ -50,8 +51,8 @@ async def create(session: AsyncSession, user: User, body: ElderlyIn, now: dateti
     session.add(elderly)
     await session.flush()
     session.add(UserElderlyRole(user_id=user.id, elderly_id=elderly.id, role=Role.OWNER.value, created_at=now))
+    queue_roles_changed(session, user.id)
     await session.commit()
-    await session.refresh(elderly)
     logger.info("elderly_created", extra={"elderly_id": str(elderly.id), "user_id": str(user.id)})
     return ElderlyCreated(
         id=elderly.id,
@@ -88,26 +89,46 @@ async def list_for_user(
         .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
         .where(UserElderlyRole.user_id == user.id, Elderly.deleted_at.is_(None))
     )
-    total = (await session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
-    rows = (await session.execute(base.order_by(Elderly.created_at).offset(offset).limit(limit))).all()
-    items = []
-    for elderly, role in rows:
-        devices = list(
-            (await session.execute(select(Device).where(Device.elderly_id == elderly.id))).scalars().all()
+    # The total rides along as a window count on the page rows: one round trip, not two.
+    page = (
+        await session.execute(
+            base.add_columns(func.count().over()).order_by(Elderly.created_at).offset(offset).limit(limit)
         )
-        # "Today" is each device's own local date.
-        today_for = {d.id: now.astimezone(zone(d.timezone)).date() for d in devices}
-        summary = summarize(await day_doses(session, elderly.id, devices, today_for, now))
-        open_alerts = (
+    ).all()
+    if page:
+        total = page[0][-1]
+    else:  # empty page (no profiles yet, or past the end): count on its own
+        total = (await session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+    rows = [(elderly, role) for elderly, role, _ in page]
+    # A fixed number of queries per page (devices, doses, alert counts), not four per elderly.
+    page_ids = [elderly.id for elderly, _ in rows]
+    devices_by_elderly: dict[UUID, list[Device]] = {elderly_id: [] for elderly_id in page_ids}
+    if page_ids:
+        for device in (await session.execute(select(Device).where(Device.elderly_id.in_(page_ids)))).scalars():
+            if device.elderly_id is not None:
+                devices_by_elderly[device.elderly_id].append(device)
+    # "Today" is each device's own local date.
+    today_for = {d.id: now.astimezone(zone(d.timezone)).date() for ds in devices_by_elderly.values() for d in ds}
+    doses = await day_doses_many(session, devices_by_elderly, today_for, now)
+    alert_counts = dict(
+        (
             await session.execute(
-                select(func.count()).select_from(Notification).where(
+                select(Notification.elderly_id, func.count())
+                .where(
                     Notification.user_id == user.id,
-                    Notification.elderly_id == elderly.id,
+                    Notification.elderly_id.in_(page_ids),
                     Notification.is_resolved.is_(False),
                     Notification.severity.in_([Severity.WARNING.value, Severity.CRITICAL.value]),
                 )
+                .group_by(Notification.elderly_id)
             )
-        ).scalar_one()
+        ).all()
+    ) if page_ids else {}
+    items = []
+    for elderly, role in rows:
+        devices = devices_by_elderly[elderly.id]
+        summary = summarize(doses[elderly.id])
+        open_alerts = alert_counts.get(elderly.id, 0)
         items.append(
             ElderlyListItem(
                 id=elderly.id,
@@ -229,6 +250,7 @@ async def invite(
             created_at=now,
         )
     )
+    queue_roles_changed(session, invitee.id)
     await session.commit()
     logger.info("caregiver_added", extra={"elderly_id": str(elderly_id), "caregiver_id": str(invitee.id)})
     return CaregiverOut(
@@ -273,6 +295,7 @@ async def remove_caregiver(session: AsyncSession, user: User, elderly_id: UUID, 
     if my_role != Role.OWNER and caregiver_id != user.id:
         raise AppError(403, "FORBIDDEN", "Only the owner can remove other caregivers")
     await session.delete(target)
+    queue_roles_changed(session, caregiver_id)
     await session.execute(
         delete(NotificationPreference).where(
             NotificationPreference.user_id == caregiver_id, NotificationPreference.elderly_id == elderly_id
