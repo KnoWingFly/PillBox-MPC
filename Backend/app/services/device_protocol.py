@@ -212,4 +212,6 @@ async def ack_config(
 
 
 def is_fresh(occurred_at: datetime, now: datetime, settings: Settings) -> bool:
-    return occurred_at >= now - timedelta(seconds=2 * settings.device_heartbeat_interval_seconds)
+    return occurred_at >= now - timedelta(
+        seconds=settings.telemetry_fresh_heartbeat_intervals * settings.device_heartbeat_interval_seconds
+    )

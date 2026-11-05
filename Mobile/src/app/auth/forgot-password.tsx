@@ -1,32 +1,37 @@
 import { router } from 'expo-router';
-import { useState } from 'react';
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Text, TouchableOpacity, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { ActivityIndicator, KeyboardAvoidingView, Platform, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import FormField from '@root/components/auth/form-field';
 import { Strings } from '@/constants/strings';
 import { useAuth } from '@/hooks/use-auth';
+import { useToast } from '@/hooks/use-toast';
 import { errorMessage } from '@/lib/api/error-message';
 
 export default function ForgotPasswordScreen() {
   const { forgotPassword } = useAuth();
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
+  const inFlight = useRef(false);
+  const { showToast, toastNode } = useToast();
   const t = Strings.forgotPassword;
 
   async function onSubmit() {
     const trimmed = email.trim();
-    if (!trimmed) return Alert.alert(Strings.common.error, Strings.validation.required);
+    if (!trimmed) return showToast(Strings.validation.required, 'error');
+    if (inFlight.current) return;
 
+    inFlight.current = true;
     setLoading(true);
     try {
       await forgotPassword(trimmed);
-      Alert.alert(t.sentTitle, t.sentMessage, [
-        { text: Strings.common.ok, onPress: () => router.push({ pathname: '/auth/reset-password', params: { email: trimmed } }) },
-      ]);
+      // The next screen says the code was sent; navigating never waits for a dialog button.
+      router.push({ pathname: '/auth/reset-password', params: { email: trimmed, sent: '1' } });
     } catch (err) {
-      Alert.alert(Strings.common.error, errorMessage(err));
+      showToast(errorMessage(err), 'error');
     } finally {
+      inFlight.current = false;
       setLoading(false);
     }
   }
@@ -61,6 +66,7 @@ export default function ForgotPasswordScreen() {
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+      {toastNode}
     </SafeAreaView>
   );
 }

@@ -35,10 +35,8 @@ DEFAULT_LANGUAGE = "ID"
 @dataclass(frozen=True)
 class Preferences:
     """Effective preferences when a caregiver never saved preferences.
-    Mirrors the column defaults in migrations/0001, except notify_on_taken:
-    the app has no preferences screen yet, so a FALSE default meant on-time
-    doses were never reported at all (PUT /notification-preferences still
-    turns it off)."""
+    Mirrors the column defaults (migrations 0001 and 0009: notify_on_taken defaults to TRUE,
+    PUT /notification-preferences still turns it off)."""
 
     push_enabled: bool = True
     notify_on_missed: bool = True

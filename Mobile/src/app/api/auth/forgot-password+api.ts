@@ -1,7 +1,9 @@
+import { serverConfig } from '@/server/config';
 import { db } from '@/server/db';
 import { sendPasswordResetOtp } from '@/server/email';
-import { json, parseBody, route } from '@/server/http';
+import { clientIp, json, parseBody, route } from '@/server/http';
 import { OTP_RESEND_COOLDOWN_MS, OTP_TTL_MS, generateOtpCode, hashOtp } from '@/server/otp';
+import { consumeAttempt } from '@/server/rate-limit';
 import { forgotPasswordSchema } from '@/server/schemas';
 
 // Always the same response so the endpoint cannot be used to discover registered emails.
@@ -9,6 +11,9 @@ const SENT = { message: 'OTP_SENT_TO_EMAIL' } as const;
 
 export const POST = route(async (request) => {
   const body = await parseBody(request, forgotPasswordSchema);
+  // Counted for unknown emails too, so the limit itself reveals nothing about registration.
+  await consumeAttempt('forgot:ip', clientIp(request), serverConfig.limits.forgotPerIp);
+  await consumeAttempt('forgot:email', body.email, serverConfig.limits.forgotPerEmail);
 
   const user = await db.user.findUnique({ where: { email: body.email }, select: { id: true, email: true } });
   if (!user) return json(SENT);

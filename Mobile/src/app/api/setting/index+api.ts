@@ -1,11 +1,25 @@
 import { requireAuth } from '@/server/auth-guard';
 import { db } from '@/server/db';
-import { unauthorized, validationError } from '@/server/errors';
+import { HttpError, unauthorized, validationError } from '@/server/errors';
 import { json, noContent, parseBody, route } from '@/server/http';
 import { verifyPassword } from '@/server/passwords';
 import { deleteAccountSchema, updateSettingSchema } from '@/server/schemas';
 import { supabaseAdmin } from '@/server/supabase-admin';
 import { getAuthedUser, isMissingUser, toSettingResponse } from '@/server/users';
+
+/**
+ * Whether the user is OWNER of an elderly profile that is not deleted. Read-only query on two
+ * Backend tables (user_elderly_roles, elderly); Prisma does not model them.
+ */
+async function ownsActiveElderly(userId: string): Promise<boolean> {
+  const rows = await db.$queryRaw<{ found: number }[]>`
+    SELECT 1 AS found
+    FROM user_elderly_roles r
+    JOIN elderly e ON e.id = r.elderly_id
+    WHERE r.user_id = ${userId}::uuid AND r.role = 'OWNER' AND e.deleted_at IS NULL
+    LIMIT 1`;
+  return rows.length > 0;
+}
 
 export const GET = route(async (request) => {
   const { userId } = await requireAuth(request);
@@ -51,6 +65,12 @@ export const DELETE = route(async (request) => {
     }
   } else if (body.confirm !== 'DELETE') {
     throw validationError([{ path: 'confirm', message: 'Must be "DELETE"' }]);
+  }
+
+  // Deleting the user cascades its user_elderly_roles rows, which would leave an elderly profile
+  // without an OWNER (docs/ai/architecture.md conflict 5): ownership must be transferred first.
+  if (await ownsActiveElderly(userId)) {
+    throw new HttpError(409, 'CANNOT_REMOVE_OWNER', 'Transfer ownership of your elderly profiles before deleting the account');
   }
 
   // Supabase first: if it fails we return 500 and the DB row stays untouched.

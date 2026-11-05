@@ -29,7 +29,7 @@ function goToSignIn() {
 
 export default function RegisterScreen() {
   const { signUp } = useAuth();
-  const { loading, submit } = useAuthSubmit();
+  const { loading, submit, showToast, toastNode } = useAuthSubmit();
   const [values, setValues] = useState<SignUpValues>(EMPTY_SIGN_UP);
   const set = <K extends keyof SignUpValues>(key: K) => (value: SignUpValues[K]) =>
     setValues((v) => ({ ...v, [key]: value }));
@@ -40,7 +40,8 @@ export default function RegisterScreen() {
     <AuthScreen
       badge={<View className="self-start"><StatusPill label={S.badge} tone="primary" icon="shield-checkmark-outline" /></View>}
       title={S.title}
-      subtitle={S.subtitle}>
+      subtitle={S.subtitle}
+      overlay={toastNode}>
       <FormField
         label={S.fullName}
         labelRight={<Text className="text-caption text-ink-muted">{S.fullNameHint}</Text>}
@@ -113,7 +114,7 @@ export default function RegisterScreen() {
       <View className="gap-5">
         <Button label={S.submit} icon="arrow-forward" onPress={onSubmit} loading={loading} />
         <DividerLabel label={S.divider} />
-        <GoogleSignInButton disabled={loading} label={S.google} />
+        <GoogleSignInButton onError={(message) => showToast(message, 'error')} disabled={loading} label={S.google} />
         <LinkPrompt question={S.haveAccount} link={S.signInLink} onPress={goToSignIn} />
         <SecurityNote text={Strings.brand.securityNote} boxed />
         <Text className="text-center text-caption text-ink-muted">{S.privacyNote}</Text>

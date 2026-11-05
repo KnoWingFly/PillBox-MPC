@@ -31,6 +31,7 @@ class DeviceSocket(QObject):
     connected_changed = Signal(bool)
     welcome_received = Signal(dict)  # carries server_time + timezone (clock sync)
     auth_rejected = Signal()  # closed with 4401: the device key is not (or no longer) valid
+    heartbeat_failed = Signal()  # the backend could not store a heartbeat sent on this socket
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -104,6 +105,9 @@ class DeviceSocket(QObject):
             logger.warning("Command channel refused the device key (4401).")
             self.auth_rejected.emit()
             self._delay_ms = config.WS_RECONNECT_MAX_MS
+        elif code == config.WS_CLOSE_SERVER_ERROR:
+            # The backend failed (not the key): keep the normal jittered backoff, never the 4401 path.
+            logger.warning("Command channel closed by a server-side failure (1011); retrying with backoff.")
         elif code == config.WS_CLOSE_REPLACED:
             # Another process uses this identity: reconnecting at once would kick it off again.
             logger.warning("Command channel taken over by another connection with this identity (4000).")
@@ -122,8 +126,14 @@ class DeviceSocket(QObject):
         if message.get("type") == "welcome":
             self.welcome_received.emit(message)
             return
+        if message.get("type") == "error":
+            error = message.get("error")
+            logger.warning("Command channel error from backend: %s", error)
+            if error == config.WS_HEARTBEAT_NOT_STORED:
+                self.heartbeat_failed.emit()
+            return
         if message.get("type") != "command":
-            return  # heartbeat_ack, pong, error: nothing to do
+            return  # heartbeat_ack, pong: nothing to do
         payload = message.get("payload")
         self.command_received.emit(
             str(message.get("command_id", "")),

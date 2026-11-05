@@ -3,8 +3,10 @@
 Idempotency: each event is first claimed in device_events with
 INSERT ... ON CONFLICT (device_id, event_id) DO NOTHING. A re-sent event_id
 does nothing and returns the outcome stored the first time. The batch is one
-transaction: if anything unexpected fails, nothing is committed (including
-the claims) and the device retries the whole batch later.
+transaction. If the database is unavailable nothing is committed (including the
+claims) and the device retries the whole batch later. If the database refuses a
+value (a constraint, an overflow), the batch is replayed with one savepoint per
+event so only that event is rejected and the device's outbox is not blocked.
 
 Ordering: events are applied in device-timestamp order (occurred_at, then
 event_id), not arrival order, so an offline buffer flushed after Wi-Fi
@@ -31,13 +33,14 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import timing
 from app.core.config import Settings
-from app.core.errors import AppError
+from app.core.errors import AppError, is_db_unavailable
 from app.models import Device, DeviceEvent, Schedule, TelemetryLog
 from app.models.enums import (
     DeviceEventType,
@@ -53,7 +56,7 @@ from app.schemas.device_protocol import (
     TelemetryRequest,
     TelemetryResponse,
 )
-from app.services.app_hub import queue_device_change
+from app.services.app_hub import queue_device_change, restore_queued, snapshot_queued
 from app.services.adherence import DoseInstants, delay_minutes_for, dose_instants, match_dose, on_time_grace
 from app.services.device_clock import device_now
 from app.services.device_protocol import is_fresh, status_builder
@@ -122,6 +125,26 @@ async def ingest_batch(
             details={"max_batch_size": settings.telemetry_max_batch_size},
         )
 
+    try:
+        return await _ingest(session, device, req, now, settings, isolate=False)
+    except sa_exc.DBAPIError as exc:
+        if is_db_unavailable(exc):
+            raise
+        # A value the schema let through but the database refused (a constraint, an overflow).
+        # Retrying the same batch would fail the same way and block the device's outbox, so the
+        # batch is replayed with one savepoint per event: only the event that fails is rejected.
+        logger.warning(
+            "telemetry_batch_isolated",
+            extra={"device_id": str(device.id), "batch_id": req.batch_id, "error": type(exc.orig).__name__},
+        )
+        await session.rollback()
+        await session.refresh(device)
+        return await _ingest(session, device, req, now, settings, isolate=True)
+
+
+async def _ingest(
+    session: AsyncSession, device: Device, req: TelemetryRequest, now: datetime, settings: Settings, *, isolate: bool
+) -> TelemetryResponse:
     started = timing.now_ms()
     # Any authenticated request proves the device is alive. This also locks the
     # device row, so batches from one device are applied one at a time.
@@ -153,7 +176,8 @@ async def ingest_batch(
     prepared = []
     for i in first_index.values():
         ev = events[i]
-        assert ev is not None  # only valid events are indexed
+        if ev is None:  # only valid events are indexed
+            continue
         occurred = as_aware(ev.occurred_at, tz)
         prepared.append(_Prepared(i, ev, occurred, _validate(ev, occurred, clock, earliest, settings)))
     prepared.sort(key=lambda p: (p.occurred_at, p.event.event_id))
@@ -169,6 +193,7 @@ async def ingest_batch(
     cache_recipients(session)
 
     log_links: list[dict[str, UUID]] = []  # device_events.id -> telemetry_logs.id
+    unstorable: list[dict[str, object]] = []  # claims whose event the database refused (isolate mode)
     for item in prepared:
         if timing.enabled():
             timing.log_timing(
@@ -193,9 +218,29 @@ async def ingest_batch(
             continue
         token = timing.correlation_id_var.set(item.event.event_id)
         try:
-            log_id = await _apply(
-                session, device, item.event, item.occurred_at, tz, now, settings, schedules, req.is_offline_flush
-            )
+            if isolate:
+                queued = snapshot_queued(session)
+                try:
+                    async with session.begin_nested():
+                        log_id = await _apply(
+                            session, device, item.event, item.occurred_at, tz, now, settings, schedules,
+                            req.is_offline_flush,
+                        )
+                except sa_exc.DBAPIError as exc:
+                    if is_db_unavailable(exc):
+                        raise
+                    # Pushes queued by the rolled-back work must not go out; the device row
+                    # (reused by the next events) is reloaded, as the rollback expired it.
+                    restore_queued(session, queued)
+                    await session.refresh(device)
+                    reason = f"could not be stored ({type(exc.orig).__name__})"
+                    unstorable.append({"id": claimed_id, "outcome": "REJECTED", "reject_reason": reason})
+                    results[item.index] = EventResult(event_id=item.event.event_id, status="rejected", reason=reason)
+                    continue
+            else:
+                log_id = await _apply(
+                    session, device, item.event, item.occurred_at, tz, now, settings, schedules, req.is_offline_flush
+                )
         finally:
             timing.correlation_id_var.reset(token)
         if log_id is not None:
@@ -210,6 +255,8 @@ async def ingest_batch(
         # One executemany instead of loading each claim row back (ORM bulk
         # UPDATE by primary key).
         await session.execute(update(DeviceEvent), log_links)
+    if unstorable:
+        await session.execute(update(DeviceEvent), unstorable)
     queue_device_change(session, device.elderly_id, device.id, status=status_builder(device, settings))
     await session.commit()
     timing.log_timing(

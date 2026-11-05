@@ -1,6 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from 'react';
 import { AppState } from 'react-native';
 
+import { AppConfig } from '@/config';
+import { Strings } from '@/constants/strings';
+import { usePolling } from '@/hooks/use-polling';
 import { authApi, deviceTimezone, type RegisterInput } from '@/lib/api/auth';
 import { ApiError, onSessionExpired, type TokenResponse } from '@/lib/api/client';
 import { settingApi } from '@/lib/api/setting';
@@ -35,8 +38,15 @@ type AuthContextValue = {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-const NOTICE_SESSION_AGED_OUT = 'Sesi Anda telah berakhir setelah 30 hari. Silakan masuk kembali.';
-const NOTICE_SESSION_EXPIRED = 'Sesi Anda telah berakhir. Silakan masuk kembali.';
+const NOTICE_SESSION_AGED_OUT = Strings.session.agedOut;
+const NOTICE_SESSION_EXPIRED = Strings.session.expired;
+
+/** The only answers that end a stored session. Offline, timeouts and 5xx keep it. */
+const SESSION_REJECTED_CODES = new Set(['UNAUTHORIZED', 'REFRESH_TOKEN_INVALID']);
+
+function sessionRejected(err: unknown): boolean {
+  return err instanceof ApiError && SESSION_REJECTED_CODES.has(err.code);
+}
 
 async function sessionAgedOut(): Promise<boolean> {
   const loginAt = await tokenStore.getLoginAt();
@@ -81,8 +91,16 @@ export default function AuthProvider({ children }: PropsWithChildren) {
     [markSignedOut],
   );
 
-  // Restore on launch: a stored refresh token means "signed in"; the profile call also
-  // exercises the refresh path. Offline keeps the session instead of signing out.
+  /** Loads the caregiver profile; also registers this phone for push, which needs a live session. */
+  const loadProfile = useCallback(async () => {
+    const setting = await settingApi.get();
+    setUser({ id: setting.id, full_name: setting.full_name, email: setting.email });
+    void registerPushToken();
+  }, []);
+
+  // Restore on launch: a stored refresh token means "signed in"; the profile call also exercises
+  // the refresh path. Only a rejected session (UNAUTHORIZED / REFRESH_TOKEN_INVALID) signs out:
+  // offline, a timeout or a server error keeps the session and the profile is retried below.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -100,26 +118,29 @@ export default function AuthProvider({ children }: PropsWithChildren) {
         }
         // Sessions stored before the 30-day cap existed have no login time: start counting now.
         if ((await tokenStore.getLoginAt()) === null) await tokenStore.markLoginNow();
-        const setting = await settingApi.get();
+        await loadProfile();
         if (cancelled) return;
-        setUser({ id: setting.id, full_name: setting.full_name, email: setting.email });
         setStatus('signedIn');
         perfLoginStep('session_restored', { result: 'signed_in' });
       } catch (err) {
         if (cancelled) return;
         perfLoginStep('session_restored', { result: 'error', code: err instanceof ApiError ? err.code : 'UNKNOWN' });
-        if (err instanceof ApiError && err.code === 'NETWORK_ERROR') setStatus('signedIn');
-        else {
+        if (sessionRejected(err)) {
           await tokenStore.clear();
-          if (err instanceof ApiError && err.code === 'UNAUTHORIZED') setSessionNotice(NOTICE_SESSION_EXPIRED);
+          setSessionNotice(NOTICE_SESSION_EXPIRED);
           markSignedOut();
-        }
+        } else setStatus('signedIn'); // user stays null until the retry below succeeds
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [markSignedOut, endSession]);
+  }, [markSignedOut, endSession, loadProfile]);
+
+  // Signed in without a profile (the server was unreachable at startup): retry on a timer and when
+  // the app returns to the foreground. A rejected session is handled by onSessionExpired below.
+  const retryProfile = useCallback(() => loadProfile().catch(() => undefined), [loadProfile]);
+  usePolling(retryProfile, status === 'signedIn' && user === null ? AppConfig.sessionRetryMs : null);
 
   // Refresh token rejected mid-session (revoked, expired, reused): tokens are already cleared.
   useEffect(

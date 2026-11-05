@@ -91,6 +91,10 @@ async def record_refill(
         )
 
     refilled_at = as_aware(body.refilled_at, zone(device.timezone)) if body.refilled_at else now
+    if refilled_at > now + timedelta(seconds=settings.clock_drift_tolerance_seconds) or (
+        refilled_at < now - timedelta(minutes=settings.telemetry_max_past_skew_minutes)
+    ):
+        raise unprocessable("VALIDATION_ERROR", "refilled_at must not be in the future or far in the past")
     refill = Refill(device_id=device.id, refilled_by_user_id=user.id, refilled_at=refilled_at, is_reset=body.is_reset)
     session.add(refill)
     await session.flush()
@@ -98,13 +102,15 @@ async def record_refill(
         RefillItem(refill_id=refill.id, slot_number=i.slot_number, unit_dose_count=i.unit_dose_count)
         for i in body.items
     )
-    for slot, value in new_values.items():
+    if new_values:
+        # One multi-row upsert instead of one round trip per slot.
+        stmt = insert(DeviceStock).values(
+            [{"device_id": device.id, "slot_number": slot, "remaining_units": value} for slot, value in new_values.items()]
+        )
         await session.execute(
-            insert(DeviceStock)
-            .values(device_id=device.id, slot_number=slot, remaining_units=value)
-            .on_conflict_do_update(
+            stmt.on_conflict_do_update(
                 index_elements=[DeviceStock.device_id, DeviceStock.slot_number],
-                set_={"remaining_units": value, "updated_at": now},
+                set_={"remaining_units": stmt.excluded.remaining_units, "updated_at": now},
             )
         )
     stock_cache.forget(device.id)  # the next heartbeat must write its counts again

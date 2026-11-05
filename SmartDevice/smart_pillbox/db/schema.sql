@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS compartments (
     medication_name TEXT NULL,
     stock_count INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
-    days_of_week TEXT NOT NULL DEFAULT '[1, 2, 3, 4, 5, 6, 7]'
+    days_of_week TEXT NOT NULL DEFAULT '[1, 2, 3, 4, 5, 6, 7]', -- = config.ISO_WEEKDAYS (JSON)
+    window_end TEXT NULL, -- "HH:MM" from the config
+    schedule_id TEXT NULL -- backend schedule id from the config
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -52,6 +54,9 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 -- Outbox reads: unsynced rows oldest first (WHERE synced = 0 ORDER BY occurred_at LIMIT n).
-CREATE INDEX IF NOT EXISTS idx_events_unsynced ON events (synced);
+-- (synced, occurred_at) also serves "WHERE synced = 0" alone, so the old idx_events_unsynced is dropped.
+DROP INDEX IF EXISTS idx_events_unsynced;
 CREATE INDEX IF NOT EXISTS idx_events_outbox ON events (synced, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_events_compartment ON events (compartment_id, occurred_at);
+-- restore_day reads one day of events by time (get_events_between).
+CREATE INDEX IF NOT EXISTS idx_events_occurred ON events (occurred_at);

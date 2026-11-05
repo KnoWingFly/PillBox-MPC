@@ -44,3 +44,23 @@ def test_a_normal_drop_retries_soon_with_jitter(qt_app) -> None:
     high = config.WS_RECONNECT_MIN_MS * (1 + config.WS_RECONNECT_JITTER)
     assert low <= socket._retry.interval() <= high
     socket._retry.stop()
+
+
+def test_a_server_failure_close_backs_off_without_rejecting_the_key(qt_app) -> None:
+    """1011 = server-side failure: the key is fine, so no 4401 handling, just the jittered backoff."""
+    socket, rejected = _lost_with(config.WS_CLOSE_SERVER_ERROR)
+    assert rejected == []
+    assert socket._retry.interval() <= config.WS_RECONNECT_MIN_MS * (1 + config.WS_RECONNECT_JITTER)
+    assert socket._delay_ms > config.WS_RECONNECT_MIN_MS  # the next drop waits longer
+    socket._retry.stop()
+
+
+def test_heartbeat_not_stored_is_reported(qt_app) -> None:
+    import json
+
+    socket = DeviceSocket()
+    failed: list[bool] = []
+    socket.heartbeat_failed.connect(lambda: failed.append(True))
+    socket._on_message(json.dumps({"type": "error", "error": config.WS_HEARTBEAT_NOT_STORED}))
+    socket._on_message(json.dumps({"type": "error", "error": "invalid message"}))
+    assert failed == [True]

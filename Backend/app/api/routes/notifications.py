@@ -32,8 +32,11 @@ async def list_notifications(
     pagination: PaginationDep,
     tab: Tab = Query("ALL"),
     elderly_id: UUID | None = Query(None),
+    device_id: UUID | None = Query(None, description="only this pillbox's feed (plus its elderly's device-less rows)"),
 ) -> NotificationPage:
-    items, total, unread = await svc.list_feed(db, user, tab, elderly_id, pagination.offset, pagination.limit)
+    items, total, unread = await svc.list_feed(
+        db, user, tab, elderly_id, pagination.offset, pagination.limit, device_id=device_id
+    )
     return NotificationPage(unread_count=unread, data=items, page=pagination.page, limit=pagination.limit, total=total)
 
 

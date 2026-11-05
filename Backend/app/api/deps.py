@@ -16,7 +16,9 @@ from app.core.errors import AppError, unauthorized
 from app.core.security import TokenConfigError, verify_app_token, verify_supabase_token
 from app.db.session import get_db
 from app.models import AuthIdentity, Device, User
+from app.schemas.common import PG_INT_MAX
 from app.services.device_protocol import authenticate_device
+from app.services.error_messages import request_language_var
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,10 @@ async def get_current_user(
 ) -> User:
     if credentials is None:
         raise unauthorized()
-    return await user_from_token(credentials.credentials, settings, db)
+    user = await user_from_token(credentials.credentials, settings, db)
+    # Errors the app shows as they are come in the caller's language (services/error_messages.py).
+    request_language_var.set(user.interface_language)
+    return user
 
 
 async def user_from_token(token: str, settings: Settings, db: AsyncSession) -> User:
@@ -130,7 +135,8 @@ class Pagination:
     def __init__(
         self,
         settings: SettingsDep,
-        page: Annotated[int, Query(ge=1)] = 1,
+        # Bounded so (page - 1) * limit always fits Postgres' bigint OFFSET (else a 500).
+        page: Annotated[int, Query(ge=1, le=PG_INT_MAX)] = 1,
         limit: Annotated[int | None, Query(ge=1)] = None,
     ) -> None:
         self.page = page

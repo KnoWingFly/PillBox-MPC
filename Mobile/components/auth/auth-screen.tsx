@@ -13,11 +13,13 @@ import AuthAside from './auth-aside';
  * form. Phones get one centered column; from `lg` a brand panel sits on the left and the form on the
  * right; from `xl` both sit in a centered card (WideFrame).
  */
-export default function AuthScreen({ badge, title, subtitle, children }: {
+export default function AuthScreen({ badge, title, subtitle, children, overlay }: {
   badge?: ReactNode;
   title: string;
   subtitle: string;
   children: ReactNode;
+  /** Floats above the page and does not scroll with it, e.g. a toast. */
+  overlay?: ReactNode;
 }) {
   // Mounted only when visible: hiding it with classes would still run its animation on phones.
   const wide = useMinWidth('lg');
@@ -44,6 +46,7 @@ export default function AuthScreen({ badge, title, subtitle, children }: {
           </KeyboardAvoidingView>
         </View>
       </WideFrame>
+      {overlay}
     </SafeAreaView>
   );
 }

@@ -28,7 +28,7 @@ function replayOnboarding() {
 
 export default function LoginScreen() {
   const { signIn, sessionNotice } = useAuth();
-  const { loading, submit } = useAuthSubmit();
+  const { loading, submit, showToast, toastNode } = useAuthSubmit();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [remember, setRemember] = useState(true);
@@ -37,7 +37,7 @@ export default function LoginScreen() {
     submit(validateSignIn({ email, password }), () => signIn(email.trim(), password, remember));
 
   return (
-    <AuthScreen title={S.title} subtitle={S.subtitle}>
+    <AuthScreen title={S.title} subtitle={S.subtitle} overlay={toastNode}>
       {sessionNotice && <SessionNotice text={sessionNotice} />}
 
       <FormField
@@ -83,7 +83,7 @@ export default function LoginScreen() {
       <View className="gap-5">
         <Button label={S.submit} onPress={onSubmit} loading={loading} />
         <DividerLabel label={S.divider} />
-        <GoogleSignInButton disabled={loading} remember={remember} />
+        <GoogleSignInButton onError={(message) => showToast(message, 'error')} disabled={loading} remember={remember} />
         <LinkPrompt question={S.noAccount} link={S.signUpLink} onPress={() => router.push('/auth/register')} />
         <SecurityNote text={S.encrypted} />
         <LegalLine

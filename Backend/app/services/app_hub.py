@@ -160,7 +160,7 @@ class AppHub:
             return
         task = loop.create_task(self.publish(notifications, devices))
         self._tasks.add(task)  # keep a reference until it finishes
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
 
 
     def refresh_roles_soon(self, user_ids: set[UUID]) -> None:
@@ -176,14 +176,33 @@ class AppHub:
             return
         task = loop.create_task(self._refresh_roles(connected))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: "asyncio.Task[None]") -> None:
+        """Never-awaited tasks would otherwise lose their exception silently."""
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("app_hub_task_failed", exc_info=task.exception())
 
     async def _refresh_roles(self, user_ids: set[UUID]) -> None:
         # Imported here: app.db.session is not needed by the rest of this module.
         from app.db.session import get_sessionmaker
 
-        async with get_sessionmaker()() as session:
-            followed = await followed_elderly(session, user_ids)
+        try:
+            async with get_sessionmaker()() as session:
+                followed = await followed_elderly(session, user_ids)
+        except Exception:
+            # Without fresh roles a removed caregiver would keep receiving pushes: close their
+            # sockets instead; the app reconnects and the roles are read again at auth.
+            logger.warning("app_hub_role_refresh_failed", exc_info=True)
+            for user_id in user_ids:
+                for conn in list(self._by_user.get(user_id, ())):
+                    self.unregister(conn)
+                    try:
+                        await asyncio.wait_for(conn.websocket.close(), get_settings().app_ws_send_timeout_seconds)
+                    except (TimeoutError, WebSocketDisconnect, RuntimeError, OSError):
+                        pass
+            return
         for user_id in user_ids:
             for conn in list(self._by_user.get(user_id, ())):
                 self.set_elderly(conn, followed.get(user_id, set()))
@@ -262,6 +281,27 @@ def queue_device_change(
     if status is None and previous is not None:
         status = previous.status  # keep the richer message
     queued[device_id] = _DeviceChange(device_id, elderly_id, status)
+
+
+QueuedPushes = tuple[dict[UUID, list[dict[str, Any]]], dict[UUID, _DeviceChange], set[UUID]]
+
+
+def snapshot_queued(session: AsyncSession) -> QueuedPushes:
+    """The pushes queued so far, for restore_queued() after a rolled-back SAVEPOINT (the queue is
+    only dropped when the outermost transaction ends)."""
+    return (
+        {user_id: list(items) for user_id, items in session.info.get(_USERS_KEY, {}).items()},
+        dict(session.info.get(_DEVICES_KEY, {})),
+        set(session.info.get(_ROLES_KEY, set())),
+    )
+
+
+def restore_queued(session: AsyncSession, snapshot: QueuedPushes) -> None:
+    for key, value in zip((_USERS_KEY, _DEVICES_KEY, _ROLES_KEY), snapshot, strict=True):
+        if value:
+            session.info[key] = value
+        else:
+            session.info.pop(key, None)
 
 
 @event.listens_for(Session, "after_commit")

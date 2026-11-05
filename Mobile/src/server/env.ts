@@ -35,4 +35,8 @@ export const env = {
   get isProduction(): boolean {
     return process.env.NODE_ENV === 'production';
   },
+  /** Only an explicit NODE_ENV=development enables dev conveniences such as printing OTP codes. */
+  get isDevelopment(): boolean {
+    return process.env.NODE_ENV === 'development';
+  },
 };

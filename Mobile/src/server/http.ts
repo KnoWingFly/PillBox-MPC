@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 
+import { serverConfig } from './config';
 import { HttpError, validationError } from './errors';
 import { timed } from './perf';
 
@@ -36,11 +37,15 @@ export function route<P = Record<string, string>>(handler: Handler<P>): Handler<
     try {
       return await timed(request, 'api_route_total', () => handler(request, params));
     } catch (err) {
-      if (err instanceof HttpError) return errorResponse(err.status, err.code, err.message, err.details);
+      if (err instanceof HttpError) {
+        const res = errorResponse(err.status, err.code, err.message, err.details);
+        for (const [name, value] of Object.entries(err.headers ?? {})) res.headers.set(name, value);
+        return res;
+      }
       if (isDbUnavailable(err)) {
         console.warn('[api] database unavailable', request.method, new URL(request.url).pathname, err);
         const res = errorResponse(503, 'SERVICE_UNAVAILABLE', 'Server sedang sibuk. Coba lagi sebentar lagi.');
-        res.headers.set('Retry-After', '5');
+        res.headers.set('Retry-After', String(serverConfig.dbUnavailableRetryAfterSeconds));
         return res;
       }
       console.error('[api] unexpected error', request.method, new URL(request.url).pathname, err);
@@ -68,4 +73,17 @@ export async function parseBody<S extends z.ZodType>(request: Request, schema: S
 
 export function userAgent(request: Request): string | null {
   return request.headers.get('user-agent')?.slice(0, 255) ?? null;
+}
+
+const MAX_IP_LENGTH = 64;
+
+/**
+ * The caller's IP as reported by the proxy in front of the server (first X-Forwarded-For hop, or
+ * X-Real-IP); null when there is none, e.g. the Expo dev server reached directly. Per-IP limits are
+ * skipped then, so local clients never share one bucket.
+ */
+export function clientIp(request: Request): string | null {
+  const forwarded = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
+  const ip = forwarded || request.headers.get('x-real-ip')?.trim();
+  return ip ? ip.slice(0, MAX_IP_LENGTH) : null;
 }

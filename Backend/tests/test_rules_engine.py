@@ -200,13 +200,13 @@ async def test_device_timeout_racing_the_rules_engine_does_not_deadlock(
     yesterday = (datetime.now(ZoneInfo("Asia/Jakarta")) - timedelta(days=1)).date().isoformat()
     timeout = event(str(uuid.uuid4()), "ALARM_TIMEOUT", f"{yesterday}T08:46:00+07:00", chime_count=9)
 
-    res, (created, missed) = await asyncio.gather(
+    res, rules_pass = await asyncio.gather(
         send_telemetry(client, device, [timeout]),
         run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0)),
     )
 
     assert res.status_code == 200
-    assert created >= 1
+    assert rules_pass.created >= 1 and not rules_pass.materialize_failed
     decided = await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED'")
     assert decided >= 2
     assert await _count(db, "SELECT count(*) FROM notifications WHERE type = 'DOSE_MISSED'") == decided

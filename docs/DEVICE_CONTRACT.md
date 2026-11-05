@@ -177,9 +177,9 @@ Response `200`:
 ```
 - `results` follows the request order. `status` is `accepted`, `duplicate` or `rejected`.
 - **All three are final.** Remove those events from the local buffer. Only a network error or a 5xx means "keep and retry".
-- `rejected` covers an unknown `event_type`, a missing `slot_number`, a field with an invalid value (e.g. a negative `chime_count`; the reason names the field, never the value), `occurred_at` too far in the future (default > 7 days, to allow fast-forwarded RTCs), or a dose/door event whose `occurred_at` is too far in the past (default > 7 days, `TELEMETRY_MAX_PAST_SKEW_MINUTES`). An item that is not an object is rejected with `event_id: ""`.
-- Batch errors: `413 BATCH_TOO_LARGE` (more than 500 events: send in chunks), `422 VALIDATION_ERROR` (malformed JSON, or the envelope itself is wrong, e.g. `events` is not a list), `401 DEVICE_KEY_INVALID`.
-- What the device does with a batch answer: `2xx` → remove the events. `401`, `408`, `429`, `5xx` or a network error → keep them and retry later (`401`: re-register). `413` → resend in smaller chunks. Any other `4xx` → final: remove the batch (retrying it would block every later event).
+- `rejected` covers an unknown `event_type`, a missing `slot_number`, a field with an invalid value (e.g. a negative `chime_count`; the reason names the field, never the value), `occurred_at` too far in the future (default > 7 days, to allow fast-forwarded RTCs), or a dose/door event whose `occurred_at` is too far in the past (default > 7 days, `TELEMETRY_MAX_PAST_SKEW_MINUTES`). An item that is not an object is rejected with `event_id: ""`. A value the database refuses although it passed validation is rejected with the reason `could not be stored (<error class>)`; the other events of the batch are still stored. Integer fields are bounded by the Postgres `INTEGER` range.
+- Batch errors: `413 BATCH_TOO_LARGE` (more than 500 events: send in chunks), `413 PAYLOAD_TOO_LARGE` (body above `MAX_REQUEST_BODY_BYTES`, default 1 MiB: send in chunks), `422 VALIDATION_ERROR` (malformed JSON, or the envelope itself is wrong, e.g. `events` is not a list), `401 DEVICE_KEY_INVALID`.
+- What the device does with a batch answer: `2xx` → remove the events. `401`, `408`, `429`, `5xx` or a network error → keep them and retry later (`401`: re-register). `413` → resend in smaller chunks. Any other `4xx` **with the PillCare error body** (`{"error": {"code": …}}`) → final: remove the batch (retrying it would block every later event). A `4xx` without that body did not come from the backend (wrong URL, a proxy or captive portal): keep the events and retry later.
 - If `latest_config_version` is above your applied version, pull the config now.
 
 ---
@@ -190,7 +190,7 @@ Connect to `ws://<host>:8000/ws/device/{device_code}` with header `X-Device-Key:
 ```json
 {"type": "auth", "device_key": "<secret>"}
 ```
-Auth failure, and rotating the device secret while connected, close the socket with code **4401**. A newer connection for the same device replaces the old one, which is closed with code **4000**.
+Auth failure, and rotating the device secret while connected, close the socket with code **4401**. A newer connection for the same device replaces the old one, which is closed with code **4000**. A server-side failure (database unreachable while authenticating, an internal error) closes with **1011**: the key is fine, reconnect with backoff. A WebSocket heartbeat the server could not store is answered `{"type": "error", "error": "heartbeat not stored, retry later"}` and the socket stays open. A send the device does not read within `DEVICE_WS_SEND_TIMEOUT_SECONDS` drops the socket (closed with 1011).
 
 **Server → device on connect:**
 ```json

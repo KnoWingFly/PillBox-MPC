@@ -3,9 +3,13 @@
 import { useState } from 'react';
 import { TextInput } from 'react-native';
 
+import { Strings } from '@/constants/strings';
 import * as tokens from '@/theme/tokens';
+import { DEVICE_PIN_PATTERN } from '@root/lib/devices';
 
 import { Dialog, DialogActions, DialogHeader } from './dialog';
+
+const PIN_LENGTH = 4;
 
 export function PinPrompt({
   visible,
@@ -25,7 +29,17 @@ export function PinPrompt({
   onCancel: () => void;
 }) {
   const [pin, setPin] = useState('');
-  const valid = /^\d{4}$/.test(pin);
+  // The PIN never outlives the prompt: closing it (success, cancel or error) clears it.
+  const [wasVisible, setWasVisible] = useState(visible);
+  if (visible !== wasVisible) {
+    setWasVisible(visible);
+    if (!visible) setPin('');
+  }
+  const valid = DEVICE_PIN_PATTERN.test(pin);
+  // Enter while a request is running would send the PIN (and count a wrong one) twice.
+  const submit = () => {
+    if (valid && !busy) onSubmit(pin);
+  };
   const close = () => {
     setPin('');
     onCancel();
@@ -36,22 +50,23 @@ export function PinPrompt({
       <DialogHeader icon="lock-open-outline" tone="warning" title={title} message={message} />
       <TextInput
         className="min-h-[52px] rounded-2xl border border-line-strong bg-surface px-4 text-body text-ink"
-        placeholder="PIN perangkat (4 digit)"
+        placeholder={Strings.pinPrompt.placeholder}
         placeholderTextColor={tokens.colors.ink.subtle}
-        accessibilityLabel="PIN perangkat, 4 digit"
+        accessibilityLabel={Strings.pinPrompt.a11y}
         value={pin}
-        onChangeText={(v) => setPin(v.replace(/\D/g, '').slice(0, 4))}
+        editable={!busy}
+        onChangeText={(v) => setPin(v.replace(/\D/g, '').slice(0, PIN_LENGTH))}
         keyboardType="number-pad"
         secureTextEntry
         autoFocus
-        onSubmitEditing={() => valid && onSubmit(pin)}
+        onSubmitEditing={submit}
       />
       <DialogActions
         tone="warning"
         confirmLabel={confirmLabel}
         busy={busy}
         confirmDisabled={!valid}
-        onConfirm={() => onSubmit(pin)}
+        onConfirm={submit}
         onCancel={close}
       />
     </Dialog>

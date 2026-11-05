@@ -11,12 +11,12 @@ Both servers --> the same Supabase Postgres (RLS enabled on every table, no poli
 ## Data ownership (one writer per table)
 | Owner | Tables | How they change |
 |---|---|---|
-| Mobile / Prisma | `users`, `auth_identities`, `refresh_tokens`, `password_reset_otps`, `push_tokens` (enums: `interface_language`, `display_mode`, `auth_provider`, `push_platform` as native Postgres ENUMs) | `Mobile/prisma/schema.prisma` + Prisma migration |
-| Backend / SQL | `elderly`, `user_elderly_roles`, `notification_preferences`, `invitations`, `devices`, `device_stocks`, `refills`, `refill_items`, `schedules`, `device_events`, `telemetry_logs`, `notifications` (enums as VARCHAR + CHECK) | `Backend/migrations/NNNN_*.sql`, tracked in `backend_schema_migrations` |
+| Mobile / Prisma | `users`, `auth_identities`, `refresh_tokens`, `password_reset_otps`, `push_tokens`, plus `auth_attempts` (auth-route rate limits, not an account table) (enums: `interface_language`, `display_mode`, `auth_provider`, `push_platform` as native Postgres ENUMs) | `Mobile/prisma/schema.prisma` + Prisma migration |
+| Backend / SQL | `elderly`, `user_elderly_roles`, `notification_preferences`, `invitations`, `devices`, `device_stocks`, `refills`, `refill_items`, `schedules`, `device_events`, `telemetry_logs`, `notifications`, plus `attempt_counters` (PIN / pairing-lookup rate limits, 0007) (enums as VARCHAR + CHECK) | `Backend/migrations/NNNN_*.sql`, tracked in `backend_schema_migrations` |
 
 Rules that follow from this:
 - Backend treats the five account tables as read-only (it reads user profile, language and `push_tokens` to deliver notifications). It never runs DDL on them.
-- Prisma never models the twelve Backend tables.
+- Prisma never models the thirteen Backend tables (twelve ERD/domain tables plus `attempt_counters`).
 - Backend tables may reference `users.id` with foreign keys; that is fine, the FK is authored in Backend SQL.
 
 ## Auth flow (as designed)
@@ -47,9 +47,8 @@ Items marked **Decided** describe what the code already does: follow it. The oth
    - Problem: `DELETE /setting` removes the user; `user_elderly_roles` rows cascade, so an OWNER's elderly profile can end up with no OWNER (the partial unique index only prevents two).
    - Fix: reject account deletion with `409` while the user is OWNER of an elderly that still has other caregivers (they must transfer ownership first); if the user is the only caregiver, soft-delete the elderly (`deleted_at`) in the same transaction.
 
-6. **`notify_on_taken` default differs from code.**
-   - Problem: the column defaults to false, but code treats a missing row as true, so behavior depends on whether a row exists.
-   - Fix: create the `notification_preferences` row whenever a caregiver gains access to an elderly (create, invite, join), then remove the "missing row = true" branch.
+6. **`notify_on_taken` default. Decided: TRUE.**
+   - The code always treated a missing `notification_preferences` row as `notify_on_taken = true`. Migration `0009_notify_on_taken_default.sql` sets the column default to `TRUE` too, so behavior no longer depends on whether a row exists. Existing rows keep their value; `PUT /notification-preferences` still turns it off.
 
 7. **Mockup vs API for the device secret.**
    - Problem: mockups say "Master Device Password (8+ characters)"; API and ERD use a 4-digit PIN (`device_pin`), and `master_password_hash` is unused. A 4-digit PIN has only 10,000 values.

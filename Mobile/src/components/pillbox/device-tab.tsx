@@ -11,10 +11,12 @@ import { SLOT_IDS, type DeviceStatus, type DoseEventType, type Slot, type SlotId
 import { ListRow, ProgressBar, StatTile, SwitchRow } from './blocks';
 import {
   deviceLook,
-  formatJakartaClock,
+  formatPillboxClock,
   formatRelative,
   isSlotActive,
-  LOW_BATTERY_PERCENT,
+  batteryText,
+  formatBattery,
+  isLowBattery,
   pillboxClockNote,
   pillboxNow,
 } from './helpers';
@@ -90,7 +92,7 @@ function StatusCard({
     );
   }
   const look = deviceLook(device, now);
-  const lowBattery = device.batteryPercent <= LOW_BATTERY_PERCENT;
+  const lowBattery = isLowBattery(device.batteryPercent);
   return (
     <Card>
       <View className="flex-row items-start gap-3" accessible accessibilityLabel={`${device.deviceName}: ${look.label}. ${look.detail}`}>
@@ -111,15 +113,15 @@ function StatusCard({
           icon={lowBattery ? 'battery-dead-outline' : 'battery-half-outline'}
           tone={lowBattery ? 'missed' : 'ontime'}
           label={S.battery}
-          value={lowBattery ? S.batteryLow(device.batteryPercent) : `${device.batteryPercent}%`}
+          value={batteryText(device.batteryPercent)}
         />
       </View>
       <View className="gap-2">
         <View className="flex-row justify-between">
           <Text className="text-body-sm text-ink-muted">{S.batteryCapacity}</Text>
-          <Text className="text-body-sm font-semibold text-ink">{device.batteryPercent}%</Text>
+          <Text className="text-body-sm font-semibold text-ink">{formatBattery(device.batteryPercent)}</Text>
         </View>
-        <ProgressBar percent={device.batteryPercent} tone={lowBattery ? 'missed' : 'primary'} />
+        <ProgressBar percent={device.batteryPercent ?? 0} tone={lowBattery ? 'missed' : 'primary'} />
       </View>
       <ListRow
         icon={device.openSlots.length ? 'lock-open-outline' : 'lock-closed-outline'}
@@ -171,7 +173,7 @@ function ClockCard({
       <View className="items-center gap-1 rounded-2xl bg-primary-light p-4">
         <Text className="text-caption font-semibold uppercase text-primary-dark">{S.internalClock}</Text>
         <Text className="text-time font-bold text-primary-dark" accessibilityLiveRegion="none">
-          {formatJakartaClock(pillboxNow(device, tick))}
+          {formatPillboxClock(pillboxNow(device, tick))}
         </Text>
         <Text className="text-body-sm text-ink-muted">{clock?.timezone ?? ''}</Text>
         <Text className={`text-body-sm ${note ? 'text-late-fg' : 'text-ontime-fg'}`}>{note ?? S.synced}</Text>

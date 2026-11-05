@@ -146,7 +146,8 @@ def test_old_database_is_migrated_and_keeps_its_events(tmp_path):
     ).fetchall()
     assert leftovers == []
     indexes = {r[0] for r in migrated._conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    assert {"idx_events_unsynced", "idx_events_compartment"} <= indexes
+    assert {"idx_events_outbox", "idx_events_compartment", "idx_events_occurred"} <= indexes
+    assert "idx_events_unsynced" not in indexes  # duplicate of idx_events_outbox's prefix
     # Opening again must not migrate (or break) anything.
     Database(db_path=db_path)
 
@@ -173,3 +174,105 @@ def test_gui_and_sync_threads_can_share_the_connection(tmp_path):
     for t in threads:
         t.join()
     assert errors == []
+
+
+# --- config validation, tuning and recovery --------------------------------------------
+
+import sqlite3  # noqa: E402
+
+import pytest  # noqa: E402
+
+from smart_pillbox.db.database import ConfigError, backup_corrupt_database  # noqa: E402
+
+GOOD = {"slot_number": 1, "window_start": "08:15", "window_end": "08:30", "tolerance_minutes": 45,
+        "days_of_week": [1, 3, 5], "active": True, "schedule_id": "abc", "medication_name": "Obat"}
+
+
+def _snapshot(db):
+    return [(c.slot_number, c.schedule_time, c.window_end, c.tolerance_minutes, c.is_active, c.days_of_week)
+            for c in db.get_compartments()]
+
+
+@pytest.mark.parametrize(
+    "schedules",
+    [
+        [GOOD, {**GOOD, "slot_number": 2, "window_start": "8.15"}],
+        [GOOD, {**GOOD, "slot_number": 2, "window_end": "24:00"}],
+        [GOOD, {**GOOD, "slot_number": 0}],
+        [GOOD, {**GOOD, "slot_number": True}],
+        [GOOD, {**GOOD, "slot_number": 2, "tolerance_minutes": "30"}],
+        [GOOD, {**GOOD, "slot_number": 2, "days_of_week": [0, 8]}],
+        [GOOD, {**GOOD, "slot_number": 2, "active": "yes"}],
+        [GOOD, {**GOOD, "slot_number": 2, "medication_name": 5}],
+        [GOOD, GOOD],
+        [GOOD, "not an object"],
+        {"slot_number": 1},
+    ],
+)
+def test_bad_or_partial_config_keeps_the_old_schedules(tmp_path, schedules):
+    db = make_db(tmp_path)
+    before = _snapshot(db)
+    with pytest.raises(ConfigError):
+        db.update_schedules(schedules)
+    assert _snapshot(db) == before
+
+
+def test_config_transaction_rolls_back_on_a_database_error(tmp_path, monkeypatch):
+    db = make_db(tmp_path)
+    before = _snapshot(db)
+    db._conn.execute("CREATE TRIGGER fail_slot_2 BEFORE UPDATE ON compartments WHEN NEW.slot_number = 2 "
+                     "AND NEW.is_active = 1 BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    with pytest.raises(sqlite3.DatabaseError):
+        db.apply_config([GOOD, {**GOOD, "slot_number": 2}], {"config_version": "5"})
+    assert _snapshot(db) == before
+    assert db.get_device_state("config_version") == "1"
+
+
+def test_window_end_and_schedule_id_are_stored(tmp_path):
+    db = make_db(tmp_path)
+    db.update_schedules([GOOD])
+    slot1 = next(c for c in db.get_compartments() if c.slot_number == 1)
+    assert (slot1.window_end, slot1.schedule_id, slot1.days_of_week) == ("08:30", "abc", [1, 3, 5])
+
+
+def test_wal_mode_is_used(tmp_path):
+    db = make_db(tmp_path)
+    assert db._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_pruning_keeps_unsynced_events(tmp_path):
+    db = make_db(tmp_path)
+    compartment_id = db.get_compartments()[0].id
+    old = datetime(2025, 1, 1, 7, 0)
+    synced = db.log_event(compartment_id, 1, "POPUP_ACTIVATED", old)
+    db.log_event(compartment_id, 1, "COMPARTMENT_OPENED", old)
+    db.mark_synced([synced])
+    assert db.prune_synced_events(datetime(2026, 1, 1)) == 1
+    assert [r["event_type"] for r in db.get_unsynced_events()] == ["COMPARTMENT_OPENED"]
+    assert db.count_unsynced_events() == 1
+
+
+def test_corrupt_database_can_be_backed_up_and_recreated(tmp_path):
+    path = tmp_path / "broken.db"
+    path.write_bytes(b"this is not a sqlite database" * 100)
+    with pytest.raises(sqlite3.DatabaseError):
+        Database(db_path=path)
+    backup = backup_corrupt_database(path, now=datetime(2026, 11, 3, 9, 0))
+    assert backup.exists() and not path.exists()
+    assert len(Database(db_path=path).get_compartments()) == 8
+
+
+def test_old_database_without_new_columns_is_migrated(tmp_path):
+    path = tmp_path / "v0.db"
+    raw = sqlite3.connect(path)
+    raw.execute("""CREATE TABLE compartments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, slot_number INTEGER NOT NULL UNIQUE,
+        meal_relation TEXT NOT NULL, meal_time TEXT NOT NULL, schedule_time TEXT NOT NULL,
+        tolerance_minutes INTEGER NOT NULL DEFAULT 30)""")
+    raw.execute("INSERT INTO compartments (slot_number, meal_relation, meal_time, schedule_time) "
+                "VALUES (1, 'sebelum_makan', 'pagi', '07:00')")
+    raw.commit()
+    raw.close()
+    compartment = Database(db_path=path).get_compartments()[0]
+    assert compartment.is_active and compartment.days_of_week == [1, 2, 3, 4, 5, 6, 7]
+    assert compartment.window_end is None and compartment.schedule_id is None

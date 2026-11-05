@@ -1,7 +1,15 @@
 import { z } from 'zod';
 
 const email = z.string().trim().toLowerCase().pipe(z.email().max(254));
-const password = z.string().min(8, 'Password must be at least 8 characters').max(72, 'Password is too long');
+// bcrypt reads only the first 72 BYTES; a longer password would be silently truncated.
+const BCRYPT_MAX_BYTES = 72;
+const PASSWORD_MIN_LENGTH = 8;
+const withinBcryptLimit = (value: string) => new TextEncoder().encode(value).length <= BCRYPT_MAX_BYTES;
+const anyPassword = z.string().min(1).refine(withinBcryptLimit, `Password must be at most ${BCRYPT_MAX_BYTES} bytes`);
+const password = z
+  .string()
+  .min(PASSWORD_MIN_LENGTH, `Password must be at least ${PASSWORD_MIN_LENGTH} characters`)
+  .refine(withinBcryptLimit, `Password must be at most ${BCRYPT_MAX_BYTES} bytes`);
 const fullName = z.string().trim().min(1).max(100);
 const phoneNumber = z.e164();
 
@@ -25,7 +33,7 @@ export const registerSchema = z.object({
 
 export const loginSchema = z.object({
   email,
-  password: z.string().min(1).max(72),
+  password: anyPassword,
 });
 
 export const googleSchema = z.object({
@@ -44,7 +52,7 @@ export const resetPasswordSchema = z.object({
 });
 
 export const changePasswordSchema = z.object({
-  old_password: z.string().min(1).max(72).optional(),
+  old_password: anyPassword.optional(),
   new_password: password,
 });
 
@@ -61,7 +69,7 @@ export const updateSettingSchema = z
   .refine((body) => Object.keys(body).length > 0, 'At least one field is required');
 
 export const deleteAccountSchema = z.object({
-  password: z.string().min(1).max(72).optional(),
+  password: anyPassword.optional(),
   confirm: z.literal('DELETE').optional(),
 });
 

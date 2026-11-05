@@ -75,13 +75,24 @@ async function secureRemove(name: string): Promise<void> {
   await SecureStore.deleteItemAsync(name, OPTIONS);
 }
 
+function chunkCount(value: string | null): number {
+  return value?.startsWith(CHUNK_MARKER) ? Number(value.slice(CHUNK_MARKER.length)) : 0;
+}
+
+// Never deletes before writing: a crash between a delete and the write would lose the session.
+// The new value is written first, then chunks the old value used and the new one does not are removed.
 async function secureSet(name: string, value: string): Promise<void> {
-  // Delete first: an existing item keeps its old accessibility class on update.
-  await secureRemove(name);
-  if (value.length <= CHUNK_SIZE) return SecureStore.setItemAsync(name, value, OPTIONS);
-  const chunks = value.match(new RegExp(`[\\s\\S]{1,${CHUNK_SIZE}}`, 'g')) ?? [];
-  await Promise.all(chunks.map((chunk, i) => SecureStore.setItemAsync(`${name}.${i}`, chunk, OPTIONS)));
-  await SecureStore.setItemAsync(name, `${CHUNK_MARKER}${chunks.length}`, OPTIONS);
+  const oldChunks = chunkCount(await SecureStore.getItemAsync(name, OPTIONS).catch(() => null));
+  let newChunks = 0;
+  if (value.length <= CHUNK_SIZE) {
+    await SecureStore.setItemAsync(name, value, OPTIONS);
+  } else {
+    const chunks = value.match(new RegExp(`[\\s\\S]{1,${CHUNK_SIZE}}`, 'g')) ?? [];
+    for (const [i, chunk] of chunks.entries()) await SecureStore.setItemAsync(`${name}.${i}`, chunk, OPTIONS);
+    await SecureStore.setItemAsync(name, `${CHUNK_MARKER}${chunks.length}`, OPTIONS);
+    newChunks = chunks.length;
+  }
+  for (let i = newChunks; i < oldChunks; i += 1) await SecureStore.deleteItemAsync(`${name}.${i}`, OPTIONS).catch(() => undefined);
 }
 
 async function get(key: Key): Promise<string | null> {
@@ -105,14 +116,21 @@ async function set(key: Key, value: string): Promise<void> {
   memory.set(KEYS[key], value);
 }
 
-async function removeEverywhere(key: Key): Promise<void> {
-  memory.delete(KEYS[key]);
+/** Removes `key` from every store except `keep` (the one a new session is about to write to). */
+async function removeEverywhere(key: Key, keep: Backend | null = null): Promise<void> {
+  if (keep !== 'memory') memory.delete(KEYS[key]);
   if (isWeb) {
-    webStorage('local')?.removeItem(KEYS[key]);
-    webStorage('session')?.removeItem(KEYS[key]);
-  } else {
+    if (keep !== 'local') webStorage('local')?.removeItem(KEYS[key]);
+    if (keep !== 'session') webStorage('session')?.removeItem(KEYS[key]);
+  } else if (keep !== 'secure') {
     await secureRemove(KEYS[key]);
   }
+}
+
+/** Writes one at a time, in order: the refresh token first, so a failure part-way never leaves an
+ * access token without the refresh token that renews it. */
+async function setInOrder(entries: [Key, string][]): Promise<void> {
+  for (const [key, value] of entries) await set(key, value);
 }
 
 export const tokenStore = {
@@ -121,16 +139,26 @@ export const tokenStore = {
   /**
    * Starts a session. `remember` false: native keeps the tokens in memory (lost when the app is
    * killed), web keeps them in sessionStorage (lost when the tab closes).
-   * Clears every store first so a previous remembered session cannot linger beside a new one.
+   * Every other store is cleared so a previous remembered session cannot linger beside a new one;
+   * the target store is overwritten in place, never emptied first.
    */
   async startSession(accessToken: string, refreshToken: string, remember: boolean) {
-    await this.clear();
-    backend = isWeb ? (remember ? 'local' : 'session') : remember ? 'secure' : 'memory';
-    await Promise.all([set('access', accessToken), set('refresh', refreshToken), set('loginAt', String(Date.now()))]);
+    const target: Backend = isWeb ? (remember ? 'local' : 'session') : remember ? 'secure' : 'memory';
+    await Promise.all((Object.keys(KEYS) as Key[]).map((key) => removeEverywhere(key, target)));
+    backend = target;
+    await removeEverywhere('pushTokenId'); // belongs to the previous account
+    await setInOrder([
+      ['refresh', refreshToken],
+      ['access', accessToken],
+      ['loginAt', String(Date.now())],
+    ]);
   },
   /** Stores a rotated token pair in whichever store the current session uses. */
   async setTokens(accessToken: string, refreshToken: string) {
-    await Promise.all([set('access', accessToken), set('refresh', refreshToken)]);
+    await setInOrder([
+      ['refresh', refreshToken],
+      ['access', accessToken],
+    ]);
   },
   async getLoginAt(): Promise<number | null> {
     const raw = await get('loginAt');
@@ -139,7 +167,7 @@ export const tokenStore = {
   },
   markLoginNow: () => set('loginAt', String(Date.now())),
   async clear() {
-    await Promise.all((Object.keys(KEYS) as Key[]).map(removeEverywhere));
+    await Promise.all((Object.keys(KEYS) as Key[]).map((key) => removeEverywhere(key)));
     backend = isWeb ? null : 'secure';
   },
   getPushTokenId: () => get('pushTokenId'),

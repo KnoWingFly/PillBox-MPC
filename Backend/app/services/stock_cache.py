@@ -30,3 +30,7 @@ def remember(device_id: UUID, counts: Counts) -> None:
 
 def forget(device_id: UUID) -> None:
     _written.pop(device_id, None)
+
+
+def clear() -> None:
+    _written.clear()

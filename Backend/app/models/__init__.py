@@ -1,3 +1,4 @@
+from app.models.attempts import AttemptCounter
 from app.models.base import Base
 from app.models.devices import Device, DeviceStock, Refill, RefillItem, Schedule
 from app.models.elderly import Elderly, Invitation, NotificationPreference, UserElderlyRole
@@ -6,6 +7,7 @@ from app.models.telemetry import DeviceEvent, TelemetryLog
 from app.models.users import AuthIdentity, PushToken, User
 
 __all__ = [
+    "AttemptCounter",
     "AuthIdentity",
     "Base",
     "Device",

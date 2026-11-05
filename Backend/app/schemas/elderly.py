@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
-from app.models.enums import Connectivity, Gender, Role
+from app.models.enums import MAX_DEVICE_OFFLINE_AFTER_MINUTES, Connectivity, Gender, Role
 from app.schemas.common import E164, BirthDate, ElderlyName, FreeText, Label50, Name100
 
 
@@ -89,6 +89,13 @@ class CaregiverOut(BaseModel):
     added_at: datetime
 
 
+
+class CaregiverPage(BaseModel):
+    data: list[CaregiverOut]
+    page: int
+    limit: int
+    total: int
+
 class TransferOwnershipIn(BaseModel):
     new_owner_caregiver_id: UUID
 
@@ -109,5 +116,5 @@ class NotificationPreferencesIO(BaseModel):
     notify_on_missed: bool = True
     notify_on_taken: bool = True  # matches services/notifications.py Preferences
     notify_on_device_offline: bool = True
-    device_offline_after_minutes: int = Field(10, ge=1, le=1440)
+    device_offline_after_minutes: int = Field(10, ge=1, le=MAX_DEVICE_OFFLINE_AFTER_MINUTES)
     notify_on_low_battery: bool = True
