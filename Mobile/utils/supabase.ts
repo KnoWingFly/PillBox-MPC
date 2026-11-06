@@ -1,7 +1,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { Platform } from 'react-native'
 
-// Used ONLY for the Google ID-token exchange; our own API issues the real session.
-// The Supabase session is never persisted and is signed out locally right after the exchange.
+// Used only to verify Google sign-in; the app's own auth API issues the lasting session.
 let client: SupabaseClient | undefined
 
 export function getSupabase(): SupabaseClient {
@@ -11,9 +11,11 @@ export function getSupabase(): SupabaseClient {
 
   client ??= createClient(url, publishableKey, {
     auth: {
-      persistSession: false,
+      persistSession: Platform.OS === 'web',
       autoRefreshToken: false,
       detectSessionInUrl: false,
+      flowType: 'pkce',
+      ...(Platform.OS === 'web' && typeof window !== 'undefined' ? { storage: window.sessionStorage } : {}),
     },
   })
   return client

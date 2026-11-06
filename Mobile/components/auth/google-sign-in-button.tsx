@@ -1,15 +1,32 @@
 import { useState } from 'react';
-import { ActivityIndicator, Image, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, Image, Platform, Text, TouchableOpacity, View } from 'react-native';
 
 import { Strings } from '@/constants/strings';
 import { useAuth } from '@/hooks/use-auth';
 import { errorMessage } from '@/lib/api/error-message';
-import { isGoogleSignInAvailable } from '@/lib/google-signin';
+import { getGoogleSignInUnavailableMessage } from '@/lib/google-signin';
 import * as tokens from '@/theme/tokens';
 
 // Bundled, so the button never depends on a third-party host (offline, blocked, tracking).
 const GOOGLE_LOGO = require('@/assets/images/google-g.png');
 const GOOGLE_LOGO_SIZE = 24;
+
+function googleSignInDebugDetails(err: unknown): string {
+  const value = err && typeof err === 'object' ? (err as Record<string, unknown>) : {};
+  const stage = typeof value.googleSignInStage === 'string' ? value.googleSignInStage : 'unknown';
+  const code = typeof value.code === 'string' || typeof value.code === 'number' ? String(value.code) : '';
+  const status = typeof value.status === 'number' ? String(value.status) : '';
+  const rawReason = err instanceof Error ? err.message : String(err);
+  const reason = rawReason
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\beyJ[\w-]*\.[\w-]*\.[\w-]*\b/g, '[redacted token]')
+    .replace(/\b(access_token|id_token|refresh_token)\s*[:=]\s*[^,\s]+/gi, '$1=[redacted]')
+    .slice(0, 180);
+  const webClientId = process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID?.trim();
+  const clientIdPart = webClientId?.match(/-([^-]+)\.apps\.googleusercontent\.com$/)?.[1];
+  const clientIdSuffix = clientIdPart ? clientIdPart.slice(-8) : webClientId ? 'format-invalid' : 'missing';
+  return Strings.auth.googleDebugDetails(stage, code, status, reason, clientIdSuffix);
+}
 
 export default function GoogleSignInButton({
   disabled,
@@ -25,7 +42,7 @@ export default function GoogleSignInButton({
 }) {
   const { signInWithGoogle, clearSessionNotice } = useAuth();
   const [loading, setLoading] = useState(false);
-  const available = isGoogleSignInAvailable();
+  const unavailableMessage = getGoogleSignInUnavailableMessage();
 
   const onPress = async () => {
     if (loading) return;
@@ -34,13 +51,21 @@ export default function GoogleSignInButton({
       clearSessionNotice();
       await signInWithGoogle(remember); // false = cancelled, stays silent
     } catch (err) {
-      onError(errorMessage(err));
+      const message = errorMessage(err);
+      if (__DEV__) {
+        const details = googleSignInDebugDetails(err);
+        if (Platform.OS === 'web') onError(`${message}\n${details}`);
+        else Alert.alert(Strings.auth.googleDebugTitle, `${message}\n\n${details}`);
+      } else {
+        onError(message);
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  const isDisabled = !available || loading || disabled;
+  // Keep the action tappable when setup detection fails so users see the actual sign-in error.
+  const isDisabled = loading || disabled;
 
   return (
     <View>
@@ -65,7 +90,7 @@ export default function GoogleSignInButton({
           </>
         )}
       </TouchableOpacity>
-      {!available && <Text className="mt-2 text-center text-caption text-ink-muted">{Strings.auth.googleUnavailable}</Text>}
+      {unavailableMessage && <Text className="mt-2 text-center text-caption text-ink-muted">{unavailableMessage}</Text>}
     </View>
   );
 }

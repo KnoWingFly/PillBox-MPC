@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from 'react';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
 
 import { AppConfig } from '@/config';
 import { Strings } from '@/constants/strings';
@@ -31,6 +31,7 @@ type AuthContextValue = {
   signUp: (input: Omit<RegisterInput, 'timezone'>) => Promise<void>;
   /** Resolves false when the user cancels the Google picker. */
   signInWithGoogle: (remember: boolean) => Promise<boolean>;
+  completeGoogleSignIn: (code: string, remember: boolean) => Promise<void>;
   signOut: () => Promise<void>;
   forgotPassword: (email: string) => Promise<void>;
   resetPassword: (email: string, otpCode: string, newPassword: string) => Promise<void>;
@@ -40,6 +41,12 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 const NOTICE_SESSION_AGED_OUT = Strings.session.agedOut;
 const NOTICE_SESSION_EXPIRED = Strings.session.expired;
+
+function withGoogleSignInStage(err: unknown, stage: string): Error & { googleSignInStage: string } {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const previousStage = (error as Error & { googleSignInStage?: unknown }).googleSignInStage;
+  return Object.assign(error, { googleSignInStage: typeof previousStage === 'string' ? previousStage : stage });
+}
 
 /** The only answers that end a stored session. Offline, timeouts and 5xx keep it. */
 const SESSION_REJECTED_CODES = new Set(['UNAUTHORIZED', 'REFRESH_TOKEN_INVALID']);
@@ -193,29 +200,74 @@ export default function AuthProvider({ children }: PropsWithChildren) {
     [startSession],
   );
 
-  const signInWithGoogle = useCallback<AuthContextValue['signInWithGoogle']>(async (remember) => {
-    perfLoginStep('google_sign_in_started');
-    const idToken = await getGoogleIdToken();
-    if (!idToken) return false; // cancelled: silent
-    perfLoginStep('google_sign_in_returned');
+  const exchangeGoogleSession = useCallback(
+    async (supabaseAccessToken: string, remember: boolean) => {
+      let stage = 'pillcare_auth_api';
+      try {
+        const res = await authApi.google({ supabase_access_token: supabaseAccessToken, timezone: deviceTimezone() });
+        perfLoginStep('google_exchange_returned');
+        stage = 'save_app_session';
+        await startSession(res, res.caregiver, remember);
+      } catch (err) {
+        throw withGoogleSignInStage(err, stage);
+      }
+    },
+    [startSession],
+  );
 
-    const supabase = getSupabase();
-    try {
-      const { data, error } = await supabase.auth.signInWithIdToken({ provider: 'google', token: idToken });
-      if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
-      perfLoginStep('supabase_session_ready');
-      const res = await authApi.google({
-        supabase_access_token: data.session.access_token,
-        timezone: deviceTimezone(),
-      });
-      perfLoginStep('google_exchange_returned');
-      await startSession(res, res.caregiver, remember);
-      return true;
-    } finally {
-      // Never keep a second live session: ours is the only one.
-      await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
-    }
-  }, [startSession]);
+  const completeGoogleSignIn = useCallback<AuthContextValue['completeGoogleSignIn']>(
+    async (code, remember) => {
+      const supabase = getSupabase();
+      try {
+        const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+        if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
+        perfLoginStep('supabase_session_ready');
+        await exchangeGoogleSession(data.session.access_token, remember);
+      } finally {
+        await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+      }
+    },
+    [exchangeGoogleSession],
+  );
+
+  const signInWithGoogle = useCallback<AuthContextValue['signInWithGoogle']>(
+    async (remember) => {
+      perfLoginStep('google_sign_in_started');
+      if (Platform.OS === 'web') {
+        const callbackUrl = new URL('/auth/google-callback', window.location.origin);
+        callbackUrl.searchParams.set('remember', String(remember));
+        const { error } = await getSupabase().auth.signInWithOAuth({
+          provider: 'google',
+          options: { redirectTo: callbackUrl.toString() },
+        });
+        if (error) throw error;
+        return true;
+      }
+
+      let stage = 'native_google_sign_in';
+      let supabase: ReturnType<typeof getSupabase> | null = null;
+      try {
+        const idToken = await getGoogleIdToken();
+        if (!idToken) return false;
+        perfLoginStep('google_sign_in_returned');
+
+        stage = 'supabase_token_exchange';
+        supabase = getSupabase();
+        const { data, error } = await supabase.auth.signInWithIdToken({ provider: 'google', token: idToken });
+        if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
+        perfLoginStep('supabase_session_ready');
+
+        stage = 'pillcare_auth_api';
+        await exchangeGoogleSession(data.session.access_token, remember);
+        return true;
+      } catch (err) {
+        throw withGoogleSignInStage(err, stage);
+      } finally {
+        if (supabase) await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+      }
+    },
+    [exchangeGoogleSession],
+  );
 
   const signOut = useCallback(() => endSession(null), [endSession]);
   const clearSessionNotice = useCallback(() => setSessionNotice(null), []);
@@ -239,11 +291,24 @@ export default function AuthProvider({ children }: PropsWithChildren) {
       signIn,
       signUp,
       signInWithGoogle,
+      completeGoogleSignIn,
       signOut,
       forgotPassword,
       resetPassword,
     }),
-    [status, user, sessionNotice, clearSessionNotice, signIn, signUp, signInWithGoogle, signOut, forgotPassword, resetPassword],
+    [
+      status,
+      user,
+      sessionNotice,
+      clearSessionNotice,
+      signIn,
+      signUp,
+      signInWithGoogle,
+      completeGoogleSignIn,
+      signOut,
+      forgotPassword,
+      resetPassword,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

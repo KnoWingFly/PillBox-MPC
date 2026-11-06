@@ -47,7 +47,7 @@ export function MonitoringPreview() {
           <Text className="shrink text-caption font-bold uppercase text-ink-muted">{S.trayTitle}</Text>
           <Text className="text-caption font-bold text-primary">{S.activeSlot}</Text>
         </View>
-        <View className="flex-row flex-wrap justify-between gap-y-2">
+        <View className="flex-row flex-wrap justify-between">
           {DEMO_SLOTS.map((slot) => (
             <DemoSlot key={slot.label} label={slot.label} time={slot.time} state={slot.state} />
           ))}
@@ -90,8 +90,8 @@ const DemoSlot = memo(function DemoSlot({ label, time, state }: { label: string;
 
   return (
     // className stays on a plain View: NativeWind styles core components, the Animated wrapper only scales.
-    <View className="aspect-square w-[23%]">
-      <Animated.View style={[StyleSheet.absoluteFill, pulse]}>
+    <View style={styles.slot}>
+      <Animated.View style={[styles.slotFace, pulse]}>
         <View className={`flex-1 items-center justify-center rounded-full ${active ? 'bg-primary' : 'bg-canvas'}`}>
           {active && <View className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full bg-missed-solid" />}
           <Text className={`text-caption ${text}`}>{label}</Text>
@@ -101,4 +101,17 @@ const DemoSlot = memo(function DemoSlot({ label, time, state }: { label: string;
       </Animated.View>
     </View>
   );
+});
+
+const styles = StyleSheet.create({
+  // Keep the slot's size in native layout styles; NativeWind's aspect-square can measure to zero
+  // when nested in the animated preview on device.
+  slot: {
+    width: '23%',
+    aspectRatio: 1,
+    marginBottom: tokens.spacing.sm,
+  },
+  slotFace: {
+    flex: 1,
+  },
 });

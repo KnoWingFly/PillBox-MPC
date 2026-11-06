@@ -35,6 +35,34 @@ npm run reset-project
 
 This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
 
+## Google sign-in
+
+The website uses Supabase's Google OAuth redirect. Configure the Google provider in the Supabase
+Dashboard with a Google **Web application** OAuth client ID and secret. In Google Cloud, add the
+website origin (for local development, `http://localhost:8081`) as an authorized JavaScript origin,
+and add the Supabase callback URL shown on the Supabase Google provider page as an authorized
+redirect URI. In Supabase URL Configuration, allow the app callback URL
+`http://localhost:8081/auth/google-callback`.
+
+Set `EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_KEY`, and `SUPABASE_SECRET_KEY` in the local
+environment; the last value is server-only. The auth API also needs its normal database and
+`JWT_ACCESS_SECRET` settings. Restart Expo after changing environment values. Then run `pnpm web`
+and use **Lanjutkan dengan Google** on the Masuk screen.
+
+On a phone, Google sign-in uses the native Google Sign-In module and does not work in Expo Go.
+Install the SDK-compatible development client with `pnpm exec expo install expo-dev-client`, then
+build and run it with `pnpm exec expo run:android` (Android Studio/device required). Configure a
+Google Android OAuth client with the app's Android package name and the SHA-1 of the certificate
+that signs the development build; add that client ID to Supabase's Google provider. Set
+`EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` to the Google Web client ID and
+`EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_KEY`, and server-side `SUPABASE_SECRET_KEY` in
+the environment before building.
+
+For iOS, configure a Google iOS OAuth client for the app's bundle ID, add it to Supabase, and set
+`EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`. Replace the `iosUrlScheme` placeholder in `app.json` with the
+reversed iOS client ID (`com.googleusercontent.apps.<client-id-prefix>`) before generating the
+development build. An iOS build requires macOS/Xcode or an EAS Build environment.
+
 ### Other setup steps
 
 - To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
