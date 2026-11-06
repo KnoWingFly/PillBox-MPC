@@ -78,6 +78,8 @@ class DeviceListItem(BaseModel):
 
 class DeviceList(BaseModel):
     data: list[DeviceListItem]
+    page: int
+    limit: int
     total: int
 
 

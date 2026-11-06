@@ -28,16 +28,17 @@ from sqlalchemy.orm import Session, SessionTransaction
 
 from app.core.config import Settings
 from app.models import Device, Elderly, Notification
-from app.models.enums import Connectivity, NotificationType, Severity
+from app.models.enums import MAX_DEVICE_OFFLINE_AFTER_MINUTES, Connectivity, NotificationType, Severity
 from app.services.app_hub import queue_device_change
-from app.services.notifications import NotificationSpec, load_recipients, notify, ts_key
+from app.services.notifications import NotificationSpec, load_recipients_many, notify, ts_key
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
 
-# The longest caregiver preference (1440 min) plus slack; older outages were
-# already notified (or never will be), so the sweep does not re-scan them.
-_MAX_OFFLINE_NOTIFY_LOOKBACK = timedelta(minutes=1440 + 60)
+# The longest caregiver preference plus slack; older outages were already notified (or never
+# will be), so the sweep does not re-scan them.
+_OFFLINE_LOOKBACK_SLACK = timedelta(hours=1)
+_MAX_OFFLINE_NOTIFY_LOOKBACK = timedelta(minutes=MAX_DEVICE_OFFLINE_AFTER_MINUTES) + _OFFLINE_LOOKBACK_SLACK
 
 
 def device_label(device: Device) -> str:
@@ -67,7 +68,7 @@ async def mark_seen(session: AsyncSession, device: Device, now: datetime) -> boo
     """Records a liveness signal. Returns True on an OFFLINE -> ONLINE transition.
     Locks the device row (unless this transaction already did); does not commit."""
     if session.info.get(_LOCKED_DEVICE_KEY) != device.id:
-        await session.refresh(device, with_for_update=True)
+        await session.refresh(device, with_for_update={"key_share": True})  # see find_device
         mark_row_locked(session, device)
     device.last_heartbeat = now
     if device.status == Connectivity.ONLINE:
@@ -153,17 +154,30 @@ async def sweep(session: AsyncSession, now: datetime, settings: Settings) -> Non
             Elderly.deleted_at.is_(None),
         )
     )
-    for device in candidates.scalars().all():
+    devices = candidates.scalars().all()  # offline_since and elderly_id are non-null by the WHERE
+    # One recipients query per sweep instead of one per offline device.
+    recipients_by_elderly = await load_recipients_many(session, {d.elderly_id for d in devices if d.elderly_id})
+    # Who already has each device's DEVICE_OFFLINE row: without this the same (deduplicated)
+    # INSERT ran every PRESENCE_CHECK_INTERVAL for as long as the device stayed offline.
+    event_keys = [offline_event_key(d.id, d.offline_since) for d in devices if d.offline_since is not None]
+    already: dict[str, set[UUID]] = {}
+    if event_keys:
+        notified = await session.execute(
+            select(Notification.event_key, Notification.user_id).where(Notification.event_key.in_(event_keys))
+        )
+        for event_key, user_id in notified.all():
+            already.setdefault(event_key, set()).add(user_id)
+    for device in devices:
         offline_since = device.offline_since
         elderly_id = device.elderly_id
         if offline_since is None or elderly_id is None:
             continue
-        recipients = await load_recipients(session, elderly_id)
+        recipients = recipients_by_elderly.get(elderly_id, [])
         due = {
             r.user_id
             for r in recipients
             if offline_since <= now - max(global_grace, timedelta(minutes=r.prefs.device_offline_after_minutes))
-        }
+        } - already.get(offline_event_key(device.id, offline_since), set())
         if not due:
             continue
         await notify(

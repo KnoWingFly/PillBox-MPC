@@ -7,7 +7,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -37,12 +37,12 @@ from app.services.access import require_role
 from app.services.adherence import AdherenceSummary, delay_minutes_for, dose_instants, is_scheduled_on, journal_status
 from app.services.device_clock import device_now
 from app.services.doses import report_taken_after_missed
+from app.services.notifications import NOTE_BY_CAREGIVER, note_texts
 from app.services.slots import slot_layout
 from app.services.timeutil import as_aware, zone
 
 logger = logging.getLogger(__name__)
 
-MAX_SUMMARY_DAYS = 366
 
 
 @dataclass
@@ -73,23 +73,69 @@ async def day_doses(
     device_id -> local date to show for that device. With unlinked_date, rows
     of devices no longer linked to this elderly (history) on that date are
     included too."""
-    records: list[DoseRecord] = []
-    devices_by_id = {d.id: d for d in devices}
     dates = set(day_for.values()) | ({unlinked_date} if unlinked_date else set())
     if not dates:
-        return records
+        return []
+    logs, schedules = await _dose_rows(session, [elderly_id], list(day_for), dates)
+    return _records(logs, schedules, {d.id: d for d in devices}, day_for, now, unlinked_date)
+
+
+async def day_doses_many(
+    session: AsyncSession, devices_by_elderly: dict[UUID, list[Device]], day_for: dict[UUID, date], now: datetime
+) -> dict[UUID, list[DoseRecord]]:
+    """day_doses for several elderly at once (two queries in total, not two per elderly)."""
+    device_ids = [d.id for devices in devices_by_elderly.values() for d in devices]
+    dates = set(day_for.values())
+    if not dates or not device_ids:
+        return {elderly_id: [] for elderly_id in devices_by_elderly}
+    logs, schedules = await _dose_rows(session, list(devices_by_elderly), device_ids, dates)
+    logs_by_elderly: dict[UUID, list[tuple[TelemetryLog, Device, Schedule | None]]] = defaultdict(list)
+    for row in logs:
+        logs_by_elderly[row[0].elderly_id].append(row)
+    out = {}
+    for elderly_id, devices in devices_by_elderly.items():
+        own = {d.id: d for d in devices}
+        out[elderly_id] = _records(
+            logs_by_elderly.get(elderly_id, []), [s for s in schedules if s.device_id in own], own, day_for, now, None
+        )
+    return out
+
+
+async def _dose_rows(
+    session: AsyncSession, elderly_ids: list[UUID], device_ids: list[UUID], dates: set[date]
+) -> tuple[list[tuple[TelemetryLog, Device, Schedule | None]], list[Schedule]]:
     rows = await session.execute(
         select(TelemetryLog, Device, Schedule)
         .join(Device, Device.id == TelemetryLog.device_id)
         .outerjoin(Schedule, Schedule.id == TelemetryLog.schedule_id)
         .where(
-            TelemetryLog.elderly_id == elderly_id,
+            TelemetryLog.elderly_id.in_(elderly_ids),
             TelemetryLog.status.is_not(None),
             TelemetryLog.scheduled_date.in_(list(dates)),
         )
     )
+    schedules = await session.execute(
+        select(Schedule).where(
+            Schedule.device_id.in_(device_ids),
+            Schedule.deleted_at.is_(None),
+            Schedule.is_active.is_(True),
+        )
+    )
+    logs = [(log, device, schedule) for log, device, schedule in rows.all()]
+    return logs, list(schedules.scalars().all())
+
+
+def _records(
+    logs: list[tuple[TelemetryLog, Device, Schedule | None]],
+    schedules: list[Schedule],
+    devices_by_id: dict[UUID, Device],
+    day_for: dict[UUID, date],
+    now: datetime,
+    unlinked_date: date | None,
+) -> list[DoseRecord]:
+    records: list[DoseRecord] = []
     seen: set[tuple[UUID, date]] = set()
-    for log, device, schedule in rows.all():
+    for log, device, schedule in logs:
         if log.scheduled_date is None or log.scheduled_for is None or log.slot_number is None:
             continue
         wanted = day_for.get(device.id, unlinked_date)
@@ -102,14 +148,7 @@ async def day_doses(
             seen.add((log.schedule_id, log.scheduled_date))
         records.append(DoseRecord(log, device, schedule, log.slot_number, log.scheduled_for, status))
 
-    schedules = await session.execute(
-        select(Schedule).where(
-            Schedule.device_id.in_(list(day_for)),
-            Schedule.deleted_at.is_(None),
-            Schedule.is_active.is_(True),
-        )
-    )
-    for schedule in schedules.scalars().all():
+    for schedule in schedules:
         device = devices_by_id.get(schedule.device_id)
         if device is None:
             continue
@@ -207,16 +246,17 @@ async def day_view(session: AsyncSession, user: User, elderly_id: UUID, day: dat
     )
 
 
-async def _rows_between(session: AsyncSession, elderly_id: UUID, start: date, end: date) -> list[TelemetryLog]:
+async def _rows_between(session: AsyncSession, elderly_id: UUID, start: date, end: date) -> list[Any]:
+    """Only the three columns the summaries read: a year of full ORM rows was the cost."""
     rows = await session.execute(
-        select(TelemetryLog).where(
+        select(TelemetryLog.scheduled_date, TelemetryLog.status, TelemetryLog.delay_minutes).where(
             TelemetryLog.elderly_id == elderly_id,
             TelemetryLog.status.is_not(None),
             TelemetryLog.scheduled_date >= start,
             TelemetryLog.scheduled_date <= end,
         )
     )
-    return list(rows.scalars().all())
+    return list(rows.all())
 
 
 def parse_month(month: str) -> tuple[date, date]:
@@ -262,12 +302,14 @@ async def calendar_view(session: AsyncSession, user: User, elderly_id: UUID, mon
     )
 
 
-async def summary_view(session: AsyncSession, user: User, elderly_id: UUID, start: date, end: date) -> SummaryOut:
+async def summary_view(
+    session: AsyncSession, user: User, elderly_id: UUID, start: date, end: date, settings: Settings
+) -> SummaryOut:
     await require_role(session, user.id, elderly_id, ALL_ROLES)
     if end < start:
         raise unprocessable("VALIDATION_ERROR", "end must not be before start")
-    if (end - start).days > MAX_SUMMARY_DAYS:
-        raise unprocessable("VALIDATION_ERROR", f"period is limited to {MAX_SUMMARY_DAYS} days")
+    if (end - start).days > settings.journal_max_summary_days:
+        raise unprocessable("VALIDATION_ERROR", f"period is limited to {settings.journal_max_summary_days} days")
     total = AdherenceSummary()
     for log in await _rows_between(session, elderly_id, start, end):
         total.add(log.status, log.delay_minutes)
@@ -285,14 +327,23 @@ async def summary_view(session: AsyncSession, user: User, elderly_id: UUID, star
 async def manual_confirmation(
     session: AsyncSession, user: User, dose_log_id: UUID, body: ManualConfirmationIn, now: datetime, settings: Settings
 ) -> ManualConfirmationOut:
-    log = (
-        await session.execute(select(TelemetryLog).where(TelemetryLog.id == dose_log_id).with_for_update())
-    ).scalar_one_or_none()
-    if log is None or log.status is None or log.elderly_id is None:
+    elderly_id = await session.scalar(select(TelemetryLog.elderly_id).where(TelemetryLog.id == dose_log_id))
+    if elderly_id is None:
         raise not_found(message="Dose log not found")
     # CONFLICT with the API List ("Caregiver terkait"): manual confirmation is
     # a write, and the brief makes PEMANTAU read-only, so OWNER/ADMIN only.
-    await require_role(session, user.id, log.elderly_id, EDITOR_ROLES)
+    # Checked before the row lock, so a caller without the role never blocks the dose row.
+    await require_role(session, user.id, elderly_id, EDITOR_ROLES)
+    log = (
+        await session.execute(
+            select(TelemetryLog)
+            .where(TelemetryLog.id == dose_log_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if log is None or log.status is None or log.elderly_id != elderly_id:
+        raise not_found(message="Dose log not found")
     if log.status == DoseStatus.TAKEN and log.log_source == LogSource.AUTO_SENSOR:
         raise conflict("ALREADY_TAKEN_BY_DEVICE", "The device already recorded this dose as taken")
     device = await session.get(Device, log.device_id)
@@ -300,6 +351,11 @@ async def manual_confirmation(
         raise conflict("DOSE_NOT_YET_DUE", "This dose is not due yet")
     tz = zone(device.timezone if device else None)
     confirmed_at = as_aware(body.confirmed_at, tz)
+    clock = device_now(device, now, settings) if device else now
+    earliest = log.scheduled_for - timedelta(minutes=settings.dose_early_accept_minutes)
+    if confirmed_at > clock + timedelta(seconds=settings.clock_drift_tolerance_seconds) or confirmed_at < earliest:
+        # Stored as recorded_at and drives delay_minutes: a typo'd year must not land in the journal.
+        raise unprocessable("VALIDATION_ERROR", "confirmed_at must be between the dose time and now")
     if body.override_status == "TAKEN_ON_TIME":
         delay = 0
     else:
@@ -321,7 +377,7 @@ async def manual_confirmation(
     log.recorded_at = confirmed_at
     if previous == DoseStatus.MISSED:
         await session.flush()
-        await report_taken_after_missed(session, log, tz, now, f"dikonfirmasi oleh {user.full_name}")
+        await report_taken_after_missed(session, log, tz, now, note_texts(NOTE_BY_CAREGIVER, name=user.full_name))
     await session.commit()
     logger.info("dose_manually_confirmed", extra={"telemetry_log_id": str(log.id), "user_id": str(user.id)})
     return ManualConfirmationOut(

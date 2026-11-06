@@ -29,9 +29,34 @@ class Settings(BaseSettings):
     log_json: bool = True
 
     # --- Database -------------------------------------------------------
-    database_url: str  # Supabase session-pooler URI
-    db_pool_size: int = 5
-    db_max_overflow: int = 5
+    # Supabase URI: session pooler (5432) or direct for a deployed backend, transaction pooler
+    # (6543) for several dev laptops sharing one project (.env.example, README).
+    database_url: str
+    # "auto" = transaction mode when the URL's port is 6543. See app/db/session.py.
+    db_pooler_mode: Literal["auto", "session", "transaction"] = "auto"
+    # Kept small on purpose: every running backend (each teammate's laptop) takes
+    # up to db_pool_size + db_max_overflow connections from the SAME Supabase project.
+    db_pool_size: int = 3
+    db_max_overflow: int = 2
+    # Background passes (rules engine, presence) have their own pool, so requests and passes
+    # never wait for each other's connections. Counts toward the same database client limit.
+    background_db_pool_size: int = Field(1, ge=1)
+    background_db_max_overflow: int = Field(1, ge=0)
+    # Seconds a request waits for a free pooled connection before failing with 503.
+    db_pool_timeout_seconds: float = 10.0
+    # Connections opened at startup (warm_pool). They stay open in the pool.
+    db_pool_warm_connections: int = 1
+    # Startup gives up warming the pool after this long (the app starts anyway).
+    db_pool_warm_timeout_seconds: float = 15.0
+    db_connect_timeout_seconds: float = 10.0
+    # Server-side statement deadline, so one stuck query cannot hold a connection forever.
+    db_command_timeout_seconds: float = 30.0
+    # Retry-After sent with 503 SERVICE_UNAVAILABLE (pool exhausted, database unreachable).
+    db_unavailable_retry_after_seconds: int = 5
+    # Postgres lock_timeout: a statement waiting this long for a row lock fails (503) instead of
+    # holding its pooled connection. Not sent through the transaction pooler (see .env.example).
+    # None = no limit.
+    db_lock_timeout_ms: int | None = Field(5000, ge=1)
     # NullPool opens a fresh connection per session. Used by the test suite so
     # pooled asyncpg connections never cross event loops.
     db_use_null_pool: bool = False
@@ -45,6 +70,9 @@ class Settings(BaseSettings):
     db_pool_recycle_seconds: int = -1
 
     cors_origins: list[str] = ["http://localhost:8081"]
+    # Bodies above this are refused with 413 before parsing. A full telemetry batch
+    # (TELEMETRY_MAX_BATCH_SIZE events) is far below it.
+    max_request_body_bytes: int = Field(1_048_576, ge=1)
 
     # --- Caregiver auth -------------------------------------------------
     # "app_jwt": HS256 access tokens issued by the Mobile server
@@ -53,6 +81,11 @@ class Settings(BaseSettings):
     #   sub is mapped to users through auth_identities.supabase_user_id.
     auth_mode: Literal["app_jwt", "supabase"] = "app_jwt"
     jwt_access_secret: SecretStr | None = None
+    # Seconds the user behind a verified access token is reused without a database lookup (every
+    # request needs it). A changed language/timezone or a deleted account shows after at most this
+    # long (access tokens stay valid until they expire anyway). 0 = look it up on every request.
+    auth_user_cache_seconds: int = Field(30, ge=0)
+    auth_user_cache_max_entries: int = Field(10000, ge=1)
     supabase_url: str | None = None
     supabase_jwt_audience: str = "authenticated"
 
@@ -70,11 +103,27 @@ class Settings(BaseSettings):
     # can only make it longer.
     device_offline_notify_grace_seconds: int = 120
     ws_auth_timeout_seconds: float = 10.0
+    # /ws/app: a send that takes longer drops that socket (the app reconnects and polls meanwhile).
+    app_ws_send_timeout_seconds: float = 5.0
+    # /ws/app: a device status that changed only last_seen_at / device_time is pushed at most this
+    # often per device (real changes go at once). Matches the app's poll while the socket is live.
+    app_ws_device_push_min_interval_seconds: int = 60
     command_ack_timeout_seconds: float = 10.0
+    # /ws/device: a send (or close) that takes longer drops that socket, so a stalled pillbox
+    # connection cannot hang the caregiver request that notifies it. The device reconnects.
+    device_ws_send_timeout_seconds: float = Field(5.0, gt=0)
+    # Recent device commands kept in memory for diagnostics.
+    device_command_history_size: int = Field(200, ge=1)
 
     # --- Rules engine ---------------------------------------------------
     rules_engine_interval_seconds: int = 30
     rules_engine_lookback_days: int = 1
+    # Schedules handled between event-loop yields in materialize_due_doses (bounds the stall a
+    # pass causes for requests to a few milliseconds).
+    rules_engine_yield_every_schedules: int = Field(500, ge=1)
+    # PENDING doses decided MISSED per transaction; a backlog pass commits in chunks so it never
+    # holds thousands of row locks (and one pooled connection) at once.
+    rules_engine_decide_chunk_size: int = Field(500, ge=1)
     # Extra wait after a dose deadline for in-flight telemetry.
     missed_decision_grace_seconds: int = 60
     # After a device reconnects, wait this long for its buffered flush.
@@ -96,6 +145,13 @@ class Settings(BaseSettings):
     # Emulator RTC can be fast-forwarded; events further in the future than
     # this are rejected.
     telemetry_max_future_skew_minutes: int = 10080
+    # Dose and door events older than this (device time) are rejected per event instead of
+    # creating dose rows for a date the device clock invented. Long enough for a multi-day
+    # offline buffer flush.
+    telemetry_max_past_skew_minutes: int = 10080
+    # A buffered BATTERY_STATUS older than this many heartbeat intervals does not overwrite the
+    # battery level a fresher heartbeat already reported.
+    telemetry_fresh_heartbeat_intervals: int = Field(2, ge=1)
 
     # --- Thresholds -----------------------------------------------------
     low_battery_threshold_percent: int = 20
@@ -106,6 +162,9 @@ class Settings(BaseSettings):
     wifi_rssi_strong_dbm: int = -60
     wifi_rssi_medium_dbm: int = -75
     low_stock_threshold_units: int = 3
+    # A heartbeat repeating the stock counts this process last wrote skips the upsert, but at
+    # least this often the counts are written again (fixes changes made by another writer).
+    stock_cache_rewrite_seconds: int = 300
     stock_capacity_per_slot: int = 30
     clock_drift_tolerance_seconds: int = 60
     # Judge doses (rules engine) and show the app's day by the DEVICE clock as last reported
@@ -113,6 +172,10 @@ class Settings(BaseSettings):
     # end to end. A real device's RTC is on real time, so this changes nothing for it.
     # See app/services/device_clock.py.
     follow_device_clock: bool = True
+    # The device clock is followed only while it is within this distance of server time; outside
+    # it (RTC reset after a dead backup battery, a wildly wrong clock) server time is used, so a
+    # bad clock can neither hold back nor invent MISSED alerts. Default = the 7-day future skew.
+    device_clock_max_skew_minutes: int = Field(10080, ge=1)
 
     # --- Missed dose taken late ("Buka bilik sekarang", app/services/late_dose.py) -----
     # How long the re-opened chamber stays popped up.
@@ -121,17 +184,35 @@ class Settings(BaseSettings):
     # time to the device's next dose (any slot); later it would come too close to the next
     # dose (double dose). 0.5 = halfway.
     late_release_cutoff_fraction: float = Field(0.5, gt=0, le=1)
+    # Days after a missed dose searched for "the next dose" that bounds its late release.
+    late_release_lookahead_days: int = Field(2, ge=1)
     # Rated runtime of a full battery, used for estimated_battery_days_remaining.
     # Unset = the estimate is returned as null.
     battery_rated_days: float | None = None
-    pin_max_attempts: int = 5
-    pin_lockout_seconds: int = 300
+    # Wrong device PINs allowed per device (all users together) per window (attempt_counters).
+    pin_max_attempts: int = Field(5, ge=1)
+    pin_lockout_seconds: int = Field(300, ge=1)
+    # POST /pairing/scan calls allowed per user per window.
+    pairing_scan_max_attempts: int = Field(30, ge=1)
+    pairing_scan_window_seconds: int = Field(300, ge=1)
 
     # Used when pairing a device and neither the request nor the caregiver
     # profile has a valid IANA timezone.
     default_device_timezone: str = "Asia/Jakarta"
 
+    # Elderly profile validation (POST/PUT /elderly): birth_date must not be in the
+    # future nor older than this many years; full_name needs at least this many chars.
+    elderly_max_age_years: int = Field(120, ge=1)
+    elderly_name_min_length: int = Field(2, ge=1)
+
     enable_background_tasks: bool = True
+    # A failing background pass waits interval * 2^failures (capped) before the next try.
+    background_max_backoff_exponent: int = Field(4, ge=0)
+    background_max_backoff_seconds: float = Field(300.0, gt=0)
+    # /health reports a loop "stale" when it finished no pass for this many of its intervals.
+    background_stale_after_intervals: int = Field(4, ge=1)
+    # GET /journal/summary: longest period allowed in one request.
+    journal_max_summary_days: int = Field(366, ge=1)
     default_page_limit: int = 20
     max_page_limit: int = 100
 

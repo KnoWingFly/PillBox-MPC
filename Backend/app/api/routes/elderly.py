@@ -3,10 +3,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, Response, status
 
-from app.api.deps import CurrentUser, DbSession, PaginationDep
+from app.api.deps import CurrentUser, DbSession, PaginationDep, SettingsDep
 from app.schemas.elderly import (
     CaregiverInvite,
     CaregiverOut,
+    CaregiverPage,
     ElderlyCreated,
     ElderlyDetail,
     ElderlyIn,
@@ -56,9 +57,10 @@ async def invite_caregiver(elderly_id: UUID, body: CaregiverInvite, user: Curren
     return await svc.invite(db, user, elderly_id, body, datetime.now(UTC))
 
 
-@router.get("/{elderly_id}/caregivers", response_model=list[CaregiverOut])
-async def list_caregivers(elderly_id: UUID, user: CurrentUser, db: DbSession) -> list[CaregiverOut]:
-    return await svc.list_caregivers(db, user, elderly_id)
+@router.get("/{elderly_id}/caregivers", response_model=CaregiverPage)
+async def list_caregivers(elderly_id: UUID, user: CurrentUser, db: DbSession, pagination: PaginationDep) -> CaregiverPage:
+    items, total = await svc.list_caregivers(db, user, elderly_id, pagination.offset, pagination.limit)
+    return CaregiverPage(data=items, page=pagination.page, limit=pagination.limit, total=total)
 
 
 @router.delete("/{elderly_id}/caregivers/{caregiver_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -99,9 +101,14 @@ async def journal_calendar(
 
 @router.get("/{elderly_id}/journal/summary", response_model=SummaryOut)
 async def journal_summary(
-    elderly_id: UUID, user: CurrentUser, db: DbSession, start: date = Query(...), end: date = Query(...)
+    elderly_id: UUID,
+    user: CurrentUser,
+    db: DbSession,
+    settings: SettingsDep,
+    start: date = Query(...),
+    end: date = Query(...),
 ) -> SummaryOut:
-    return await journal.summary_view(db, user, elderly_id, start, end)
+    return await journal.summary_view(db, user, elderly_id, start, end, settings)
 
 
 @router.get("/{elderly_id}/journal/{day}", response_model=DayOut)

@@ -12,31 +12,43 @@ Formats: docs/DEVICE_CONTRACT.md.
 import asyncio
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+import jwt
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import user_from_token
 from app.core.config import get_settings
-from app.core.errors import AppError
+from app.core.errors import AppError, is_db_unavailable
 from app.db.session import get_sessionmaker
-from app.models import Device, UserElderlyRole
+from app.models import Device
 from app.schemas.device_protocol import HeartbeatRequest
-from app.services.app_hub import AppConnection, app_hub
-from app.services.connection_manager import DeviceCommand, DeviceConnection, connection_manager
+from app.services.app_hub import AppConnection, app_hub, followed_elderly
+from app.services.connection_manager import (
+    WS_CLOSE_AUTH_FAILED,
+    WS_CLOSE_REPLACED,
+    WS_CLOSE_INTERNAL_ERROR,
+    DeviceCommand,
+    DeviceConnection,
+    connection_manager,
+)
 from app.services.device_protocol import authenticate_device, process_heartbeat
 from app.services.presence import mark_offline, mark_seen
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-WS_CLOSE_AUTH_FAILED = 4401
-WS_CLOSE_REPLACED = 4000
+# Server-side failure (database unreachable) while authenticating closes with
+# WS_CLOSE_INTERNAL_ERROR (1011) so the client retries with backoff. 4401 would tell a device its
+# key is wrong and make it stop retrying.
+
+
+class _AuthUnavailable(Exception):
+    pass
 
 
 async def _authenticate(websocket: WebSocket, device_code: str, timeout: float) -> Device | None:
@@ -51,23 +63,29 @@ async def _authenticate(websocket: WebSocket, device_code: str, timeout: float) 
         key = first.get("device_key")
         if not isinstance(key, str):
             return None
-    async with get_sessionmaker()() as session:
-        try:
+    try:
+        async with get_sessionmaker()() as session:
             return await authenticate_device(session, device_code, key)
-        except AppError:
-            return None
+    except AppError:
+        return None
+    except Exception as exc:
+        logger.warning("device_ws_auth_unavailable", extra={"error": type(exc).__name__}, exc_info=not is_db_unavailable(exc))
+        raise _AuthUnavailable from exc
 
 
 async def _send(conn: DeviceConnection, message: dict[str, Any]) -> None:
-    async with conn.send_lock:
-        await conn.websocket.send_json(message)
+    await connection_manager.send(conn, message)
 
 
 @router.websocket("/ws/device/{device_code}")
 async def device_socket(websocket: WebSocket, device_code: str) -> None:
     settings = get_settings()
     await websocket.accept()
-    device = await _authenticate(websocket, device_code, settings.ws_auth_timeout_seconds)
+    try:
+        device = await _authenticate(websocket, device_code, settings.ws_auth_timeout_seconds)
+    except _AuthUnavailable:
+        await _close_quietly(websocket, WS_CLOSE_INTERNAL_ERROR, "service unavailable, retry later")
+        return
     if device is None:
         await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="device authentication failed")
         return
@@ -75,10 +93,7 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
     conn = DeviceConnection(device.id, device.device_code, websocket, datetime.now(UTC))
     replaced = connection_manager.register(conn)
     if replaced is not None:
-        try:
-            await replaced.websocket.close(code=WS_CLOSE_REPLACED, reason="replaced by a newer connection")
-        except (RuntimeError, OSError, WebSocketDisconnect):
-            pass  # the old socket was already gone
+        await connection_manager.close_socket(replaced, WS_CLOSE_REPLACED, "replaced by a newer connection")
     logger.info("device_ws_connected", extra={"device_id": str(device.id)})
 
     sessionmaker = get_sessionmaker()
@@ -118,13 +133,25 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
                 try:
                     hb = HeartbeatRequest.model_validate(message)
                 except ValidationError as exc:
-                    await _send(conn, {"type": "error", "error": "invalid heartbeat", "details": exc.errors(include_url=False)})
+                    # Paths and messages only: the submitted values are not echoed back.
+                    details = exc.errors(include_url=False, include_input=False, include_context=False)
+                    await _send(conn, {"type": "error", "error": "invalid heartbeat", "details": details})
                     continue
-                async with sessionmaker() as session:
-                    current = await session.get(Device, device.id)
-                    if current is None:
-                        break
-                    response = await process_heartbeat(session, current, hb, datetime.now(UTC), settings)
+                try:
+                    async with sessionmaker() as session:
+                        current = await session.get(Device, device.id)
+                        if current is None:
+                            break
+                        response = await process_heartbeat(session, current, hb, datetime.now(UTC), settings)
+                except Exception as exc:
+                    # A short database outage must not drop every device socket (and fail their
+                    # pending commands): answer this heartbeat with an error and keep the socket.
+                    if is_db_unavailable(exc):
+                        logger.warning("device_ws_heartbeat_unavailable", extra={"device_id": str(device.id)})
+                    else:
+                        logger.exception("device_ws_heartbeat_failed", extra={"device_id": str(device.id)})
+                    await _send(conn, {"type": "error", "error": "heartbeat not stored, retry later"})
+                    continue
                 await _send(conn, {"type": "heartbeat_ack", **response.model_dump(mode="json")})
             elif kind == "ack":
                 connection_manager.handle_ack(device.id, message)
@@ -136,21 +163,30 @@ async def device_socket(websocket: WebSocket, device_code: str) -> None:
         logger.info("device_ws_disconnected", extra={"device_id": str(device.id), "code": exc.code})
     except Exception:
         logger.exception("device_ws_error", extra={"device_id": str(device.id)})
-        try:
-            await websocket.close(code=1011, reason="internal error")
-        except (RuntimeError, OSError, WebSocketDisconnect):
-            pass
+        await _close_quietly(websocket, WS_CLOSE_INTERNAL_ERROR, "internal error")
     finally:
         if connection_manager.unregister(conn):
             # Only the current connection may flip the device offline; a socket
             # that was replaced by a reconnect must not.
-            async with sessionmaker() as session:
-                await mark_offline(session, device.id, datetime.now(UTC), reason="ws_disconnect")
-                await session.commit()
+            try:
+                async with sessionmaker() as session:
+                    await mark_offline(session, device.id, datetime.now(UTC), reason="ws_disconnect")
+                    await session.commit()
+            except Exception:
+                # The presence sweep flips it after the heartbeat timeout instead.
+                logger.warning("device_ws_mark_offline_failed", extra={"device_id": str(device.id)}, exc_info=True)
 
 
-async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUID]] | None:
-    """First message must be {"type": "auth", "token": "<access token>"}."""
+async def _close_quietly(websocket: WebSocket, code: int, reason: str) -> None:
+    try:
+        await websocket.close(code=code, reason=reason)
+    except (RuntimeError, OSError, WebSocketDisconnect):
+        pass  # already gone
+
+
+async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUID], float | None] | None:
+    """First message must be {"type": "auth", "token": "<access token>"}. Returns the user, the
+    elderly they follow, and the token's expiry (epoch seconds)."""
     try:
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=timeout))
     except (TimeoutError, ValueError, WebSocketDisconnect):
@@ -158,17 +194,19 @@ async def _app_user(websocket: WebSocket, timeout: float) -> tuple[UUID, set[UUI
     token = first.get("token") if isinstance(first, dict) and first.get("type") == "auth" else None
     if not isinstance(token, str):
         return None
-    async with get_sessionmaker()() as session:
-        try:
-            user = await user_from_token(token, get_settings(), session)
-        except AppError:
-            return None
-        return user.id, await _elderly_ids(session, user.id)
-
-
-async def _elderly_ids(session: AsyncSession, user_id: UUID) -> set[UUID]:
-    rows = await session.execute(select(UserElderlyRole.elderly_id).where(UserElderlyRole.user_id == user_id))
-    return set(rows.scalars().all())
+    try:
+        async with get_sessionmaker()() as session:
+            try:
+                user = await user_from_token(token, get_settings(), session)
+            except AppError:
+                return None
+            # Signature and expiry were verified above; only the expiry is read here.
+            expires_at = jwt.decode(token, options={"verify_signature": False}).get("exp")
+            followed = await followed_elderly(session, {user.id})
+            return user.id, followed[user.id], float(expires_at) if expires_at is not None else None
+    except Exception as exc:
+        logger.warning("app_ws_auth_unavailable", extra={"error": type(exc).__name__}, exc_info=not is_db_unavailable(exc))
+        raise _AuthUnavailable from exc
 
 
 @router.websocket("/ws/app")
@@ -178,23 +216,34 @@ async def app_socket(websocket: WebSocket) -> None:
     App -> server:  auth (first, within WS_AUTH_TIMEOUT_SECONDS) | ping | resubscribe
     Server -> app:  ready | notifications | device | pong
     `resubscribe` reloads the elderly the user follows (send it after pairing).
-    The token is checked once, at connect; the socket carries no data, only
-    hints to call the authenticated REST endpoints.
+    The token is checked at connect and the socket is closed (4401) when it expires; the app
+    reconnects with a fresh one. Role changes refresh the followed elderly on their own
+    (app_hub.queue_roles_changed). Pushes carry the changed data (see
+    app/services/app_hub.py); a message without data tells the app to refetch.
     """
     settings = get_settings()
     await websocket.accept()
-    auth = await _app_user(websocket, settings.ws_auth_timeout_seconds)
+    try:
+        auth = await _app_user(websocket, settings.ws_auth_timeout_seconds)
+    except _AuthUnavailable:
+        await _close_quietly(websocket, WS_CLOSE_INTERNAL_ERROR, "service unavailable, retry later")
+        return
     if auth is None:
         await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="authentication failed")
         return
-    user_id, elderly_ids = auth
+    user_id, elderly_ids, expires_at = auth
     conn = AppConnection(user_id, elderly_ids, websocket)
     app_hub.register(conn)
     logger.info("app_ws_connected", extra={"user_id": str(user_id), "elderly_count": len(elderly_ids)})
     try:
         await websocket.send_json({"type": "ready"})
         while True:
-            raw = await websocket.receive_text()
+            remaining = None if expires_at is None else expires_at - time.time()
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+            except TimeoutError:
+                await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="access token expired")
+                break
             try:
                 kind = json.loads(raw).get("type")
             except (ValueError, AttributeError):
@@ -204,7 +253,7 @@ async def app_socket(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "pong"})
             elif kind == "resubscribe":
                 async with get_sessionmaker()() as session:
-                    conn.elderly_ids = await _elderly_ids(session, user_id)
+                    app_hub.set_elderly(conn, (await followed_elderly(session, {user_id}))[user_id])
     except WebSocketDisconnect:
         pass
     except Exception:

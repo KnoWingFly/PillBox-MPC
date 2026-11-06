@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 _effect: QSoundEffect | None = None
 _effect_loaded = False
+_volume = config.CHIME_VOLUME
 
 
 def _sound() -> QSoundEffect | None:
@@ -30,13 +31,21 @@ def _sound() -> QSoundEffect | None:
         if path.is_file():
             _effect = QSoundEffect(QApplication.instance())
             _effect.setSource(QUrl.fromLocalFile(str(path)))
-            _effect.setVolume(config.CHIME_VOLUME)
+            _effect.setVolume(_volume)
             logger.info("Chime sound: %s", path)
         else:
             logger.info("No chime file at %s; using the system beep.", path)
     if _effect is not None and _effect.status() == QSoundEffect.Status.Error:
         return None  # not a PCM WAV (or unreadable): beep instead
     return _effect
+
+
+def set_volume_level(level: str | None) -> None:
+    """Applies the config's chime_volume_level (LOW / MEDIUM / HIGH); unknown or None keeps the default."""
+    global _volume
+    _volume = config.CHIME_VOLUME_LEVELS.get(level or "", config.CHIME_VOLUME)
+    if _effect is not None:
+        _effect.setVolume(_volume)
 
 
 def play_chime() -> None:

@@ -7,15 +7,16 @@
 // on several accounts, and unpairing it (OWNER only) removes it for every caregiver.
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import { AppConfig } from '@/config';
+import { Strings } from '@/constants/strings';
+
 import {
   BackendError,
   backendRequest as backend,
-  deleteBackendNotification,
-  fetchBackendNotifications,
+  deleteBackendNotificationsForDevice,
   getDeviceStatus,
   USE_MOCK,
 } from './api';
-import type { AppNotification } from './types';
 
 export type PillboxRole = 'OWNER' | 'ADMIN' | 'PEMANTAU';
 
@@ -67,12 +68,15 @@ type ElderlyListItem = { id: string; full_name: string; nickname: string | null;
 const MOCK_ID = 'mock-pillbox';
 
 function mockUnsupported(): never {
-  throw new BackendError(400, 'MOCK_UNSUPPORTED', 'Tidak tersedia di mode data contoh.');
+  throw new BackendError(400, 'MOCK_UNSUPPORTED', 'Not available with mock data');
 }
+
+/** Same rule as the backend's device_pin (exactly 4 digits). */
+export const DEVICE_PIN_PATTERN = /^\d{4}$/;
 
 async function elderlyProfiles(): Promise<ElderlyListItem[]> {
   // TODO(backend-branch): more than 100 elderly profiles would need paging.
-  return (await backend<{ data: ElderlyListItem[] }>('/elderly?limit=100')).data;
+  return (await backend<{ data: ElderlyListItem[] }>(`/elderly?limit=${AppConfig.backendPageLimit}`)).data;
 }
 
 // --- list -----------------------------------------------------------------------
@@ -96,7 +100,8 @@ export async function listPillboxes(): Promise<Pillbox[]> {
     ];
   }
   const [devices, profiles] = await Promise.all([
-    backend<{ data: DeviceListItem[] }>('/devices'),
+    // Paginated (default 20): ask for the largest page so every pillbox of the account is listed.
+    backend<{ data: DeviceListItem[] }>(`/devices?limit=${AppConfig.backendPageLimit}`),
     elderlyProfiles(),
   ]);
   const roleOf = new Map(profiles.map((p) => [p.id, p.my_role]));
@@ -136,21 +141,19 @@ export interface PairingCheck {
 
 /**
  * Looks a validated code up. Throws BackendError QR_CODE_NOT_RECOGNIZED for an unknown code and
- * DEVICE_ALREADY_MINE when the pillbox is already on this account.
- * TODO(backend-branch): /pairing/scan is not rate limited and returns the elderly name to any
- * signed-in user (handoff items 1 and 2).
+ * DEVICE_ALREADY_MINE when the pillbox is already on this account. `myDeviceIds` is the account's
+ * list the app already holds (DevicesProvider), so no second list request is needed.
+ * The backend rate-limits lookups (429 TOO_MANY_ATTEMPTS) and names the elderly only to its
+ * caregivers (handoff items 1 and 2).
  */
-export async function checkPairingCode(code: string): Promise<PairingCheck> {
+export async function checkPairingCode(code: string, myDeviceIds: readonly string[]): Promise<PairingCheck> {
   if (USE_MOCK) return mockUnsupported();
-  const [scan, mine] = await Promise.all([
-    backend<{ device_id: string; is_registered: boolean; elderly_name_if_owned: string | null }>(
-      '/devices/pairing/scan',
-      'POST',
-      { device_qr_payload: code },
-    ),
-    backend<{ data: { id: string }[] }>('/devices'),
-  ]);
-  if (mine.data.some((d) => d.id === scan.device_id)) {
+  const scan = await backend<{ device_id: string; is_registered: boolean; elderly_name_if_owned: string | null }>(
+    '/devices/pairing/scan',
+    'POST',
+    { device_qr_payload: code },
+  );
+  if (myDeviceIds.includes(scan.device_id)) {
     throw new BackendError(409, 'DEVICE_ALREADY_MINE', 'This pillbox is already linked to your account.');
   }
   return {
@@ -178,30 +181,68 @@ export interface ConnectPillboxResult {
   online: boolean | null;
 }
 
-/** Pairs a registered pillbox to an elderly profile (or joins it with its PIN). */
+/** Why the input cannot be sent (checked before any request), or null. Copy is user-facing. */
+export function connectInputProblem(input: Pick<ConnectPillboxInput, 'check' | 'pin' | 'elderly'>): BackendError | null {
+  if (!DEVICE_PIN_PATTERN.test(input.pin)) return new BackendError(0, 'DEVICE_PIN_INVALID', 'PIN must be 4 digits');
+  if (input.check.mode === 'pair' && 'newName' in input.elderly) {
+    const name = input.elderly.newName.trim();
+    const errors = Strings.elderlyForm.errors;
+    const problem =
+      name.length < AppConfig.elderlyNameMinLength
+        ? errors.nameTooShort(AppConfig.elderlyNameMinLength)
+        : name.length > AppConfig.elderlyNameMaxLength
+          ? errors.nameTooLong(AppConfig.elderlyNameMaxLength)
+          : null;
+    if (problem) return new BackendError(0, 'VALIDATION_ERROR', 'Invalid elderly name', [], problem);
+  }
+  return null;
+}
+
+/**
+ * Pairs a registered pillbox to an elderly profile (or joins it with its PIN). The input is checked
+ * first, so a bad PIN or name never creates anything. When pairing to a NEW profile fails, that
+ * profile is deleted again, so a failed attempt leaves no empty elderly profile behind.
+ */
 export async function connectPillbox(input: ConnectPillboxInput): Promise<ConnectPillboxResult> {
   if (USE_MOCK) return mockUnsupported();
+  const problem = connectInputProblem(input);
+  if (problem) throw problem;
   const { code, deviceId, mode } = input.check;
   if (mode === 'join') {
     await backend(`/devices/${deviceId}/join`, 'POST', { device_pin: input.pin });
+    // The join answer has no connectivity: ask for it. Pairing succeeds even if the pillbox has
+    // never connected, so the UI can warn.
+    const online = await backend<{ connectivity: 'ONLINE' | 'OFFLINE' }>(`/devices/${deviceId}/status`)
+      .then((s) => s.connectivity === 'ONLINE')
+      .catch(() => null);
+    return { deviceId, joined: true, online };
   } else {
-    const elderlyId =
+    const created =
       'id' in input.elderly
-        ? input.elderly.id
-        : (await backend<{ id: string }>('/elderly', 'POST', { full_name: input.elderly.newName.trim() || 'Lansia' })).id;
-    // timezone omitted: the backend uses the caregiver's own timezone from their profile.
-    await backend('/devices', 'POST', {
-      device_qr_payload: code,
-      elderly_id: elderlyId,
-      device_nickname: input.nickname.trim() || 'Pillbox Lansia',
-      device_pin: input.pin,
-    });
+        ? null
+        : await backend<{ id: string }>('/elderly', 'POST', { full_name: input.elderly.newName.trim() });
+    const elderlyId = created?.id ?? ('id' in input.elderly ? input.elderly.id : '');
+    try {
+      // timezone omitted: the backend uses the caregiver's own timezone from their profile.
+      // The answer already carries connectivity (PairDeviceOut), so no status request follows.
+      const paired = await backend<{ connectivity: 'ONLINE' | 'OFFLINE' }>('/devices', 'POST', {
+        device_qr_payload: code,
+        elderly_id: elderlyId,
+        device_nickname: input.nickname.trim() || Strings.connect.nicknameDefault,
+        device_pin: input.pin,
+      });
+      return { deviceId, joined: false, online: paired.connectivity === 'ONLINE' };
+    } catch (err) {
+      // A timeout may have paired it anyway; then the profile is in use and must stay.
+      const maybeApplied = err instanceof BackendError && err.code === 'TIMEOUT';
+      if (created && !maybeApplied) {
+        await backend(`/elderly/${created.id}`, 'DELETE').catch((cleanupErr: unknown) => {
+          console.warn('[pillbox] could not remove the elderly profile created for a failed pairing', cleanupErr);
+        });
+      }
+      throw err;
+    }
   }
-  // Pairing succeeds even if the pillbox has never connected: report it so the UI can warn.
-  const online = await backend<{ connectivity: 'ONLINE' | 'OFFLINE' }>(`/devices/${deviceId}/status`)
-    .then((s) => s.connectivity === 'ONLINE')
-    .catch(() => null);
-  return { deviceId, joined: mode === 'join', online };
 }
 
 // --- rename -----------------------------------------------------------------------
@@ -217,44 +258,13 @@ export async function renamePillbox(id: string, name: string): Promise<void> {
 // --- remove -----------------------------------------------------------------------
 
 /** Most notifications scanned when deleting by device (100 per page). */
-const MAX_SCAN_PAGES = 30;
-const DELETE_CONCURRENCY = 4;
-
-/**
- * Deletes the CALLER's notifications that `match` (never other caregivers' copies: the backend
- * scopes DELETE /notifications/{id} to the owner). Collects ids first, then deletes, so paging
- * offsets do not shift under the scan.
- * TODO(backend-branch): replace with DELETE /notifications?device_id= (handoff item 3).
- */
-export async function deleteMyNotificationsWhere(
-  match: (n: AppNotification) => boolean,
-  elderlyId: string | null,
-): Promise<{ deleted: number; failed: number }> {
-  const ids: string[] = [];
-  for (let page = 1; page <= MAX_SCAN_PAGES; page++) {
-    const res = await fetchBackendNotifications('ALL', page, 100, elderlyId);
-    ids.push(...res.items.filter(match).map((n) => n.id));
-    if (res.items.length < 100) break;
-  }
-  let deleted = 0;
-  let failed = 0;
-  for (let i = 0; i < ids.length; i += DELETE_CONCURRENCY) {
-    const results = await Promise.allSettled(ids.slice(i, i + DELETE_CONCURRENCY).map(deleteBackendNotification));
-    for (const r of results) {
-      if (r.status === 'fulfilled') deleted++;
-      else failed++;
-    }
-  }
-  return { deleted, failed };
-}
-
 /**
  * Unpairs a pillbox for EVERY caregiver of its elderly profile (OWNER only, server-enforced), then
  * deletes this caregiver's notification history for it.
  * The unpair itself (Backend device_management.unpair) soft-deletes the pillbox's schedules,
  * removes pending doses and clears its PIN and nickname. Notifications are not touched by the
- * backend, so the history purge is a second, best-effort step: `notificationsFailed` > 0 means
- * some rows are left and can be deleted from the Notifikasi tab.
+ * backend, so the history purge is a second, best-effort request (one DELETE for all rows):
+ * `notificationsFailed` > 0 means it failed and the rows can be deleted from the Notifikasi tab.
  * TODO(backend-branch): DELETE /devices/{id}?purge_my_notifications=true (handoff item 5).
  */
 export async function unpairPillbox(
@@ -262,8 +272,9 @@ export async function unpairPillbox(
 ): Promise<{ notificationsDeleted: number; notificationsFailed: number }> {
   if (USE_MOCK) return mockUnsupported();
   await backend(`/devices/${pillbox.id}`, 'DELETE');
-  const purge = await deleteMyNotificationsWhere((n) => n.deviceId === pillbox.id, pillbox.elderlyId).catch(
-    () => ({ deleted: 0, failed: -1 }),
+  const purge = await deleteBackendNotificationsForDevice(pillbox.id).then(
+    (deleted) => ({ deleted, failed: 0 }),
+    () => ({ deleted: 0, failed: 1 }),
   );
   return { notificationsDeleted: purge.deleted, notificationsFailed: purge.failed };
 }

@@ -15,13 +15,15 @@ Referensi lengkap seluruh endpoint HTTP PillCare dalam format Postman Collection
 
    | Variabel | Isi |
    |---|---|
-   | `email`, `password` | Akun caregiver |
+   | `email`, `password` | Akun caregiver utama yang memiliki perangkat/jadwal target |
+   | `other_caregiver_email`, `other_caregiver_password` | Akun caregiver kedua yang tidak memiliki akses ke lansia target |
    | `device_pin` | PIN 4 digit perangkat (untuk pairing, join, kalibrasi, buka ulang kompartemen) |
    | `device_key` | Secret perangkat (folder *Device Protocol*). Terisi otomatis oleh *Provision device* |
    | `provisioning_token` | Token provisioning server (folder *Provisioning*) |
    | `invitee_email` | Email caregiver lain untuk *Add caregiver* |
 
-3. Jalankan **Authentication › Log in**. Token dan ID berikutnya (lansia, perangkat, jadwal, notifikasi) tersimpan otomatis ke variabel koleksi oleh skrip post-response.
+3. Jalankan **Authentication › Log in** sebagai akun utama. Jalankan **Devices › List devices** lalu **Schedules › List slot schedules** untuk mengisi otomatis `device_id` dan `schedule_id` milik akun utama.
+4. Untuk demo isolasi akses, isi akun kedua pada `other_caregiver_email` dan `other_caregiver_password`, lalu jalankan **Access control demo › Log in as unrelated caregiver** diikuti **Try to update the first caregiver schedule**. Hasil yang diharapkan: `404 NOT_FOUND`; token akun kedua disimpan terpisah sehingga token utama tetap aktif. Jangan join akun kedua ke lansia target karena itu mengubah skenario menjadi anggota read-only (PEMANTAU), yang semestinya mendapat `403 FORBIDDEN` saat mengubah jadwal.
 
 Deskripsi koleksi (tab *Overview*) memuat autentikasi, konvensi, format error, alur umum, dan kanal WebSocket.
 

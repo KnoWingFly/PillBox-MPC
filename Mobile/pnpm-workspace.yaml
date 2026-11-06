@@ -5,3 +5,8 @@ allowBuilds:
   prisma: true
   workerd: true
   unrs-resolver: false
+overrides:
+  decode-uri-component@<=0.4.2: ^0.5.0
+  deepmerge-ts@<8.0.0: ^8.0.0
+  postcss-selector-parser@<7.1.6: ^7.1.6
+  zod@<4.6.6: ^4.6.6

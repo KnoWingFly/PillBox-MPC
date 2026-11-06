@@ -48,6 +48,9 @@ os.environ.update(
         "LOG_JSON": "false",
         "LOG_LEVEL": "WARNING",
         "COMMAND_ACK_TIMEOUT_SECONDS": "1",
+        # Tests use fixed historic dates (e.g. 2026-09-28); the past-skew rule has its own test.
+        "TELEMETRY_MAX_PAST_SKEW_MINUTES": str(100 * 365 * 24 * 60),
+        "DB_LOCK_TIMEOUT_MS": "1000",
     }
 )
 
@@ -57,7 +60,9 @@ import httpx  # noqa: E402
 from app.db.migrate import apply_migrations, to_asyncpg_dsn  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.connection_manager import connection_manager  # noqa: E402
-from app.services.pin_attempts import pin_limiter  # noqa: E402
+from app.api import deps  # noqa: E402
+from app.services import stock_cache  # noqa: E402
+from app.services.app_hub import app_hub  # noqa: E402
 
 DSN = to_asyncpg_dsn(
     TEST_DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -66,7 +71,7 @@ DSN = to_asyncpg_dsn(
 )
 
 _TABLES = (
-    "device_events, notifications, telemetry_logs, refill_items, refills, device_stocks, schedules, "
+    "attempt_counters, device_events, notifications, telemetry_logs, refill_items, refills, device_stocks, schedules, "
     "devices, invitations, notification_preferences, user_elderly_roles, elderly, push_tokens, users"
 )
 
@@ -94,8 +99,11 @@ async def clean_state() -> AsyncIterator[None]:
         await conn.execute(f"TRUNCATE {_TABLES} CASCADE")
     finally:
         await conn.close()
-    pin_limiter._failures.clear()
     connection_manager._connections.clear()
+    # Process-memory caches would otherwise leak state between tests.
+    deps._user_cache.clear()
+    app_hub.clear()
+    stock_cache.clear()
     yield
 
 

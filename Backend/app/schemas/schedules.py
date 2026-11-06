@@ -8,6 +8,9 @@ from app.models.enums import DayPeriod, MealRelation, RowType
 from app.schemas.common import HHMM, DaysOfWeek
 
 Tolerance = Literal[15, 30, 45, 60]
+# Defaults when a new schedule omits them (POST /schedules and the bulk PUT share these).
+DEFAULT_TOLERANCE_MINUTES: Tolerance = 30
+ALL_DAYS_OF_WEEK = (1, 2, 3, 4, 5, 6, 7)
 _MedName = Field(None, max_length=100)
 _Dosage = Field(None, max_length=255)
 
@@ -24,8 +27,8 @@ class ScheduleCreateIn(BaseModel):
     dosage_info: str | None = _Dosage
     window_start: HHMM
     window_end: HHMM
-    tolerance_minutes: Tolerance = 30
-    days_of_week: DaysOfWeek = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
+    tolerance_minutes: Tolerance = DEFAULT_TOLERANCE_MINUTES
+    days_of_week: DaysOfWeek = Field(default_factory=lambda: list(ALL_DAYS_OF_WEEK))
     active: bool = True
 
     @model_validator(mode="after")

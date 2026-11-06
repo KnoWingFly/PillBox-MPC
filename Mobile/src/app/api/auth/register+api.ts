@@ -1,7 +1,9 @@
+import { serverConfig } from '@/server/config';
 import { db } from '@/server/db';
 import { HttpError } from '@/server/errors';
-import { json, parseBody, route, userAgent } from '@/server/http';
+import { clientIp, json, parseBody, route, userAgent } from '@/server/http';
 import { hashPassword } from '@/server/passwords';
+import { consumeAttempt } from '@/server/rate-limit';
 import { registerSchema } from '@/server/schemas';
 import { issueTokens, toTokenResponse } from '@/server/tokens';
 import { isUniqueViolation } from '@/server/users';
@@ -10,6 +12,7 @@ const emailTaken = () => new HttpError(409, 'EMAIL_ALREADY_REGISTERED', 'Email i
 
 export const POST = route(async (request) => {
   const body = await parseBody(request, registerSchema);
+  await consumeAttempt('register:ip', clientIp(request), serverConfig.limits.registerPerIp);
 
   // No pre-check query: the unique index on email is the source of truth (saves a round trip).
   let user;

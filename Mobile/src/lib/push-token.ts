@@ -4,11 +4,17 @@ import { Platform } from 'react-native';
 import { settingApi } from './api/setting';
 import { tokenStore } from './api/token-store';
 
+/** Push is unavailable on web and in Expo Go on Android. */
+function pushSupported(): boolean {
+  if (Platform.OS !== 'ios' && Platform.OS !== 'android') return false;
+  return !(Platform.OS === 'android' && Constants.executionEnvironment === ExecutionEnvironment.StoreClient);
+}
+
 // Registers this device's Expo push token with our API. Fails silently: push is optional,
-// and is unavailable on web, simulators without credentials, and Expo Go on Android.
+// and is unavailable on web, simulators without credentials, and Expo Go on Android. A token still
+// registered to another signed-in account is refused by the server (409) and skipped here.
 export async function registerPushToken(): Promise<void> {
-  if (Platform.OS !== 'ios' && Platform.OS !== 'android') return;
-  if (Platform.OS === 'android' && Constants.executionEnvironment === ExecutionEnvironment.StoreClient) return;
+  if (!pushSupported()) return;
 
   try {
     const Notifications = await import('expo-notifications');
@@ -38,4 +44,39 @@ export async function unregisterPushToken(): Promise<void> {
   } catch {
     // best effort; server-side cascade/ownership rules still apply
   }
+}
+
+/**
+ * While signed in: shows pushes that arrive in the foreground, re-registers when the OS rotates the
+ * push token, and calls `onOpen` when the caregiver taps a notification. Returns the cleanup.
+ */
+export function watchPushNotifications(onOpen: () => void): () => void {
+  if (!pushSupported()) return () => undefined;
+  let stopped = false;
+  let subscriptions: { remove: () => void }[] = [];
+  import('expo-notifications')
+    .then((Notifications) => {
+      if (stopped) return;
+      Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+          shouldShowBanner: true,
+          shouldShowList: true,
+          shouldPlaySound: true,
+          shouldSetBadge: false,
+        }),
+      });
+      subscriptions = [
+        // The listener carries the native device token; the Expo token is derived from it again.
+        Notifications.addPushTokenListener(() => void registerPushToken()),
+        Notifications.addNotificationResponseReceivedListener(() => onOpen()),
+      ];
+    })
+    .catch((err: unknown) => {
+      if (__DEV__) console.warn('[push] listeners skipped:', err instanceof Error ? err.message : err);
+    });
+  return () => {
+    stopped = true;
+    subscriptions.forEach((s) => s.remove());
+    subscriptions = [];
+  };
 }

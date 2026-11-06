@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm install)",
+            "Bash(pnpm exec tsc *)",
+      "Bash(pnpm exec expo lint *)",
+      "Bash(pnpm exec prisma generate)",
+      "Bash(pnpm exec prisma validate)",
+      "Bash(uv sync)",
+      "Bash(uv run pytest *)",
+      "Bash(.venv/bin/pytest *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ],
+    "ask": [
+      "Bash(pnpm add *)",
+      "Bash(pnpm exec expo install *)",
+      "Bash(pnpm exec prisma migrate *)",
+      "Bash(pnpm prisma migrate *)",
+      "Bash(uv add *)",
+      "Bash(uv run python -m scripts.migrate *)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(git push *)"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/.env.local)",
+      "Read(**/.env.bak)",
+      "Read(**/.env.development)",
+      "Read(**/.env.production)",
+      "Read(**/.dev-last-otp.json)",
+      "Bash(pnpm exec prisma migrate reset *)",
+      "Bash(pnpm exec prisma db push *)",
+      "Bash(npx prisma migrate reset *)",
+      "Bash(npx prisma db push *)",
+      "Bash(pnpm prisma migrate reset *)",
+      "Bash(pnpm prisma db push *)",
+      "Bash(git push --force *)"
+    ]
+  }
+}

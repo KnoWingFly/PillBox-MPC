@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
-from PySide6.QtNetwork import QNetworkRequest
+from PySide6.QtNetwork import QAbstractSocket, QNetworkRequest
 from PySide6.QtWebSockets import QWebSocket
 
 from smart_pillbox import config
@@ -29,6 +30,8 @@ class DeviceSocket(QObject):
     command_received = Signal(str, str, dict)  # command_id, command, payload
     connected_changed = Signal(bool)
     welcome_received = Signal(dict)  # carries server_time + timezone (clock sync)
+    auth_rejected = Signal()  # closed with 4401: the device key is not (or no longer) valid
+    heartbeat_failed = Signal()  # the backend could not store a heartbeat sent on this socket
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -73,12 +76,15 @@ class DeviceSocket(QObject):
     def _open(self) -> None:
         if not self._wanted or self._identity is None:
             return
+        if self._ws.state() != QAbstractSocket.SocketState.UnconnectedState:
+            return  # already connecting or connected (a stale retry must not replace it)
         code, key = self._identity
         request = QNetworkRequest(QUrl(config.device_ws_url(code)))
         request.setRawHeader(b"X-Device-Key", key.encode("utf-8"))
         self._ws.open(request)
 
     def _on_connected(self) -> None:
+        self._retry.stop()
         self._delay_ms = config.WS_RECONNECT_MIN_MS
         self.is_connected = True
         logger.info("Command channel connected.")
@@ -90,9 +96,25 @@ class DeviceSocket(QObject):
             self.is_connected = False
             logger.info("Command channel disconnected.")
             self.connected_changed.emit(False)
-        if self._wanted and not self._retry.isActive():
-            self._retry.start(self._delay_ms)
-            self._delay_ms = min(self._delay_ms * 2, config.WS_RECONNECT_MAX_MS)
+        if not self._wanted or self._retry.isActive():
+            return
+        code = self._ws.closeCode().value
+        if code == config.WS_CLOSE_AUTH_FAILED:
+            # Retrying every second cannot fix a rejected key: wait the longest delay, and tell
+            # the window so it can ask for the device to be registered again.
+            logger.warning("Command channel refused the device key (4401).")
+            self.auth_rejected.emit()
+            self._delay_ms = config.WS_RECONNECT_MAX_MS
+        elif code == config.WS_CLOSE_SERVER_ERROR:
+            # The backend failed (not the key): keep the normal jittered backoff, never the 4401 path.
+            logger.warning("Command channel closed by a server-side failure (1011); retrying with backoff.")
+        elif code == config.WS_CLOSE_REPLACED:
+            # Another process uses this identity: reconnecting at once would kick it off again.
+            logger.warning("Command channel taken over by another connection with this identity (4000).")
+            self._delay_ms = config.WS_RECONNECT_MAX_MS
+        jitter = 1 + random.uniform(-config.WS_RECONNECT_JITTER, config.WS_RECONNECT_JITTER)
+        self._retry.start(int(self._delay_ms * jitter))
+        self._delay_ms = min(self._delay_ms * 2, config.WS_RECONNECT_MAX_MS)
 
     def _on_message(self, raw: str) -> None:
         try:
@@ -104,8 +126,14 @@ class DeviceSocket(QObject):
         if message.get("type") == "welcome":
             self.welcome_received.emit(message)
             return
+        if message.get("type") == "error":
+            error = message.get("error")
+            logger.warning("Command channel error from backend: %s", error)
+            if error == config.WS_HEARTBEAT_NOT_STORED:
+                self.heartbeat_failed.emit()
+            return
         if message.get("type") != "command":
-            return  # heartbeat_ack, pong, error: nothing to do
+            return  # heartbeat_ack, pong: nothing to do
         payload = message.get("payload")
         self.command_received.emit(
             str(message.get("command_id", "")),

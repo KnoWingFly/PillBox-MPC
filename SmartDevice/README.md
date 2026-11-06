@@ -13,8 +13,9 @@ physical hardware built).
 - **Single Active Chamber** constraint — a second due compartment queues
   until the first is closed or marked MISSED
 - A Rules Engine that flags **MISSED** once the tolerance window expires.
-  A dose window is `schedule_time` to `schedule_time + tolerance`, the same
-  window the backend uses. A chamber only pops up inside it. If the simulator
+  A dose window is `schedule_time` to `schedule_time + tolerance` (the backend's
+  deadline is `window_end + tolerance`; the same when `window_end == window_start`,
+  see `docs/DEVICE_CONTRACT.md` §6). A chamber only pops up inside it. If the simulator
   starts, or the clock jumps, after a window has closed, that dose shows
   MISSED without ringing instead of popping up hours late.
 - Today's TAKEN/MISSED states are rebuilt from the local event log at
@@ -29,8 +30,8 @@ physical hardware built).
 - A chime that repeats every `CHIME_REPEAT_SECONDS` while a chamber is popped
   up (see "Chime sound" below)
 - An offline-first local SQLite event log that doubles as the telemetry
-  queue — sync attempts fail gracefully (and just keep buffering) until the
-  FastAPI backend exists
+  queue — while the backend is unreachable, sync attempts fail gracefully and
+  events keep buffering until the next successful flush
 
 ## Run it
 
@@ -45,7 +46,7 @@ python -m venv .venv                    # once
 pairing QR. A fresh run creates `pillbox_local.db` next to this file, seeded with a
 default schedule (07:00/12:00/17:00/20:00 before meals, +30 min after).
 Edit `_DEFAULT_SCHEDULE` in `smart_pillbox/db/database.py` or use
-`Database.update_schedule()` to change it.
+`Database.update_schedules()` to change it.
 
 ## Run the tests
 
@@ -59,10 +60,9 @@ needed, so they run headless in CI too.
 
 ## Known simplifications (documented, not hidden)
 
-- `interact()` logs `DOOR_OPEN` → `DOOR_CLOSE` → `TAKEN` from a single button
-  press rather than two separate physical transitions — acceptable for a
-  simulator, but note it if a reviewer asks how the real Reed Switch flow maps
-  to this code.
+- `interact()` is a thin wrapper around `open_compartment()`: opening the lid counts as taken and logs
+  `COMPARTMENT_OPENED`. Closing is a separate call that logs `COMPARTMENT_CLOSED`. The real reed switch
+  would report both transitions on its own.
 - Sync (`SyncWorker`) and registration (`RegisterWorker`) run on `QThreadPool` workers, so a slow
   or unreachable backend never freezes the GUI; one sync runs at a time.
 
@@ -130,7 +130,7 @@ another. The backend tells pillboxes apart by device code (each `register` creat
 6. Let the dose pop up in `[pb2]` and take it (or let it go missed). The notification
    appears in the app under "Kamar Ayah" only; switch to "Kamar Ibu" and it is not there.
 7. **Reset Identitas** in `[pb2]`: the default window stays "Terpasang". In the app, "Kamar Ayah"
-   turns offline within about 45 s.
+   turns offline right away (its WebSocket closes).
 8. In the app, remove "Kamar Ayah" (Perangkat → Hapus). "Kamar Ibu" stays, schedules intact.
 9. Open up to 4 windows with **Tambah Pillbox Virtual**: the button then disables ("4/4").
    `python main.py --profile pb2` while `[pb2]` is open is refused.

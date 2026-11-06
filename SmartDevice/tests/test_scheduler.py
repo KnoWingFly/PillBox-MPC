@@ -88,14 +88,17 @@ def test_missed_after_tolerance_window_expires(tmp_path):
     assert scheduler.active_chamber_id is None
 
 
-def test_interact_ignored_when_not_active(tmp_path):
+def test_opening_a_chamber_that_is_not_active_is_an_unscheduled_open(tmp_path):
+    """SmartDevice/CLAUDE.md: opening any chamber that is not the ACTIVE one logs UNSCHEDULED_OPEN
+    (the backend raises a critical alert); the chamber's dose state does not change."""
     scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 0))
     compartment = next(iter(scheduler.compartments.values()))
 
     scheduler.interact(compartment.id)  # never activated
 
     assert compartment.state == ChamberState.IDLE
-    assert scheduler.db.get_unsynced_events() == []
+    events = scheduler.db.get_unsynced_events()
+    assert [(e["event_type"], e["slot_number"]) for e in events] == [("UNSCHEDULED_OPEN", compartment.slot_number)]
 
 
 def _take_slot_one_at_seven(tmp_path):
@@ -266,3 +269,131 @@ def test_release_late_refuses_while_another_chamber_is_active(tmp_path):
     assert scheduler.active_chamber_id == other.id
 
     assert scheduler.release_late(1, datetime(2026, 1, 1, 9, 15)) is not None
+
+
+def test_opening_after_the_clock_moved_back_logs_no_negative_chime_count(tmp_path):
+    """The backend rejects chime_count < 0; it used to go negative when the RTC was set back
+    while a chamber was up (time_sync, "Sync Jam Nyata")."""
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 59))
+    compartment = next(iter(scheduler.compartments.values()))
+    compartment.schedule_time = "07:00"
+    scheduler.clock.jump(timedelta(minutes=2))
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+
+    scheduler.clock.jump(timedelta(minutes=-1))
+    scheduler.interact(compartment.id)
+
+    opened = [e for e in scheduler.db.get_unsynced_events() if e["event_type"] == "COMPARTMENT_OPENED"]
+    assert opened and opened[-1]["chime_count"] == 0
+
+
+# --- robustness (config, restarts, midnight) ----------------------------------------
+
+def test_deadline_after_midnight_does_not_skip_the_next_day(tmp_path):
+    """A 23:50 dose with 30 min tolerance times out at 00:20 the next day. It used to be recorded
+    as done for the NEW day, so that day's 23:50 dose never popped up."""
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 23, 49))
+    compartment = next(iter(scheduler.compartments.values()))
+    compartment.schedule_time = "23:50"
+    compartment.tolerance_minutes = 30
+    scheduler.restore_day()  # started at 23:49: forget the seeded 07:00 dose that is already over
+
+    scheduler.clock.jump(timedelta(minutes=2))  # 23:51 day 1
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+
+    scheduler.clock.jump(timedelta(minutes=30))  # 00:21 day 2: past the deadline
+    scheduler.tick()
+    assert compartment.state == ChamberState.MISSED
+
+    scheduler.clock.set_time(datetime(2026, 1, 2, 23, 51))  # same day 2, its own dose is due
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+    assert compartment.due_at == datetime(2026, 1, 2, 23, 50)
+
+
+def test_dose_taken_after_midnight_does_not_skip_the_next_day(tmp_path):
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 23, 49))
+    compartment = next(iter(scheduler.compartments.values()))
+    compartment.schedule_time = "23:50"
+    compartment.tolerance_minutes = 30
+    scheduler.restore_day()  # started at 23:49: forget the seeded 07:00 dose that is already over
+
+    scheduler.clock.jump(timedelta(minutes=2))
+    scheduler.tick()
+    scheduler.clock.jump(timedelta(minutes=15))  # 00:06 day 2, still inside the window
+    scheduler.tick()
+    scheduler.open_compartment(compartment.id)
+    scheduler.close_compartment(compartment.id)
+    assert compartment.state == ChamberState.TAKEN
+
+    scheduler.clock.set_time(datetime(2026, 1, 2, 23, 51))
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+
+
+def test_refill_mode_survives_a_restart(tmp_path):
+    db = Database(db_path=tmp_path / "refill.db")
+    first = PillboxScheduler(db, SimulatedClock(start_at=datetime(2026, 1, 1, 6, 0)))
+    first.set_refill_mode(True)
+
+    restarted = PillboxScheduler(Database(db_path=tmp_path / "refill.db"), SimulatedClock(start_at=datetime(2026, 1, 1, 6, 0)))
+    assert restarted.is_refill_mode is True
+    compartment = next(iter(restarted.compartments.values()))
+    restarted.open_compartment(compartment.id)
+    events = [row["event_type"] for row in restarted.db.get_unsynced_events()]
+    assert events == ["REFILL_MAINTENANCE"]  # not UNSCHEDULED_OPEN (a critical alert)
+
+
+def test_one_unreadable_slot_does_not_stop_the_others(tmp_path):
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 59))
+    broken, healthy = list(scheduler.compartments.values())[:2]
+    broken.schedule_time = "7 pagi"
+    healthy.schedule_time = "07:00"
+
+    scheduler.clock.jump(timedelta(minutes=2))
+    scheduler.tick()  # used to raise ValueError and stop every slot
+    scheduler.restore_day()
+    scheduler.reset_day()
+    scheduler.tick()
+
+    assert healthy.state == ChamberState.ACTIVE
+    assert broken.state == ChamberState.IDLE
+    assert scheduler.get_next_dose() is None or scheduler.get_next_dose() is not broken
+    assert scheduler.next_due_at() is None or isinstance(scheduler.next_due_at(), datetime)
+
+
+def test_deadline_follows_window_end(tmp_path):
+    """The backend's deadline is window_end + tolerance (contract §5); the device used window_start."""
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 1, 6, 59))
+    compartment = next(iter(scheduler.compartments.values()))
+    compartment.schedule_time = "07:00"
+    compartment.window_end = "07:30"
+    compartment.tolerance_minutes = 10
+
+    scheduler.clock.jump(timedelta(minutes=2))
+    scheduler.tick()
+    scheduler.clock.set_time(datetime(2026, 1, 1, 7, 35))  # past start + tolerance, before end + tolerance
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE
+
+    scheduler.clock.set_time(datetime(2026, 1, 1, 7, 41))
+    scheduler.tick()
+    assert compartment.state == ChamberState.MISSED
+
+
+def test_released_dose_of_yesterday_does_not_block_today(tmp_path):
+    scheduler = make_scheduler(tmp_path, datetime(2026, 1, 2, 6, 0))
+    compartment = next(iter(scheduler.compartments.values()))
+    compartment.schedule_time = "07:00"
+    refused = scheduler.release_late(
+        compartment.slot_number, until=datetime(2026, 1, 2, 6, 30), scheduled_for=datetime(2026, 1, 1, 22, 0)
+    )
+    assert refused is None
+    scheduler.open_compartment(compartment.id)
+    scheduler.close_compartment(compartment.id)
+
+    scheduler.clock.set_time(datetime(2026, 1, 2, 7, 1))
+    scheduler.tick()
+    assert compartment.state == ChamberState.ACTIVE

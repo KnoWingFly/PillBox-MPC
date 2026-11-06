@@ -1,3 +1,7 @@
+# Agent personal overrides
+CLAUDE.local.md
+.claude/settings.local.json
+
 # Environment and local secrets
 .env
 .env.*
@@ -43,3 +47,5 @@ __pycache__/
 # Simulator: virtual pillbox profiles (own DBs) and per-profile run locks
 SmartDevice/profiles/
 SmartDevice/.pillbox.lock
+
+Design/stitch

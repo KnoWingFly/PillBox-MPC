@@ -1,11 +1,13 @@
 """Missed-dose rules engine against a real database."""
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import asyncpg
 import httpx
+import pytest
 
 from app.core.config import Settings, get_settings
 from app.db.session import get_sessionmaker
@@ -183,3 +185,117 @@ async def test_editing_an_old_slot_does_not_back_fill_yesterday(
     await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0))
     assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status IS NOT NULL") == 0
     assert await _count(db, "SELECT count(*) FROM notifications WHERE type = 'DOSE_MISSED'") == 0
+
+
+async def test_device_timeout_racing_the_rules_engine_does_not_deadlock(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    """Telemetry locks the device row while the rules engine inserts dose rows whose FK check
+    locks the same row FOR KEY SHARE; with FOR UPDATE on the device this deadlocked every time."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, start="08:00", end="08:30", tolerance=15)
+    await _backdate(db, device.id)
+    await _set_online(db, device.id, datetime.now(UTC) - timedelta(days=1))
+    yesterday = (datetime.now(ZoneInfo("Asia/Jakarta")) - timedelta(days=1)).date().isoformat()
+    timeout = event(str(uuid.uuid4()), "ALARM_TIMEOUT", f"{yesterday}T08:46:00+07:00", chime_count=9)
+
+    res, rules_pass = await asyncio.gather(
+        send_telemetry(client, device, [timeout]),
+        run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0)),
+    )
+
+    assert res.status_code == 200
+    assert rules_pass.created >= 1 and not rules_pass.materialize_failed
+    decided = await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED'")
+    assert decided >= 2
+    assert await _count(db, "SELECT count(*) FROM notifications WHERE type = 'DOSE_MISSED'") == decided
+
+
+async def _report_rtc(client: httpx.AsyncClient, device, rtc: datetime) -> None:  # type: ignore[no-untyped-def]
+    res = await client.post(
+        f"/api/v1/devices/{device.code}/heartbeat",
+        json={"battery_percent": 80, "rtc_time": rtc.isoformat(), "rtc_speed": 1.0},
+        headers=device.device_headers,
+    )
+    assert res.status_code == 200, res.text
+
+
+async def test_absurd_device_clock_falls_back_to_server_time(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """An RTC reset to 2000 must not hide real missed doses nor create doses for 1999/2000."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, start="08:00", end="08:30", tolerance=15)
+    await _backdate(db, device.id)
+    await _report_rtc(client, device, datetime(2000, 1, 1, tzinfo=ZoneInfo("Asia/Jakarta")))
+    await _set_online(db, device.id, datetime.now(UTC) - timedelta(days=1))
+
+    await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0))
+
+    assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE scheduled_date < '2026-01-01'") == 0
+    assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED'") >= 1
+
+
+async def test_lagging_device_clock_still_alerts_after_max_wait(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """A clock 2 days behind (within the followed skew) is followed, but OFFLINE_MAX_WAIT runs on server time."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device, start="08:00", end="08:30", tolerance=15)
+    await _backdate(db, device.id)
+    await _report_rtc(client, device, datetime.now(UTC) - timedelta(days=2))
+    await _set_online(db, device.id, datetime.now(UTC) - timedelta(days=1))
+    settings = _settings(offline_flush_wait_seconds=0, offline_max_wait_minutes=60)
+
+    await run_once(get_sessionmaker(), datetime.now(UTC), settings)
+
+    yesterday = (datetime.now(ZoneInfo("Asia/Jakarta")) - timedelta(days=1)).date()
+    missed = await db.fetchval(
+        "SELECT status FROM telemetry_logs WHERE scheduled_date = $1", yesterday
+    )
+    assert missed == "MISSED"
+
+
+async def test_device_clock_beyond_skew_does_not_miss_future_doses(
+    client: httpx.AsyncClient, db: asyncpg.Connection
+) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    local_now = datetime.now(ZoneInfo("Asia/Jakarta"))
+    start = (local_now + timedelta(hours=2)).replace(second=0, microsecond=0)
+    if start.date() != local_now.date():
+        pytest.skip("the 2-hour-ahead window would cross midnight")
+    hhmm = start.strftime("%H:%M")
+    await create_schedule(client, owner, device, start=hhmm, end=hhmm, tolerance=15)
+    await _backdate(db, device.id)
+    await _report_rtc(client, device, datetime.now(UTC) + timedelta(days=8))
+    await _set_online(db, device.id, datetime.now(UTC) - timedelta(days=1))
+
+    await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_flush_wait_seconds=0))
+
+    assert await _count(db, "SELECT count(*) FROM telemetry_logs WHERE status = 'MISSED' AND scheduled_for > now()") == 0
+
+
+async def test_resolution_note_is_in_each_recipients_language(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    owner = await create_caregiver(db, "Owner")
+    await db.execute("UPDATE users SET interface_language = 'EN' WHERE id = $1", owner.id)
+    device = await paired_device(client, owner)
+    viewer = await create_caregiver(db, "Viewer")  # default language ID
+    res = await client.post(f"/api/v1/devices/{device.id}/join", json={"device_pin": device.pin}, headers=viewer.headers)
+    assert res.status_code == 200
+    await create_schedule(client, owner, device, start="08:00", end="08:30", tolerance=15)
+    await _backdate(db, device.id)
+    await run_once(get_sessionmaker(), datetime.now(UTC), _settings(offline_max_wait_minutes=0))
+    row = await db.fetchrow("SELECT id, scheduled_date FROM telemetry_logs WHERE status = 'MISSED' ORDER BY scheduled_for LIMIT 1")
+    day = row["scheduled_date"].isoformat()
+
+    await send_telemetry(client, device, [event("ev-late-2", "COMPARTMENT_OPENED", f"{day}T08:40:00+07:00")])
+
+    notes = {
+        r["user_id"]: r["resolution_note"]
+        for r in await db.fetch(
+            "SELECT user_id, resolution_note FROM notifications WHERE telemetry_log_id = $1 AND type = 'DOSE_MISSED'",
+            row["id"],
+        )
+    }
+    assert notes[owner.id].startswith("Taken late at 08:40") and "pillbox sensor" in notes[owner.id]
+    assert notes[viewer.id].startswith("Diminum terlambat pukul 08:40") and "sensor pillbox" in notes[viewer.id]

@@ -11,7 +11,10 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy import exc as sa_exc
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,32 @@ def conflict(code: str, message: str, details: Any = None) -> AppError:
 
 def unprocessable(code: str, message: str, details: Any = None) -> AppError:
     return AppError(422, code, message, details)
+
+
+# Database overloaded or unreachable (pool exhausted, pooler client limit, dropped
+# connection, statement timeout). Answered with 503 + Retry-After instead of 500,
+# so the app can tell "busy, try again" from a bug.
+_DB_UNAVAILABLE = (sa_exc.TimeoutError, sa_exc.OperationalError, sa_exc.InterfaceError, OSError, TimeoutError)
+
+
+# Postgres aborted the transaction to resolve a conflict (deadlock_detected, serialization_failure,
+# lock_not_available from lock_timeout): safe to retry, so "busy" (503), not a bug (500).
+_RETRYABLE_SQLSTATES = frozenset({"40P01", "40001", "55P03"})
+_UNIQUE_VIOLATION = "23505"
+
+
+def is_db_unavailable(exc: BaseException) -> bool:
+    if isinstance(exc, _DB_UNAVAILABLE):
+        return True
+    if isinstance(exc, sa_exc.DBAPIError):
+        if exc.connection_invalidated:
+            return True
+        if getattr(exc.orig, "sqlstate", None) in _RETRYABLE_SQLSTATES:
+            return True
+        # Supavisor rejects with a FATAL that asyncpg maps to a generic error class.
+        text = str(exc.orig).lower()
+        return "max client" in text or "too many" in text or "timeout" in text
+    return False
 
 
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
@@ -100,6 +129,25 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unexpected(request: Request, exc: Exception) -> JSONResponse:
+        if is_db_unavailable(exc):
+            logger.warning(
+                "db_unavailable",
+                extra={"method": request.method, "path": request.url.path, "error": type(exc).__name__},
+                # A bare OSError/TimeoutError may also be a bug outside the database: keep its trace.
+                exc_info=not isinstance(exc, sa_exc.SQLAlchemyError),
+            )
+            return JSONResponse(
+                error_body("SERVICE_UNAVAILABLE", "Server is busy, please try again shortly"),
+                status_code=503,
+                headers={"Retry-After": str(get_settings().db_unavailable_retry_after_seconds)},
+            )
+        if isinstance(exc, sa_exc.IntegrityError) and getattr(exc.orig, "sqlstate", None) == _UNIQUE_VIOLATION:
+            # Two requests raced past a "does it exist yet?" check: the second one loses.
+            logger.warning("unique_violation", extra={"method": request.method, "path": request.url.path})
+            return JSONResponse(
+                error_body("CONFLICT", "This was changed at the same time by another request, please reload"),
+                status_code=409,
+            )
         logger.exception(
             "unhandled_error", extra={"method": request.method, "path": request.url.path}
         )

@@ -1,6 +1,8 @@
+import { Strings } from '@/constants/strings';
 import * as api from '@root/lib/api';
+import type { DoseStatus, TodayDose } from '@root/lib/insights';
 import type { NotificationFilter } from '@root/lib/notifications';
-import { jakartaMinutesNow } from '@root/lib/schedule-time';
+import { scheduleMinutesNow, scheduleParts } from '@root/lib/schedule-time';
 import type { AppNotification, DeviceStatus, NotificationType, Slot, SlotId, ToleranceMinutes } from '@root/lib/types';
 
 import type { IconName, Tone } from './ui';
@@ -11,15 +13,14 @@ export const LOW_BATTERY_PERCENT = 20;
 export const STALE_SYNC_MS = 10 * 60 * 1000;
 /** Used when an empty slot gets its first time: Pagi, Siang, Sore, Malam. */
 export const COLUMN_DEFAULT_TIMES = [7 * 60, 12 * 60, 18 * 60, 21 * 60] as const;
-export const COLUMNS: { label: string; icon: IconName }[] = [
-  { label: 'Pagi', icon: 'sunny-outline' },
-  { label: 'Siang', icon: 'sunny' },
-  { label: 'Sore', icon: 'partly-sunny-outline' },
-  { label: 'Malam', icon: 'moon-outline' },
-];
+const COLUMN_ICONS: IconName[] = ['sunny-outline', 'sunny', 'partly-sunny-outline', 'moon-outline'];
+export const COLUMNS: { label: string; icon: IconName }[] = Strings.shell.periods.map((label, i) => ({
+  label,
+  icon: COLUMN_ICONS[i],
+}));
 export const ROWS = [
-  { key: 'A', label: 'Sebelum Makan' },
-  { key: 'B', label: 'Sesudah Makan' },
+  { key: 'A', label: Strings.shell.rows.A },
+  { key: 'B', label: Strings.shell.rows.B },
 ] as const;
 export const TOLERANCE_OPTIONS: { value: ToleranceMinutes; label: string }[] = [
   { value: 15, label: '15 menit' },
@@ -121,7 +122,6 @@ export function deviceLook(device: DeviceStatus, now: number): DeviceLook {
   return { tone: 'ontime', label: 'Terhubung', detail: 'Pillbox terhubung dan jadwal tersinkron.', icon: 'checkmark-circle' };
 }
 
-/** The next active dose (WIB): today if still ahead, otherwise the first one tomorrow. */
 /** "Now" on the pillbox clock (epoch ms); the phone clock when the pillbox reports none. */
 export function pillboxNow(device: DeviceStatus | null, nowMs: number): number {
   const clock = device?.clock;
@@ -144,29 +144,79 @@ export function pillboxClockNote(device: DeviceStatus | null, nowMs: number): st
   return parts.length ? parts.join(' · ') : null;
 }
 
+/** The next active dose (pillbox clock): today if still ahead, otherwise the first one tomorrow. */
 export function nextDose(slots: Slot[], nowMs: number): { slot: Slot; inMinutes: number; tomorrow: boolean } | null {
   const active = slots.filter(isSlotActive).sort((a, b) => (a.timeMinutes ?? 0) - (b.timeMinutes ?? 0));
   if (active.length === 0) return null;
-  const now = jakartaMinutesNow(nowMs);
+  const now = scheduleMinutesNow(nowMs);
   const today = active.find((s) => (s.timeMinutes ?? 0) > now);
   if (today) return { slot: today, inMinutes: (today.timeMinutes ?? 0) - now, tomorrow: false };
   const first = active[0];
   return { slot: first, inMinutes: 24 * 60 - now + (first.timeMinutes ?? 0), tomorrow: true };
 }
 
-const DAYS_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
-const MONTHS_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
-
-/** "Sabtu, 17 Oktober" in WIB, independent of the phone's timezone. */
-export function formatJakartaDate(nowMs: number): string {
-  const d = new Date(nowMs + 7 * 60 * 60000);
-  return `${DAYS_ID[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS_ID[d.getUTCMonth()]}`;
+/** "Sabtu, 17 Oktober" on the pillbox clock, independent of the phone's timezone. */
+export function formatPillboxDate(nowMs: number): string {
+  const p = scheduleParts(nowMs);
+  const c = Strings.calendar;
+  return c.dayDate(c.days[p.weekday], p.day, c.months[p.month - 1]);
 }
 
-export function greeting(nowMs: number): string {
-  const hour = Math.floor(jakartaMinutesNow(nowMs) / 60);
-  if (hour < 11) return 'Selamat pagi';
-  if (hour < 15) return 'Selamat siang';
-  if (hour < 18) return 'Selamat sore';
-  return 'Selamat malam';
+/** Adherence at or above these percentages is "Sangat Baik" / "Baik"; below is "Perlu Perhatian". */
+export const ADHERENCE_GREAT_PERCENT = 90;
+export const ADHERENCE_GOOD_PERCENT = 75;
+
+export function adherenceBand(percent: number | null): { label: string; tone: Tone } {
+  const bands = Strings.home.adherenceBands;
+  if (percent === null) return { label: bands.none, tone: 'neutral' };
+  if (percent >= ADHERENCE_GREAT_PERCENT) return { label: bands.great, tone: 'ontime' };
+  if (percent >= ADHERENCE_GOOD_PERCENT) return { label: bands.good, tone: 'late' };
+  return { label: bands.low, tone: 'missed' };
+}
+
+const DOSE_TONE: Record<DoseStatus, Tone> = {
+  PENDING: 'primary',
+  TAKEN_ON_TIME: 'ontime',
+  TAKEN_LATE: 'late',
+  MISSED: 'missed',
+};
+
+export function doseLook(dose: Pick<TodayDose, 'status' | 'delayMinutes'>): { label: string; tone: Tone } {
+  const s = Strings.home.status;
+  const label = dose.status === 'TAKEN_LATE' ? s.TAKEN_LATE(dose.delayMinutes) : s[dose.status];
+  return { label, tone: DOSE_TONE[dose.status] };
+}
+
+/** Whole years between a "YYYY-MM-DD" birth date and `nowMs` (pillbox calendar); null when unknown. */
+export function ageInYears(birthDate: string | null, nowMs: number): number | null {
+  if (!birthDate) return null;
+  const [y, m, d] = birthDate.split('-').map(Number);
+  const today = scheduleParts(nowMs);
+  const beforeBirthday = today.month < m || (today.month === m && today.day < d);
+  return today.year - y - (beforeBirthday ? 1 : 0);
+}
+
+/** "15:06:26" on the pillbox clock. */
+export function formatPillboxClock(ms: number): string {
+  const p = scheduleParts(ms);
+  return [p.hour, p.minute, p.second].map((n) => String(n).padStart(2, '0')).join(':');
+}
+
+/** "86%", or "—" when the pillbox has not reported its battery. */
+export function formatBattery(percent: number | null): string {
+  return percent === null ? Strings.common.noValue : Strings.shell.percent(percent);
+}
+
+export function isLowBattery(percent: number | null): boolean {
+  return percent !== null && percent <= LOW_BATTERY_PERCENT;
+}
+
+/** "15% · Lemah" when low, "86%" otherwise, "—" when unknown. */
+export function batteryText(percent: number | null): string {
+  return percent !== null && isLowBattery(percent) ? Strings.device.batteryLow(percent) : formatBattery(percent);
+}
+
+/** First word of a name, for greetings ("Halo, Arya"). */
+export function firstName(name: string | null | undefined): string {
+  return name?.trim().split(/\s+/)[0] || Strings.shell.caregiverFallback;
 }

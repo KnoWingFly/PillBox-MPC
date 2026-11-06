@@ -1,0 +1,5 @@
+# Created at run time next to each profile's database (see smart_pillbox/config.py)
+*.db-wal
+*.db-shm
+*.db.corrupt-*
+pillbox.log*

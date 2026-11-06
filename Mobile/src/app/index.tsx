@@ -4,33 +4,46 @@
 // One screen with four sections (Beranda, Jadwal, Notifikasi, Perangkat) swapped by a bottom tab
 // bar. State lives here so the sections share it (e.g. an unsaved schedule survives a tab switch).
 
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, BackHandler, Linking, Modal, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppConfig } from '@/config';
 import { ConnectPillboxScreen } from '@/components/pillbox/connect-card';
-import { PillboxListCard, PillboxSwitcher, RenamePillboxDialog } from '@/components/pillbox/device-list';
+import { TopBar } from '@/components/pillbox/blocks';
+import { PillboxListCard, RenamePillboxDialog } from '@/components/pillbox/device-list';
 import { DeviceTab } from '@/components/pillbox/device-tab';
 import { deviceLook, isDraftDirty, isSlotActive, notificationLook, pillboxNow, type ToastTone } from '@/components/pillbox/helpers';
 import { HomeTab } from '@/components/pillbox/home-tab';
 import { NotificationsTab, type DoseActionBusy } from '@/components/pillbox/notifications-tab';
 import { ConfirmDialog, type ConfirmRequest } from '@/components/pillbox/dialog';
 import { PinPrompt } from '@/components/pillbox/pin-prompt';
+import { ScheduleSyncedSheet } from '@/components/pillbox/schedule-synced-sheet';
+import { ServerBanner } from '@/components/pillbox/server-banner';
 import { ScheduleTab } from '@/components/pillbox/schedule-tab';
+import { SettingsTab } from '@/components/pillbox/settings-tab';
+import { BackHeader } from '@/components/ui/back-header';
 import { TabBar, type TabKey } from '@/components/pillbox/tab-bar';
 import { makeToast, Toast, type ToastData } from '@/components/pillbox/toast';
 import { LoadErrorBox } from '@/components/pillbox/ui';
 import * as tokens from '@/theme/tokens';
 import { useAuth } from '@/hooks/use-auth';
+import { useBackendHealth } from '@/hooks/use-backend-health';
+import { useDashboardInsights } from '@/hooks/use-dashboard-insights';
+import { Strings } from '@/constants/strings';
 import { useNotificationFeed } from '@/hooks/use-notification-feed';
+import { usePillboxAlarm } from '@/hooks/use-pillbox-alarm';
+import { usePolling } from '@/hooks/use-polling';
+import { useToast } from '@/hooks/use-toast';
+import { failMessage } from '@/lib/api/error-message';
 import { perfLog, perfLoginStep } from '@/lib/perf';
 import { DevicesProvider, useDevices } from '@root/context/devices-context';
 import * as api from '@root/lib/api';
-import type { ConnectPillboxResult, Pillbox } from '@root/lib/devices';
-import { fetchNotificationPage, NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
-import { findAllConflicts } from '@root/lib/schedule-time';
+import { canEdit, type ConnectPillboxResult, type Pillbox } from '@root/lib/devices';
+import { NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
+import { findAllConflicts, timezoneLabel } from '@root/lib/schedule-time';
 import type {
   AdherenceSummary,
   AppNotification,
@@ -41,16 +54,44 @@ import type {
   SlotId,
 } from '@root/lib/types';
 
-const RECENT_COUNT = 3;
-
 /** The active pillbox no longer exists for this account (unpaired here or by another caregiver). */
 function pillboxGone(err: unknown): boolean {
   return err instanceof api.BackendError && (err.code === 'NO_DEVICE' || err.status === 404 || err.status === 403);
 }
 
-/** "Gagal …" plus the backend's own message when there is one (e.g. "Device is offline"). */
-function failMessage(prefix: string, err: unknown): string {
-  return err instanceof api.BackendError ? `${prefix}: ${err.message}` : prefix;
+const D = Strings.dashboard;
+
+const TAB_KEYS: readonly TabKey[] = ['home', 'schedule', 'notifications', 'device', 'settings'];
+const isTabKey = (value: string | undefined): value is TabKey => TAB_KEYS.includes(value as TabKey);
+
+/** Lookups ConnectPillboxScreen needs from the account's list (no extra request). */
+function pairingLookups(devices: ReturnType<typeof useDevices>) {
+  return {
+    myDeviceIds: devices.all.map((p) => p.id),
+    findExisting: (code: string) => {
+      const found = devices.all.find((p) => p.code === code);
+      return found ? { id: found.id, name: found.name, hidden: devices.hidden.some((h) => h.id === found.id) } : null;
+    },
+  };
+}
+
+/**
+ * After pairing or joining: the new pillbox becomes active, which remounts the dashboard, so the
+ * result toast is handed over through `onCarry`. `showToast` reports a list reload that failed.
+ */
+function useConnectedHandler(onCarry: (carry: Carry) => void, showToast: (text: string, tone: ToastTone) => void) {
+  const devices = useDevices();
+  return async (result: ConnectPillboxResult) => {
+    const linked = result.joined ? D.joined : D.paired;
+    const message = result.online === false ? makeToast(D.linkedOffline(linked), 'warning') : makeToast(linked, 'success');
+    api.resubscribeRealtime();
+    onCarry({ tab: 'home', toast: message });
+    try {
+      await devices.added(result.deviceId);
+    } catch {
+      showToast(D.linkedReloadList, 'warning');
+    }
+  };
 }
 
 /** What survives the remount when the active pillbox changes (the dashboard is keyed by it). */
@@ -70,7 +111,12 @@ export default function PillboxScreen() {
  */
 function PillboxGate() {
   const devices = useDevices();
-  const [carriedTab, setCarriedTab] = useState<TabKey>('home');
+  // `/?tab=schedule&at=<ms>` opens a tab (e.g. "Atur Jadwal Obat Sekarang" after saving a profile);
+  // `at` makes the same tab requested twice count as two requests.
+  const params = useLocalSearchParams<{ tab?: string; at?: string }>();
+  const requestedTab = isTabKey(params.tab) ? params.tab : null;
+  const tabRequest = requestedTab ? { tab: requestedTab, id: params.at ?? requestedTab } : null;
+  const [carriedTab, setCarriedTab] = useState<TabKey>(requestedTab ?? 'home');
   // Toasts that must outlive a remount (e.g. "dihapus" after removing the active pillbox) live here.
   const [carriedToast, setCarriedToast] = useState<ToastData | null>(null);
   const hideCarried = useCallback((id: number) => {
@@ -85,7 +131,7 @@ function PillboxGate() {
       <SafeAreaView style={{ flex: 1 }} className="items-center justify-center gap-4 bg-canvas px-6">
         {devices.loadError ? (
           <LoadErrorBox
-            text={`Gagal memuat daftar pillbox. Periksa koneksi Anda.${__DEV__ ? `\nServer: ${api.BASE_URL}` : ''}`}
+            text={`${D.listLoadError}${__DEV__ ? D.devServer(api.BASE_URL) : ''}`}
             onRetry={() => void devices.refresh()}
           />
         ) : (
@@ -94,17 +140,89 @@ function PillboxGate() {
       </SafeAreaView>
     );
   }
+  // Backend mode without a selected pillbox: only the pairing screen mounts, so no feed, poll or
+  // socket runs for a dashboard that has nothing to show.
+  const needsPairing = !api.USE_MOCK && devices.active === null;
   return (
     <>
-      <PillboxDashboard key={devices.active?.id ?? 'none'} initialTab={carriedTab} onCarry={carry} />
+      {needsPairing ? (
+        <NeedsPairingScreen onCarry={carry} />
+      ) : (
+        <PillboxDashboard key={devices.active?.id ?? 'none'} initialTab={carriedTab} tabRequest={tabRequest} onCarry={carry} />
+      )}
       {carriedToast && <Toast key={carriedToast.id} toast={carriedToast} onDone={hideCarried} />}
     </>
   );
 }
 
-function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry: (carry: Carry) => void }) {
+/** Full-screen "Belum ada pillbox": pair or join one, or sign out. */
+function NeedsPairingScreen({ onCarry }: { onCarry: (carry: Carry) => void }) {
+  const devices = useDevices();
+  const { signOut } = useAuth();
+  const { showToast, toastNode } = useToast();
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  const [busy, setBusy] = useState(false);
+  const handleConnected = useConnectedHandler(onCarry, showToast);
+  const { myDeviceIds, findExisting } = pairingLookups(devices);
+
+  const runConfirm = async () => {
+    if (!confirm || busy) return;
+    setBusy(true);
+    try {
+      await confirm.onConfirm();
+    } finally {
+      setBusy(false);
+      setConfirm(null);
+    }
+  };
+
+  return (
+    <View className="flex-1 bg-canvas">
+      <StatusBar style="dark" />
+      <SafeAreaView style={{ flex: 1 }} edges={['top', 'left', 'right', 'bottom']}>
+        <ConnectPillboxScreen
+          onConnected={(r) => void handleConnected(r)}
+          findExisting={findExisting}
+          myDeviceIds={myDeviceIds}
+          onUnhide={() => void devices.unhideAll()}
+          hiddenCount={devices.hidden.length}
+          onSignOut={() => setConfirm(signOutRequest(signOut))}
+        />
+      </SafeAreaView>
+      <ConfirmDialog request={confirm} busy={busy} onConfirm={() => void runConfirm()} onCancel={() => setConfirm(null)} />
+      {toastNode}
+    </View>
+  );
+}
+
+function signOutRequest(signOut: () => Promise<void>): ConfirmRequest {
+  return {
+    title: D.signOutTitle,
+    message: D.signOutMessage,
+    confirmLabel: D.signOutConfirm,
+    tone: 'danger',
+    icon: 'log-out-outline',
+    onConfirm: signOut,
+  };
+}
+
+function PillboxDashboard({
+  initialTab,
+  tabRequest,
+  onCarry,
+}: {
+  initialTab: TabKey;
+  /** A tab asked for through the route (see PillboxGate); applied once per request id. */
+  tabRequest: { tab: TabKey; id: string } | null;
+  onCarry: (carry: Carry) => void;
+}) {
   const devices = useDevices();
   const [tab, setTab] = useState<TabKey>(initialTab);
+  const [seenTabRequest, setSeenTabRequest] = useState(tabRequest?.id ?? null);
+  if (tabRequest && tabRequest.id !== seenTabRequest) {
+    setSeenTabRequest(tabRequest.id);
+    setTab(tabRequest.tab);
+  }
   const [now, setNow] = useState(() => Date.now());
   const [toast, setToast] = useState<ToastData | null>(null);
 
@@ -112,8 +230,6 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [dashboardError, setDashboardError] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  // Backend mode only: no pillbox is selected because the caregiver has none (or hid them all).
-  const needsPairing = !api.USE_MOCK && devices.active === null;
   const [addOpen, setAddOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<Pillbox | null>(null);
 
@@ -121,7 +237,10 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const [draftSlots, setDraftSlots] = useState<Slot[]>([]);
   const [selectedSlotId, setSelectedSlotId] = useState<SlotId | null>(null);
   const [saving, setSaving] = useState(false);
+  /** Schedule just saved to an online pillbox: shown in the success sheet. */
+  const [syncedSlots, setSyncedSlots] = useState<Slot[] | null>(null);
   const [testing, setTesting] = useState(false);
+  const pillboxAlarm = usePillboxAlarm();
 
   const [alarmBusyId, setAlarmBusyId] = useState<string | null>(null);
   const [doseActionBusy, setDoseActionBusy] = useState<DoseActionBusy>(null);
@@ -131,38 +250,62 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const { user, signOut } = useAuth();
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  // Synchronous guard: a double tap reaches runConfirm twice before confirmBusy re-renders.
+  const confirmRunning = useRef(false);
   const [adherence, setAdherence] = useState<AdherenceSummary | null>(null);
-  const [recent, setRecent] = useState<AppNotification[]>([]);
+  // Every request the dashboard makes reports here; the banner shows while the server is unreachable.
+  const health = useBackendHealth();
+  const trackHealth = health.track;
+
+  const router = useRouter();
+  // Today's doses, weekly chart, elderly profile, clock and preferences; days follow the pillbox clock.
+  const insights = useDashboardInsights(pillboxNow(device, now), true);
+  const refreshDoses = insights.refreshDoses;
+  const [remindBusy, setRemindBusy] = useState(false);
+  const [calibrateOpen, setCalibrateOpen] = useState(false);
+  const [calibrateBusy, setCalibrateBusy] = useState(false);
 
   const [simSlotId, setSimSlotId] = useState<SlotId | null>(null);
   const [minutesLate, setMinutesLate] = useState(25);
   const [simBusy, setSimBusy] = useState<DoseEventType | null>(null);
   const [seeding, setSeeding] = useState(false);
 
+  const adherenceGen = useRef(0);
   const refreshAdherence = useCallback(() => {
-    api
-      .getAdherenceSummary()
-      .then(setAdherence)
-      .catch(() => {});
-  }, []);
+    const generation = ++adherenceGen.current;
+    trackHealth(api.getAdherenceSummary())
+      .then((summary) => {
+        if (generation === adherenceGen.current) setAdherence(summary);
+      })
+      .catch(() => undefined); // the card keeps its last value; health shows an outage
+  }, [trackHealth]);
 
-  /** The few newest notifications (any type) shown on Beranda. */
-  const refreshRecent = useCallback(() => {
-    fetchNotificationPage({ filter: 'all', cursor: null, limit: RECENT_COUNT })
-      .then((page) => setRecent(page.items))
-      .catch(() => {});
-  }, []);
+  // Several dose notifications in a burst (a backlog after reconnecting) refetch once, not per item.
+  const doseRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshAfterDoseEvent = useCallback(() => {
+    if (doseRefreshTimer.current) clearTimeout(doseRefreshTimer.current);
+    doseRefreshTimer.current = setTimeout(() => {
+      doseRefreshTimer.current = null;
+      refreshAdherence();
+      refreshDoses();
+    }, AppConfig.insightRefetchDebounceMs);
+  }, [refreshAdherence, refreshDoses]);
+  useEffect(
+    () => () => {
+      if (doseRefreshTimer.current) clearTimeout(doseRefreshTimer.current);
+    },
+    [],
+  );
 
   // New notifications trigger the banner; dose events also change adherence.
   const handleArrive = useCallback(
     (n: AppNotification) => {
       perfLog('iot_to_app', 'shown_on_screen', { notification_id: n.id });
-      setToast(makeToast(n.slotId ? `${n.title} · ${n.slotId}` : n.title, notificationLook(n).toast));
+      setToast(makeToast(n.slotId ? D.arrived(n.title, n.slotId) : n.title, notificationLook(n).toast));
       setNow(Date.now());
-      refreshRecent();
-      if (n.type !== 'system') refreshAdherence();
+      if (n.type !== 'system') refreshAfterDoseEvent();
     },
-    [refreshAdherence, refreshRecent],
+    [refreshAfterDoseEvent],
   );
   const feed = useNotificationFeed({ onArrive: handleArrive });
 
@@ -171,15 +314,18 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     setToast((current) => (current?.id === id ? null : current));
   }, []);
 
+  // Status answers can arrive out of order (a slow poll after a push): only the newest is applied.
+  const statusGen = useRef(0);
+
   // Initial load from the data layer. Pairing or switching pillboxes remounts the dashboard instead.
   useEffect(() => {
-    if (needsPairing) return;
     let cancelled = false;
-    Promise.all([api.getDeviceStatus(), api.getSchedules()])
+    const generation = ++statusGen.current;
+    trackHealth(Promise.all([api.getDeviceStatus(), api.getSchedules()]))
       .then(([status, slots]) => {
         if (cancelled) return;
         setDashboardError(false);
-        setDevice(status);
+        if (generation === statusGen.current) setDevice(status);
         setSavedSlots(slots);
         setDraftSlots(slots);
         perfLoginStep('first_screen_data_loaded');
@@ -191,34 +337,41 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
           return;
         }
         setDashboardError(true);
-        setToast(makeToast(failMessage('Gagal memuat data perangkat', err), 'error'));
+        // An unreachable server is already explained by the banner.
+        if (!api.isServerUnreachable(err)) setToast(makeToast(failMessage(D.deviceLoadFailed, err), 'error'));
       });
-    api
-      .getAdherenceSummary()
-      .then((summary) => {
-        if (!cancelled) setAdherence(summary);
-      })
-      .catch(() => {});
-    fetchNotificationPage({ filter: 'all', cursor: null, limit: RECENT_COUNT })
-      .then((page) => {
-        if (!cancelled) setRecent(page.items);
-      })
-      .catch(() => {});
+    refreshAdherence();
     return () => {
       cancelled = true;
     };
-    // `devices` is read only on failure; re-running on its changes would refetch on every list poll.
+    // Runs once per mount (the dashboard is keyed by pillbox). `devices` is read only on failure;
+    // re-running on its changes would refetch on every list poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [needsPairing]);
+  }, []);
 
   // Backend mode: online/offline, battery and last sync change on the device side. The backend
-  // pushes a hint when they change; the interval is the fallback when the socket is down.
+  // pushes them when they change; this poll is the fallback (slow while the socket is live, paused
+  // in the background).
+  const refreshStatus = useCallback(() => {
+    const generation = ++statusGen.current;
+    return trackHealth(api.getDeviceStatus()).then(
+      (status) => {
+        if (generation === statusGen.current) setDevice(status);
+      },
+      (err: unknown) => {
+        if (pillboxGone(err)) void devices.refresh();
+      },
+    );
+    // `devices.refresh` is stable; `devices` itself changes on every list poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackHealth, devices.refresh]);
+  usePolling(refreshStatus, api.USE_MOCK ? null : AppConfig.deviceStatusPollMs, {
+    slowWhen: api.isRealtimeLive,
+    slowIntervalMs: api.REALTIME_FALLBACK_POLL_MS,
+  });
+
   useEffect(() => {
-    if (api.USE_MOCK || needsPairing) return;
-    const refresh = () => {
-      api.getDeviceStatus().then(setDevice).catch(() => undefined);
-    };
-    const timer = setInterval(refresh, AppConfig.deviceStatusPollMs);
+    if (api.USE_MOCK) return;
     // Stock changes on the pillbox (refill, a sachet taken) arrive with the same heartbeat as the
     // status, but are not part of the pushed status: fetch them on each push. Only the stock field
     // is touched, so unsaved schedule edits survive. One request at a time.
@@ -238,31 +391,29 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
           stockInFlight = false;
         });
     };
-    // Pushed values are applied directly; without them, refetch.
+    // Pushed values are applied directly (and win over any poll still in flight); without them, refetch.
     const unsubscribe = api.subscribeToDeviceChanges((status) => {
-      if (status) setDevice((prev) => (prev ? { ...prev, ...status } : prev));
-      else refresh();
+      if (status) {
+        statusGen.current += 1;
+        setDevice((prev) => (prev ? { ...prev, ...status } : prev));
+      } else void refreshStatus();
       refreshStock();
     });
-    return () => {
-      clearInterval(timer);
-      unsubscribe();
-    };
-  }, [needsPairing]);
+    return unsubscribe;
+  }, [refreshStatus]);
 
-  // Keeps relative times ("5 menit lalu") fresh; every second while the pillbox clock runs fast
-  // (emulator at 10x / 60x), so "next dose" keeps up with it.
-  const clockSpeed = device?.clock?.speed ?? 1;
+  // Keeps relative times ("5 menit lalu") and the pillbox day fresh. Deliberately slow: the clock
+  // card in the PillBox tab ticks every second on its own, so the whole dashboard does not re-render.
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), clockSpeed > 1 ? 1_000 : 30_000);
+    const timer = setInterval(() => setNow(Date.now()), AppConfig.dashboardTickMs);
     return () => clearInterval(timer);
-  }, [clockSpeed]);
+  }, []);
 
-  // Android back: return to Beranda before leaving the app.
+  // Android back: Jadwal returns to PillBox, other tabs to Beranda, before leaving the app.
   useEffect(() => {
     if (tab === 'home') return;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      setTab('home');
+      setTab(tab === 'schedule' ? 'device' : 'home');
       return true;
     });
     return () => sub.remove();
@@ -272,7 +423,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const effectiveSimSlot =
     simSlotId && isSlotActive(savedSlots.find((s) => s.id === simSlotId)) ? simSlotId : (firstActiveSlot?.id ?? null);
   const draftDirty = isDraftDirty(draftSlots, savedSlots);
-  const deviceTone = device ? deviceLook(device, now).tone : dashboardError ? 'missed' : null;
+  // PEMANTAU sees the schedule read-only (the backend refuses their writes anyway).
+  const canEditSchedule = api.USE_MOCK || canEdit(devices.active?.myRole ?? null);
+  // While the server is unreachable the pillbox state is unknown, not "missed": the banner says so.
+  const deviceTone = health.unreachable ? null : device ? deviceLook(device, now).tone : dashboardError ? 'missed' : null;
+  const scheduleTzLabel = timezoneLabel(insights.clock?.timezone ?? AppConfig.fallbackTimezone);
   // Time of day as the pillbox sees it: doses are due and missed by this clock, not the phone's.
   const pillboxNowMs = pillboxNow(device, now);
 
@@ -280,15 +435,15 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     setTab(next);
     if (next === 'home') {
       setNow(Date.now());
-      refreshRecent();
     }
   };
 
   /** Reloads device status + schedules (retry, pull to refresh). `keepDraft` leaves unsaved edits alone. */
   const loadDashboard = async (keepDraft: boolean) => {
+    const generation = ++statusGen.current;
     try {
-      const [status, slots] = await Promise.all([api.getDeviceStatus(), api.getSchedules()]);
-      setDevice(status);
+      const [status, slots] = await trackHealth(Promise.all([api.getDeviceStatus(), api.getSchedules()]));
+      if (generation === statusGen.current) setDevice(status);
       setSavedSlots(slots);
       if (!keepDraft) setDraftSlots(slots);
       setDashboardError(false);
@@ -298,35 +453,24 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     }
   };
 
+  const finishConnect = useConnectedHandler(onCarry, showToast);
   const handleConnected = async (result: ConnectPillboxResult) => {
-    const linked = result.joined ? 'Bergabung ke pillbox (mode pemantau)' : 'Pillbox berhasil dihubungkan';
-    const message =
-      result.online === false
-        ? makeToast(`${linked}, tetapi pillbox sedang offline. Pastikan pillbox menyala dan terhubung internet.`, 'warning')
-        : makeToast(linked, 'success');
     setAddOpen(false);
-    api.resubscribeRealtime();
-    // The new pillbox becomes active, which remounts this dashboard: hand the toast over.
-    onCarry({ tab: 'home', toast: message });
-    try {
-      await devices.added(result.deviceId);
-    } catch {
-      setToast(makeToast('Pillbox terhubung. Tarik ke bawah untuk memuat ulang daftar.', 'warning'));
-    }
+    await finishConnect(result);
   };
 
   /** Switches the active pillbox; an unsaved schedule draft would be lost, so ask first. */
   const handleSelectPillbox = (pillbox: Pillbox) => {
     const go = () => {
-      onCarry({ tab, toast: makeToast(`Menampilkan ${pillbox.name}`, 'info') });
+      onCarry({ tab, toast: makeToast(D.showing(pillbox.name), 'info') });
       devices.select(pillbox.id);
     };
     if (!draftDirty) return go();
     setConfirmRequest({
-      title: 'Pindah pillbox?',
-      message: 'Perubahan jadwal yang belum disimpan akan hilang.',
-      confirmLabel: 'Pindah',
-      cancelLabel: 'Tetap di sini',
+      title: D.switchTitle,
+      message: D.switchMessage,
+      confirmLabel: D.switchConfirm,
+      cancelLabel: D.switchCancel,
       tone: 'warning',
       icon: 'swap-horizontal',
       onConfirm: go,
@@ -339,22 +483,16 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     const ok = await devices.rename(target.id, name);
     setRenameTarget(null);
     if (ok) {
-      showToast('Nama pillbox diperbarui', 'success');
+      showToast(D.renamed, 'success');
       if (target.id === devices.active?.id) setDevice((prev) => (prev ? { ...prev, deviceName: name } : prev));
-    } else showToast('Gagal mengubah nama. Nama sebelumnya dikembalikan.', 'error');
+    } else showToast(D.renameFailed, 'error');
   };
 
   const handleRemovePillbox = (pillbox: Pillbox) => {
-    const elderly = pillbox.elderlyName ? ` "${pillbox.elderlyName}"` : '';
     setConfirmRequest({
-      title: `Hapus "${pillbox.name}"?`,
-      message:
-        `Tindakan ini permanen dan tidak bisa dibatalkan:\n` +
-        `• Pillbox ${pillbox.code} dilepas dari profil lansia${elderly} untuk SEMUA pengasuh yang terhubung, bukan hanya Anda.\n` +
-        `• Semua jadwal pillbox ini di Kontrol Jadwal dihapus.\n` +
-        `• Riwayat notifikasi pillbox ini di akun Anda dihapus.\n` +
-        `Riwayat minum obat lansia tetap tersimpan. Untuk memakai pillbox ini lagi, pasangkan ulang dengan PIN baru.`,
-      confirmLabel: 'Hapus Permanen',
+      title: D.removeTitle(pillbox.name),
+      message: D.removeMessage(pillbox.code, pillbox.elderlyName),
+      confirmLabel: D.removeConfirm,
       tone: 'danger',
       icon: 'trash-outline',
       onConfirm: async () => {
@@ -363,10 +501,10 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
         if (wasActive) onCarry({ tab: 'device' });
         const result = await devices.remove(pillbox);
         const message = !result
-          ? makeToast(`Gagal menghapus "${pillbox.name}". Pillbox dikembalikan ke daftar.`, 'error')
+          ? makeToast(D.removeFailed(pillbox.name), 'error')
           : result.notificationsFailed !== 0
-            ? makeToast(`"${pillbox.name}" dihapus, tetapi sebagian riwayat notifikasinya gagal dihapus.`, 'warning')
-            : makeToast(`"${pillbox.name}" dihapus`, 'success');
+            ? makeToast(D.removedPartly(pillbox.name), 'warning')
+            : makeToast(D.removed(pillbox.name), 'success');
         if (wasActive && result) onCarry({ tab: 'device', toast: message });
         else setToast(message);
       },
@@ -375,31 +513,25 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
 
   const handleHidePillbox = (pillbox: Pillbox) => {
     setConfirmRequest({
-      title: `Sembunyikan "${pillbox.name}"?`,
-      message:
-        'Pillbox hanya disembunyikan di HP ini. Anda tetap terhubung sebagai ' +
-        (pillbox.myRole === 'ADMIN' ? 'admin' : 'pemantau') +
-        ' di server, dan hanya pemilik yang dapat melepas pillbox. Anda bisa menampilkannya lagi dari tab Perangkat.',
-      confirmLabel: 'Sembunyikan',
+      title: D.hideTitle(pillbox.name),
+      message: D.hideMessage(pillbox.myRole === 'ADMIN'),
+      confirmLabel: D.hideConfirm,
       tone: 'warning',
       icon: 'eye-off-outline',
       onConfirm: async () => {
-        if (pillbox.id === devices.active?.id) onCarry({ tab: 'device', toast: makeToast(`"${pillbox.name}" disembunyikan`, 'info') });
-        if (!(await devices.hide(pillbox.id))) showToast('Gagal menyembunyikan pillbox', 'error');
+        if (pillbox.id === devices.active?.id) onCarry({ tab: 'device', toast: makeToast(D.hidden(pillbox.name), 'info') });
+        if (!(await devices.hide(pillbox.id))) showToast(D.hideFailed, 'error');
       },
     });
   };
 
-  const findExisting = (code: string) => {
-    const found = devices.all.find((p) => p.code === code);
-    return found ? { id: found.id, name: found.name, hidden: devices.hidden.some((h) => h.id === found.id) } : null;
-  };
+  const { myDeviceIds, findExisting } = pairingLookups(devices);
 
   const handleRefresh = async () => {
     setRefreshing(true);
     setNow(Date.now());
     refreshAdherence();
-    refreshRecent();
+    insights.refreshAll();
     // An unsaved schedule draft is never thrown away by a refresh.
     await Promise.allSettled([feed.refresh(), loadDashboard(draftDirty), devices.refresh()]);
     setRefreshing(false);
@@ -416,7 +548,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     try {
       setDevice(await api.setDeviceConnection(!device.online));
     } catch {
-      showToast('Gagal mengubah status koneksi', 'error');
+      showToast(D.connectionToggleFailed, 'error');
     } finally {
       setConnectionBusy(false);
     }
@@ -429,7 +561,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       // The resulting notification arrives through the feed subscription.
       await api.simulateDoseEvent({ slotId: effectiveSimSlot, type, minutesLate });
     } catch {
-      showToast('Gagal mengirim kejadian simulasi', 'error');
+      showToast(D.simulateFailed, 'error');
     } finally {
       setSimBusy(null);
     }
@@ -438,109 +570,140 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   const handleSeed = async () => {
     setSeeding(true);
     try {
-      await api.seedMockHistory(45);
+      await api.seedMockHistory(api.MOCK_SEED_COUNT);
       await feed.refresh();
       refreshAdherence();
-      refreshRecent();
-      showToast('45 riwayat contoh ditambahkan', 'success');
+      insights.refreshDoses();
+      showToast(D.seeded(api.MOCK_SEED_COUNT), 'success');
     } catch {
-      showToast('Gagal menambah riwayat contoh', 'error');
+      showToast(D.seedFailed, 'error');
     } finally {
       setSeeding(false);
     }
   };
 
+  const handleMarkAllRead = () => {
+    feed.markAllRead();
+  };
+
   const markRead = (id: string) => {
     feed.markRead(id);
-    setRecent((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
   };
 
   const handleDelete = async (n: AppNotification) => {
-    if (await feed.remove(n.id)) refreshRecent();
-    else showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
+    if (!(await feed.remove(n.id))) showToast(D.deleteFailed, 'error');
   };
 
   const runConfirm = async () => {
-    if (!confirmRequest) return;
+    if (!confirmRequest || confirmRunning.current) return;
+    confirmRunning.current = true;
     setConfirmBusy(true);
     try {
       await confirmRequest.onConfirm();
+    } catch (err) {
+      // onConfirm handlers report their own failures; this catches the ones that throw anyway.
+      showToast(failMessage(D.actionFailed, err), 'error');
     } finally {
+      confirmRunning.current = false;
       setConfirmBusy(false);
       setConfirmRequest(null);
     }
   };
 
-  const handleSignOut = () => {
-    setConfirmRequest({
-      title: 'Keluar dari akun?',
-      message: 'Anda perlu masuk kembali untuk melihat pillbox. Notifikasi push ke HP ini akan berhenti.',
-      confirmLabel: 'Keluar',
-      tone: 'danger',
-      icon: 'log-out-outline',
-      onConfirm: signOut,
-    });
-  };
+  const handleSignOut = () => setConfirmRequest(signOutRequest(signOut));
 
   const handleClearAll = () => {
     setConfirmRequest({
-      title: 'Hapus semua notifikasi?',
-      message:
-        `Semua notifikasi ${devices.active?.name ?? 'pillbox ini'}, termasuk yang tidak tampil di filter ini, akan dihapus ` +
-        'permanen dan tidak bisa dikembalikan. Notifikasi pillbox lain dan milik pengasuh lain tidak ikut terhapus.',
-      confirmLabel: 'Hapus Semua',
+      title: D.clearAllTitle,
+      message: D.clearAllMessage(devices.active?.name ?? null),
+      confirmLabel: D.clearAllConfirm,
       tone: 'danger',
       icon: 'trash-outline',
       onConfirm: async () => {
-        if (await feed.clearAll()) {
-          refreshRecent();
-          showToast('Semua notifikasi dihapus', 'success');
-        } else {
-          showToast('Gagal menghapus. Notifikasi dikembalikan.', 'error');
-        }
+        if (await feed.clearAll()) showToast(D.clearedAll, 'success');
+        else showToast(D.deleteFailed, 'error');
       },
     });
   };
 
+  /** The elderly's own number; null hides every "call" action (nothing else is ever dialed). */
+  const elderPhone = insights.elderly?.contactPhone ?? null;
+  const callElder = async () => {
+    if (!elderPhone) return;
+    try {
+      await Linking.openURL(`tel:${elderPhone}`);
+    } catch {
+      showToast(D.callFailed, 'error');
+    }
+  };
+
   const handleCall = async (n: AppNotification) => {
     markRead(n.id);
+    await callElder();
+  };
+
+  /** Rings the pillbox (optionally at one compartment). Resolves false when the command failed. */
+  const ringAlarm = async (slotId: SlotId | null) => {
     try {
-      await Linking.openURL(`tel:${AppConfig.elderPhone}`);
-    } catch {
-      showToast('Tidak dapat membuka aplikasi telepon', 'error');
+      await api.triggerAlarm(slotId);
+      pillboxAlarm.started(AppConfig.alarmDurationSeconds);
+      showToast(D.alarmRung(device?.deviceName ?? devices.active?.name ?? Strings.connect.nicknameDefault), 'success');
+    } catch (err) {
+      showToast(failMessage(D.alarmFailed, err), 'error');
     }
   };
 
   const handleAlarm = async (n: AppNotification) => {
     markRead(n.id);
     setAlarmBusyId(n.id);
+    await ringAlarm(n.slotId);
+    setAlarmBusyId(null);
+  };
+
+  const handleRemind = async (slotId: SlotId) => {
+    setRemindBusy(true);
+    await ringAlarm(slotId);
+    setRemindBusy(false);
+  };
+
+  const handleCalibrate = async (pin: string) => {
+    setCalibrateBusy(true);
     try {
-      await api.triggerAlarm(n.slotId);
-      showToast(`Alarm dibunyikan di ${device?.deviceName ?? 'Pillbox'}`, 'success');
+      await insights.calibrate(pin);
+      setCalibrateOpen(false);
+      showToast(Strings.device.calibrated, 'success');
     } catch (err) {
-      // e.g. "Device is offline; the command was not sent" from the backend
-      showToast(failMessage('Gagal membunyikan alarm', err), 'error');
+      const wrongPin = err instanceof api.BackendError && err.code === 'DEVICE_PIN_INCORRECT';
+      if (!wrongPin) setCalibrateOpen(false);
+      showToast(wrongPin ? Strings.device.pinIncorrect : failMessage(Strings.device.calibrateFailed, err), 'error');
     } finally {
-      setAlarmBusyId(null);
+      setCalibrateBusy(false);
     }
+  };
+
+  const handleAutoSync = async (value: boolean) => {
+    if (!(await insights.setAutoSync(value))) showToast(Strings.device.autoSyncFailed, 'error');
+  };
+
+  const handleTogglePreference = async (key: Parameters<typeof insights.togglePreference>[0], value: boolean) => {
+    if (!(await insights.togglePreference(key, value))) showToast(Strings.settings.prefsFailed, 'error');
   };
 
   /** A late-dose action changed the dose: refresh what shows it. */
   const afterDoseAction = () => {
     void feed.refresh();
-    refreshRecent();
     refreshAdherence();
+    insights.refreshDoses();
   };
 
   const confirmTaken = async (n: AppNotification) => {
     setDoseActionBusy({ id: n.id, action: 'CONFIRM_TAKEN' });
     try {
       await api.confirmDoseTaken(n.id);
-      showToast('Dicatat: obat diminum terlambat', 'success');
+      showToast(D.confirmedTaken, 'success');
       afterDoseAction();
     } catch (err) {
-      // e.g. "Sudah lewat batas aman (pukul 10:00) ... Jangan diminum, tunggu jadwal berikutnya."
-      showToast(failMessage('Gagal mencatat', err), 'error');
+      showToast(failMessage(D.confirmTakenFailed, err), 'error');
     } finally {
       setDoseActionBusy(null);
     }
@@ -553,10 +716,9 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       return;
     }
     setConfirmRequest({
-      title: 'Obat sudah diminum?',
-      message:
-        'Dosis ini akan dicatat sebagai diminum terlambat dan peringatannya ditutup. Pastikan lansia benar-benar sudah meminumnya.',
-      confirmLabel: 'Ya, Sudah Diminum',
+      title: D.takenTitle,
+      message: D.takenMessage,
+      confirmLabel: D.takenConfirm,
       tone: 'success',
       icon: 'checkmark-done-outline',
       onConfirm: () => confirmTaken(n),
@@ -570,14 +732,12 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
     try {
       const { releaseUntil } = await api.releaseMissedDose(n.id, pin);
       setReleaseTarget(null);
-      const until = releaseUntil.slice(11, 16); // pillbox clock, already in WIB
-      showToast(`Bilik ${n.slotId ?? ''} dibuka sampai ${until}. Minta lansia mengambil obatnya.`, 'success');
+      const until = releaseUntil.slice(11, 16); // "HH:MM" of the pillbox's own local time (device timezone)
+      showToast(D.released(n.slotId ?? '', until), 'success');
     } catch (err) {
-      if (!(err instanceof api.BackendError) || err.code !== 'DEVICE_PIN_INCORRECT') setReleaseTarget(null);
-      showToast(
-        err instanceof api.BackendError && err.code === 'DEVICE_PIN_INCORRECT' ? 'PIN salah' : failMessage('Gagal membuka bilik', err),
-        'error',
-      );
+      const wrongPin = err instanceof api.BackendError && err.code === 'DEVICE_PIN_INCORRECT';
+      if (!wrongPin) setReleaseTarget(null);
+      showToast(wrongPin ? Strings.device.pinIncorrect : failMessage(D.releaseFailed, err), 'error');
     } finally {
       setDoseActionBusy(null);
     }
@@ -589,23 +749,34 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
 
   const handleDiscard = () => {
     setConfirmRequest({
-      title: 'Batalkan perubahan?',
-      message: 'Perubahan jadwal yang belum disimpan akan hilang. Jadwal kembali seperti yang tersimpan di Pillbox.',
-      confirmLabel: 'Batalkan Perubahan',
-      cancelLabel: 'Tidak',
+      title: D.discardTitle,
+      message: D.discardMessage,
+      confirmLabel: D.discardConfirm,
+      cancelLabel: D.discardCancel,
       tone: 'danger',
       icon: 'arrow-undo-outline',
       onConfirm: () => setDraftSlots(savedSlots),
     });
   };
 
+  const handleStopAlarm = async () => {
+    try {
+      await pillboxAlarm.stop();
+      showToast(Strings.alarm.stopped, 'success');
+    } catch (err) {
+      showToast(failMessage(Strings.alarm.stopFailed, err), 'error');
+    }
+  };
+  const alarmControl = { ringing: pillboxAlarm.ringing, stopping: pillboxAlarm.stopping, onStop: handleStopAlarm };
+
   const handleTestSlot = async (id: SlotId) => {
     setTesting(true);
     try {
       await api.triggerTestSlot(id);
-      showToast(`Tes pengingat dikirim ke slot ${id}`, 'success');
+      pillboxAlarm.started(AppConfig.testAlarmDurationSeconds);
+      showToast(D.testSent(id), 'success');
     } catch (err) {
-      showToast(failMessage('Gagal mengirim tes pengingat', err), 'error');
+      showToast(failMessage(D.testFailed, err), 'error');
     } finally {
       setTesting(false);
     }
@@ -613,8 +784,9 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
 
   const handleSave = async () => {
     // The button is disabled on conflicts; re-check in case state changed in between.
+    if (!canEditSchedule || saving) return;
     if (findAllConflicts(draftSlots).size > 0) {
-      showToast('Ada jam yang bentrok atau terlalu dekat. Perbaiki dulu sebelum menyimpan.', 'error');
+      showToast(D.saveConflicts, 'error');
       return;
     }
     setSaving(true);
@@ -622,14 +794,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       const saved = await api.saveSchedule(draftSlots);
       setSavedSlots(saved);
       setDraftSlots(saved);
-      if (device?.online) {
-        setDevice(await api.getDeviceStatus());
-        showToast('Jadwal berhasil disimpan ke Pillbox', 'success');
-      } else {
-        showToast('Jadwal disimpan, akan dikirim saat Pillbox terhubung kembali', 'warning');
-      }
+      // The sheet waits for the pillbox to report the new config_version as applied (or says it
+      // is waiting, e.g. while the pillbox is offline): "saved" is not "on the pillbox".
+      setSyncedSlots(saved);
     } catch (err) {
-      showToast(failMessage('Gagal menyimpan jadwal', err), 'error');
+      showToast(failMessage(D.saveFailed, err), 'error');
     } finally {
       setSaving(false);
     }
@@ -638,32 +807,32 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
   return (
     <View className="flex-1 bg-canvas">
       <StatusBar style="dark" />
-      <SafeAreaView style={{ flex: 1 }} edges={needsPairing ? ['top', 'left', 'right', 'bottom'] : ['top', 'left', 'right']}>
-        {needsPairing ? (
-          <ConnectPillboxScreen
-            onConnected={(r) => void handleConnected(r)}
-            findExisting={findExisting}
-            onUnhide={() => void devices.unhideAll()}
-            hiddenCount={devices.hidden.length}
-            onSignOut={handleSignOut}
-          />
-        ) : (
+      <SafeAreaView style={{ flex: 1 }} edges={['top', 'left', 'right']}>
           <>
-            <PillboxSwitcher pillboxes={devices.pillboxes ?? []} activeId={devices.active?.id ?? null} onSelect={handleSelectPillbox} />
+            <TopBar userName={user?.full_name ?? Strings.shell.caregiverFallback} online={!health.unreachable} />
+            {health.unreachable && <ServerBanner onRetry={() => void handleRefresh()} retrying={refreshing} />}
+            {tab === 'schedule' && <BackHeader title={Strings.tabs.backToDevice} onBack={() => openTab('device')} />}
             <View className="flex-1">
               {tab === 'home' && (
                 <HomeTab
                   now={now}
                   pillboxNow={pillboxNowMs}
+                  userName={user?.full_name ?? null}
+                  pillbox={devices.active}
                   device={device}
                   deviceLoadError={dashboardError}
                   onRetryDevice={handleRetryDashboard}
                   adherence={adherence}
-                  savedSlots={savedSlots}
-                  recent={recent}
+                  insights={insights}
+                  unreadCount={feed.unreadCount}
+                  remindBusy={remindBusy}
+                  alarm={alarmControl}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
                   onOpenTab={openTab}
+                  onAddElderly={api.USE_MOCK ? undefined : () => router.push('/elderly/new')}
+                  onCall={elderPhone ? () => void callElder() : undefined}
+                  onRemind={(slotId) => void handleRemind(slotId)}
                 />
               )}
               {tab === 'schedule' && (
@@ -676,7 +845,10 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   loadError={dashboardError}
                   onRetry={handleRetryDashboard}
                   now={pillboxNowMs}
+                  timezoneLabel={scheduleTzLabel}
+                  canEdit={canEditSchedule}
                   testing={testing}
+                  alarm={alarmControl}
                   onTest={handleTestSlot}
                   saving={saving}
                   onSave={handleSave}
@@ -688,13 +860,16 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   feed={feed}
                   canDelete={NOTIFICATION_DELETE_SUPPORTED}
                   now={now}
+                  heading={insights.elderly?.fullName ?? devices.active?.elderlyName ?? Strings.shell.elderlyFallback}
                   alarmBusyId={alarmBusyId}
+                  alarm={alarmControl}
                   actionBusy={doseActionBusy}
                   onAction={handleDoseAction}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
                   onMarkRead={markRead}
-                  onCall={handleCall}
+                  onMarkAllRead={handleMarkAllRead}
+                  onCall={elderPhone ? handleCall : undefined}
                   onAlarm={handleAlarm}
                   onDelete={handleDelete}
                   onClearAll={handleClearAll}
@@ -703,6 +878,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
               {tab === 'device' && (
                 <DeviceTab
                   device={device}
+                  pillboxes={devices.pillboxes ?? []}
+                  activeId={devices.active?.id ?? null}
+                  elderlyName={insights.elderly?.fullName ?? devices.active?.elderlyName ?? null}
+                  clock={insights.clock}
+                  canEditDevice={api.USE_MOCK || canEdit(devices.active?.myRole ?? null)}
                   connectionBusy={connectionBusy}
                   now={now}
                   loadError={dashboardError}
@@ -710,8 +890,11 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   onToggleConnection={handleToggleConnection}
                   refreshing={refreshing}
                   onRefresh={handleRefresh}
-                  userName={user?.full_name ?? null}
-                  onSignOut={handleSignOut}
+                  onSelectPillbox={handleSelectPillbox}
+                  onAdd={api.USE_MOCK ? undefined : () => setAddOpen(true)}
+                  onCalibrate={() => setCalibrateOpen(true)}
+                  onToggleAutoSync={(value) => void handleAutoSync(value)}
+                  onOpenSchedule={() => openTab('schedule')}
                   pillboxList={
                     api.USE_MOCK ? null : (
                       <PillboxListCard
@@ -741,6 +924,28 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
                   }}
                 />
               )}
+              {tab === 'settings' && (
+                <SettingsTab
+                  now={now}
+                  pillboxNow={pillboxNowMs}
+                  userName={user?.full_name ?? Strings.shell.caregiverFallback}
+                  email={user?.email ?? null}
+                  accountId={user?.id ?? null}
+                  pillbox={devices.active}
+                  elderly={insights.elderly}
+                  device={device}
+                  prefs={insights.prefs}
+                  prefsError={insights.prefsError}
+                  prefsBusy={insights.prefsBusy}
+                  onTogglePreference={(key, value) => void handleTogglePreference(key, value)}
+                  onRetryPrefs={insights.refreshPrefs}
+                  onCallElder={() => void callElder()}
+                  onOpenDevice={() => openTab('device')}
+                  onAddElderly={api.USE_MOCK ? undefined : () => router.push('/elderly/new')}
+                  onAddDevice={api.USE_MOCK ? undefined : () => setAddOpen(true)}
+                  onSignOut={handleSignOut}
+                />
+              )}
             </View>
             <TabBar
               active={tab}
@@ -752,14 +957,22 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
               }}
             />
           </>
-        )}
       </SafeAreaView>
 
       <PinPrompt
+        visible={calibrateOpen}
+        title={Strings.device.calibrateTitle}
+        message={Strings.device.calibrateMessage}
+        confirmLabel={Strings.device.calibrateConfirm}
+        busy={calibrateBusy}
+        onSubmit={(pin) => void handleCalibrate(pin)}
+        onCancel={() => setCalibrateOpen(false)}
+      />
+      <PinPrompt
         visible={releaseTarget !== null}
-        title="Buka bilik sekarang?"
-        message={`Bilik ${releaseTarget?.slotId ?? ''} akan terbuka sebentar agar obat yang terlewat bisa diminum terlambat. Masukkan PIN pillbox.`}
-        confirmLabel="Buka Bilik"
+        title={D.releaseTitle}
+        message={D.releaseMessage(releaseTarget?.slotId ?? '')}
+        confirmLabel={D.releaseConfirm}
         busy={doseActionBusy?.action === 'LATE_RELEASE'}
         onSubmit={(pin) => void handleRelease(pin)}
         onCancel={() => setReleaseTarget(null)}
@@ -769,6 +982,7 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
           <ConnectPillboxScreen
             onConnected={(r) => void handleConnected(r)}
             findExisting={findExisting}
+            myDeviceIds={myDeviceIds}
             onUnhide={() => {
               void devices.unhideAll();
               setAddOpen(false);
@@ -780,6 +994,18 @@ function PillboxDashboard({ initialTab, onCarry }: { initialTab: TabKey; onCarry
       {renameTarget && (
         <RenamePillboxDialog pillbox={renameTarget} onSave={handleRenamePillbox} onCancel={() => setRenameTarget(null)} />
       )}
+      <ScheduleSyncedSheet
+        slots={syncedSlots}
+        device={device}
+        deviceName={device?.deviceName ?? devices.active?.name ?? Strings.connect.nicknameDefault}
+        timezoneLabel={scheduleTzLabel}
+        elderlyName={insights.elderly?.fullName ?? devices.active?.elderlyName ?? null}
+        onHome={() => {
+          setSyncedSlots(null);
+          openTab('home');
+        }}
+        onClose={() => setSyncedSlots(null)}
+      />
       <ConfirmDialog
         request={confirmRequest}
         busy={confirmBusy}

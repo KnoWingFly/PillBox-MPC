@@ -3,11 +3,16 @@ classification, and offline-flush ordering."""
 
 import uuid
 from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import asyncpg
 import httpx
+from sqlalchemy import event as sa_event
 
+from app.core.config import get_settings
+from app.db.session import get_engine
+from app.main import app
 from tests.helpers import API, create_caregiver, create_schedule, event, paired_device, send_telemetry
 
 # 2026-09-28 (Monday), Asia/Jakarta (+07:00). Schedule: 07:00-07:30, tolerance 30
@@ -224,3 +229,80 @@ async def test_replayed_dose_after_the_clock_was_set_back_is_notified_again(
     assert doses[0]["actual_open_time"] == due + timedelta(seconds=20)
     taken = await db.fetchval("SELECT count(*) FROM notifications WHERE type IN ('DOSE_TAKEN', 'DOSE_LATE')")
     assert taken == 2  # one per take
+
+
+async def test_dose_event_far_in_the_past_is_rejected(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """An RTC reset to 2000 must not create a dose row for 2000-01-01."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device)
+    strict = get_settings().model_copy(update={"telemetry_max_past_skew_minutes": 7 * 24 * 60})
+    app.dependency_overrides[get_settings] = lambda: strict
+    try:
+        res = await send_telemetry(client, device, [event(str(uuid.uuid4()), "COMPARTMENT_OPENED", "2000-01-01T07:05:00+07:00")])
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert res.status_code == 200
+    result = res.json()["results"][0]
+    assert result["status"] == "rejected" and "past" in result["reason"]
+    assert await db.fetchval("SELECT count(*) FROM telemetry_logs") == 0
+
+
+async def test_one_invalid_event_does_not_reject_the_batch(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """A field error is answered per event, so the device's outbox is never blocked by it."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device)
+    good = event(str(uuid.uuid4()), "COMPARTMENT_OPENED", f"{DAY}T07:10:00+07:00")
+    bad = event(str(uuid.uuid4()), "COMPARTMENT_CLOSED", f"{DAY}T07:11:00+07:00", chime_count=-1)
+
+    res = await send_telemetry(client, device, [good, bad, "not an object"], is_offline_flush=True)
+
+    assert res.status_code == 200, res.text
+    results = res.json()["results"]
+    assert [r["status"] for r in results] == ["accepted", "rejected", "rejected"]
+    assert results[1]["event_id"] == bad["event_id"] and "chime_count" in results[1]["reason"]
+    assert "-1" not in results[1]["reason"]  # submitted values are not echoed
+    assert results[2]["event_id"] == ""
+    assert res.json()["accepted"] == 1 and len(res.json()["rejected"]) == 2
+    assert [r["status"] for r in await _dose_rows(db, device.id)] == ["TAKEN"]
+
+
+async def test_malformed_batch_envelope_is_still_422(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    res = await client.post(
+        f"{API}/devices/{device.code}/telemetry", json={"events": "not a list"}, headers=device.device_headers
+    )
+    assert res.status_code == 422 and res.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+async def test_batch_cost_does_not_grow_per_event(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    """Claims, re-send lookups, schedules and recipients are loaded once per batch, not per event."""
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    await create_schedule(client, owner, device)
+
+    def batch(n: int) -> list[dict[str, Any]]:
+        return [event(str(uuid.uuid4()), "REFILL_MAINTENANCE", f"{DAY}T09:{i % 60:02d}:00+07:00", slot=None) for i in range(n)]
+
+    async def statements(events: list[dict[str, Any]]) -> int:
+        executed: list[str] = []
+
+        def count(*_: Any) -> None:
+            executed.append("x")
+
+        sa_event.listen(get_engine().sync_engine, "before_cursor_execute", count)
+        try:
+            res = await send_telemetry(client, device, events)
+        finally:
+            sa_event.remove(get_engine().sync_engine, "before_cursor_execute", count)
+        assert res.status_code == 200, res.text
+        return len(executed)
+
+    small, large = await statements(batch(5)), await statements(batch(200))
+    resend = batch(200)
+    await send_telemetry(client, device, resend)
+    assert await statements(resend) <= small + 1  # all duplicates: one lookup for their outcomes
+    assert large == small

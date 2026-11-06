@@ -8,7 +8,8 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 
 export function useTheme() {
   const scheme = useColorScheme();
-  const theme = scheme === 'unspecified' ? 'light' : scheme;
+  // React Native 0.88 reports an unknown scheme as null (it used to be 'unspecified').
+  const theme = scheme ?? 'light';
 
   return Colors[theme];
 }

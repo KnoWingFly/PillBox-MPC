@@ -7,12 +7,10 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import { AppConfig } from '@/config';
 import { useAuth } from '@/hooks/use-auth';
+import { usePolling } from '@/hooks/use-polling';
 import * as api from '@root/lib/api';
 import * as devices from '@root/lib/devices';
 import type { Pillbox } from '@root/lib/devices';
-
-/** Background refresh of the list (online state, battery) while the dashboard is open. */
-const LIST_REFRESH_MS = 30_000;
 
 type DevicesValue = {
   /** Visible pillboxes (hidden ones excluded); null until the first load finishes. */
@@ -88,7 +86,7 @@ export function DevicesProvider({ children }: PropsWithChildren) {
    */
   const applyActive = useCallback(
     (next: Pillbox | null) => {
-      api.setActivePillbox(next ? { id: next.id, elderlyId: next.elderlyId } : null);
+      api.setActivePillbox(next ? { id: next.id, elderlyId: next.elderlyId, name: next.name } : null);
       stateRef.current = { ...stateRef.current, activeId: next?.id ?? null };
       setActiveId(next?.id ?? null);
       void devices.saveActivePillboxId(userId, next?.id ?? null);
@@ -102,7 +100,7 @@ export function DevicesProvider({ children }: PropsWithChildren) {
       const current = visible.find((p) => p.id === preferred);
       // Same pillbox still active: only refresh lib/api.ts (its elderly may have changed).
       if (current && current.id === stateRef.current.activeId) {
-        api.setActivePillbox({ id: current.id, elderlyId: current.elderlyId });
+        api.setActivePillbox({ id: current.id, elderlyId: current.elderlyId, name: current.name });
       } else applyActive(pickActive(visible, preferred));
       setAll(list);
       setHiddenIds(hidden);
@@ -145,11 +143,8 @@ export function DevicesProvider({ children }: PropsWithChildren) {
     };
   }, [userId, applyList]);
 
-  useEffect(() => {
-    if (api.USE_MOCK) return;
-    const timer = setInterval(() => void refresh(), LIST_REFRESH_MS);
-    return () => clearInterval(timer);
-  }, [refresh]);
+  // Background refresh of online state and battery; paused while the app is in the background.
+  usePolling(refresh, api.USE_MOCK ? null : AppConfig.deviceListRefreshMs);
 
   const select = useCallback(
     (id: string) => {

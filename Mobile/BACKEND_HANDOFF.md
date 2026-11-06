@@ -8,7 +8,14 @@ current workaround lives so it can be removed once the endpoint exists. Code wor
 
 Error bodies keep the existing shape `{"error": {"code", "message", "details"?}}`.
 
-## 1. Rate-limit pairing-code lookups (security)
+## 1. Rate-limit pairing-code lookups (security) — DONE (3 Nov 2026)
+
+Implemented per user (not per IP: behind a proxy the client IP is not reliable):
+`PAIRING_SCAN_MAX_ATTEMPTS` lookups per `PAIRING_SCAN_WINDOW_SECONDS` (default 30 per 5 min),
+shared by `/pairing/scan` and `POST /devices`, answered `429 TOO_MANY_ATTEMPTS` + `Retry-After`.
+Counters and the PIN limiter now live in Postgres (`attempt_counters`, migration 0007); a device
+PIN is limited per device across all users. Original request:
+
 
 `POST /api/v1/devices/pairing/scan` and `POST /api/v1/devices` have no attempt limit; only PIN
 checks do (`services/pin_attempts.py`). A device code is 8 hex characters (2^32 values) and
@@ -20,7 +27,10 @@ checks do (`services/pin_attempts.py`). A device code is 8 hex characters (2^32 
 - Note: the PIN limiter is in process memory, so it resets on restart and is per worker. A shared
   store (database or Redis) makes both limits real.
 
-## 2. Stop leaking the elderly name from `/pairing/scan` (privacy)
+## 2. Stop leaking the elderly name from `/pairing/scan` (privacy) — DONE (3 Nov 2026)
+
+The name is returned only to a caller with a role on that elderly profile. Original request:
+
 
 `elderly_name_if_owned` is returned to any signed-in user who knows a code
 (`services/device_management.py` `scan`). Contract stays the same, value changes:
@@ -32,12 +42,12 @@ checks do (`services/pin_attempts.py`). A device code is 8 hex characters (2^32 
 Return the name only when the caller already has a role on that elderly profile. The app shows
 the name when present and works without it.
 
-## 3. Delete the caller's notifications for one pillbox
+## 3. Delete the caller's notifications for one pillbox — DONE (3 Nov 2026)
 
-Today the app pages through `GET /notifications?elderly_id=` and calls
-`DELETE /notifications/{id}` once per row (`Mobile/lib/devices.ts` `deleteMyNotificationsWhere`).
-Used by "Hapus pillbox" and by "Hapus semua" in the Notifikasi tab, which must not clear other
-pillboxes. Requested:
+Implemented as specified below (`Backend/app/api/routes/notifications.py` `delete_all`) and used by
+the app (`lib/api.ts` `deleteBackendNotificationsForDevice`, for "Hapus pillbox" and "Hapus semua").
+The app used to page through `GET /notifications?elderly_id=` and call `DELETE /notifications/{id}`
+once per row. Still to do: add the `device_id` parameter to the API list. Contract:
 
 ```
 DELETE /api/v1/notifications?device_id={uuid}[&up_to_created_at={ISO8601}&up_to_id={uuid}]
@@ -48,7 +58,14 @@ DELETE /api/v1/notifications?device_id={uuid}[&up_to_created_at={ISO8601}&up_to_
 - `up_to_*` optional, same meaning as the existing bulk delete (keeps rows newer than the boundary).
 - Unknown or foreign `device_id`: `200 {"deleted": 0}` (do not reveal whether it exists).
 
-## 4. Filter the feed by pillbox
+## 4. Filter the feed by pillbox — DONE (3 Nov 2026)
+
+`GET /api/v1/notifications?device_id=` is implemented as requested (`notification_feed.list_feed`);
+`unread_count` follows `device_id`/`elderly_id` (not `tab`). `GET /devices` and
+`GET /elderly/{id}/caregivers` are paginated too (`page`, `limit`, `total`; the caregivers list
+changed from a bare array to a page object). Still to do: add both to the API list. Original
+request:
+
 
 The feed is filtered on the phone (`Mobile/lib/notifications.ts`, `inActiveScope` in
 `Mobile/lib/api.ts`), and the unread badge counts every pillbox because `unread_count` is per

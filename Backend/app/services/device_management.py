@@ -19,7 +19,7 @@ from app.core.config import Settings
 from app.core.errors import AppError, conflict, not_found, unprocessable
 from app.core.security import hash_pin, verify_pin
 from app.models import Device, DeviceEvent, DeviceStock, Elderly, Schedule, TelemetryLog, User, UserElderlyRole
-from app.models.enums import ALL_ROLES, EDITOR_ROLES, ChimeVolume, Connectivity, DoseStatus, Role
+from app.models.enums import ALL_ROLES, EDITOR_ROLES, AttemptScope, ChimeVolume, Connectivity, DoseStatus, Role
 from app.schemas.devices import (
     ChamberDoor,
     ClockOut,
@@ -37,8 +37,9 @@ from app.schemas.devices import (
     PairingScanOut,
     SlotLayoutOut,
 )
-from app.services import stock_cache
+from app.services import pin_attempts, stock_cache
 from app.services.access import get_device_for_user, require_role
+from app.services.app_hub import queue_roles_changed
 from app.services.connection_manager import (
     CommandAck,
     CommandError,
@@ -49,11 +50,13 @@ from app.services.connection_manager import (
     connection_manager,
 )
 from app.services.device_clock import extrapolated
-from app.services.pin_attempts import pin_limiter
 from app.services.slots import SLOT_NUMBERS, all_slots
 from app.services.timeutil import as_aware, is_valid_timezone, zone
 
 logger = logging.getLogger(__name__)
+
+# `reason` sent with alarm commands started from the app (docs/DEVICE_CONTRACT.md §3).
+ALARM_REASON_CAREGIVER = "caregiver_request"
 
 _PIN = re.compile(r"^\d{4}$")
 
@@ -127,13 +130,27 @@ async def notify_config_changed(device_id: UUID, config_version: int) -> bool:
     )
 
 
-async def _check_pin(user_id: UUID, device: Device, pin: str, settings: Settings, error_code: str) -> None:
-    key = f"{user_id}:{device.id}"
-    pin_limiter.check(key, settings.pin_max_attempts, settings.pin_lockout_seconds)
+async def _check_pin(
+    user_id: UUID,
+    device: Device,
+    pin: str,
+    settings: Settings,
+    error_code: str,
+    scope: AttemptScope = AttemptScope.DEVICE_PIN,
+) -> None:
+    """Counted per device across all users (services/pin_attempts.py), before scrypt runs, so
+    parallel guesses cannot get past the limit. `join` (callers who are not caregivers yet) uses
+    its own counter, DEVICE_PIN_JOIN: strangers guessing cannot lock the caregivers out of their
+    own PIN actions (change PIN, calibrate, late release)."""
+    check_pin_format(pin)
+    key = str(device.id)
+    await pin_attempts.register_attempt(
+        scope, key, settings.pin_max_attempts, settings.pin_lockout_seconds,
+        "Too many incorrect PIN attempts, try again later",
+    )
     if not await asyncio.to_thread(verify_pin, pin, device.device_pin_hash):
-        pin_limiter.record_failure(key)
         raise AppError(401, error_code, "Device PIN is incorrect")
-    pin_limiter.reset(key)
+    await pin_attempts.reset(scope, key)
 
 
 def command_error_to_app_error(exc: CommandError, device: Device) -> AppError:
@@ -198,16 +215,39 @@ async def unpair(session: AsyncSession, device: Device, now: datetime) -> None:
 
 # --- pairing ---------------------------------------------------------------------
 
-async def scan(session: AsyncSession, raw_payload: str) -> PairingScanOut:
+async def _count_lookup(user: User, settings: Settings) -> None:
+    """Device-code lookups are rate-limited per user: the answers reveal which codes exist
+    (Mobile/BACKEND_HANDOFF.md item 1). Shared by POST /pairing/scan and POST /devices."""
+    await pin_attempts.register_attempt(
+        AttemptScope.PAIRING_SCAN, str(user.id), settings.pairing_scan_max_attempts,
+        settings.pairing_scan_window_seconds, "Too many device code lookups, try again later",
+    )
+
+
+async def scan(session: AsyncSession, user: User, raw_payload: str, settings: Settings) -> PairingScanOut:
+    await session.commit()  # the user lookup's connection goes back before counting takes one
+    await _count_lookup(user, settings)
     code = parse_qr_payload(raw_payload)
     device = (await session.execute(select(Device).where(Device.device_code == code))).scalar_one_or_none()
     if device is None:
         raise not_found("QR_CODE_NOT_RECOGNIZED", "QR code is not a known PillCare device")
     elderly_name = None
     if device.elderly_id is not None:
-        elderly = await session.get(Elderly, device.elderly_id)
-        if elderly is not None and elderly.deleted_at is None:
-            elderly_name = elderly.nickname or elderly.full_name
+        # Only a caregiver of that elderly sees the name; anyone else holding the QR code (or
+        # guessing codes) learns only that the device is registered (BACKEND_HANDOFF §2).
+        row = (
+            await session.execute(
+                select(Elderly)
+                .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
+                .where(
+                    Elderly.id == device.elderly_id,
+                    Elderly.deleted_at.is_(None),
+                    UserElderlyRole.user_id == user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            elderly_name = row.nickname or row.full_name
     return PairingScanOut(
         device_id=device.id, is_registered=device.elderly_id is not None, elderly_name_if_owned=elderly_name
     )
@@ -218,8 +258,14 @@ async def pair(
 ) -> PairDeviceOut:
     check_pin_format(body.device_pin)
     code = parse_qr_payload(body.device_qr_payload)
+    # scrypt takes tens of ms: hash before taking the row lock, with no transaction (and so no
+    # pooled connection) held. The caller's user lookup opened one; nothing was written yet.
+    # Committed before counting too, which uses a connection of its own.
+    await session.commit()
+    await _count_lookup(user, settings)  # an unknown code answers 404: same enumeration guard as scan
+    pin_hash = await asyncio.to_thread(hash_pin, body.device_pin)
     device = (
-        await session.execute(select(Device).where(Device.device_code == code).with_for_update())
+        await session.execute(select(Device).where(Device.device_code == code).with_for_update(key_share=True))
     ).scalar_one_or_none()
     if device is None:
         raise not_found("QR_CODE_NOT_RECOGNIZED", "QR code is not a known PillCare device")
@@ -234,7 +280,7 @@ async def pair(
     device.elderly_id = body.elderly_id
     device.device_nickname = body.device_nickname
     device.timezone = timezone
-    device.device_pin_hash = await asyncio.to_thread(hash_pin, body.device_pin)
+    device.device_pin_hash = pin_hash
     device.pin_updated_at = now
     device.paired_at = now
     device.is_refill_mode = False
@@ -265,7 +311,8 @@ async def join(
     device = await session.get(Device, device_id)
     if device is None or device.elderly_id is None:
         raise not_found(message="Device not found")
-    await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT")
+    await session.commit()  # read only so far: hold no pooled connection during the slow PIN check
+    await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT", AttemptScope.DEVICE_PIN_JOIN)
     elderly_id = device.elderly_id
     existing = (
         await session.execute(
@@ -280,6 +327,7 @@ async def join(
         )
     role = UserElderlyRole(user_id=user.id, elderly_id=elderly_id, role=Role.PEMANTAU.value, created_at=now)
     session.add(role)
+    queue_roles_changed(session, user.id)
     await session.commit()
     logger.info("caregiver_joined_device", extra={"device_id": str(device.id), "user_id": str(user.id)})
     return JoinDeviceOut(device_id=device.id, elderly_id=elderly_id, my_role=Role.PEMANTAU, joined_at=now)
@@ -288,10 +336,18 @@ async def join(
 async def change_pin(
     session: AsyncSession, user: User, device_id: UUID, current: str, new: str, settings: Settings, now: datetime
 ) -> datetime:
-    device, _ = await get_device_for_user(session, user.id, device_id, {Role.OWNER}, for_update=True)
+    device, _ = await get_device_for_user(session, user.id, device_id, {Role.OWNER})
     check_pin_format(new)
+    checked_hash = device.device_pin_hash
+    # Both scrypt calls run with no transaction or row lock held; the row is locked only to write.
+    await session.commit()
     await _check_pin(user.id, device, current, settings, "CURRENT_PIN_INCORRECT")
-    device.device_pin_hash = await asyncio.to_thread(hash_pin, new)
+    new_hash = await asyncio.to_thread(hash_pin, new)
+    await session.refresh(device, with_for_update={"key_share": True})
+    if device.device_pin_hash != checked_hash:
+        # The PIN changed meanwhile (another request): check against the PIN now in force.
+        await _check_pin(user.id, device, current, settings, "CURRENT_PIN_INCORRECT")
+    device.device_pin_hash = new_hash
     device.pin_updated_at = now
     await session.commit()
     return now
@@ -300,18 +356,22 @@ async def change_pin(
 # --- reads --------------------------------------------------------------------------
 
 async def list_devices(
-    session: AsyncSession, user: User, elderly_id: UUID | None, settings: Settings
-) -> list[DeviceListItem]:
+    session: AsyncSession, user: User, elderly_id: UUID | None, settings: Settings, offset: int, limit: int
+) -> tuple[list[DeviceListItem], int]:
+    """One page and the total, in one query (the total rides along as a window count)."""
     stmt = (
-        select(Device, Elderly)
+        select(Device, Elderly, func.count().over().label("total"))
         .join(Elderly, Elderly.id == Device.elderly_id)
         .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
         .where(UserElderlyRole.user_id == user.id, Elderly.deleted_at.is_(None))
-        .order_by(Elderly.full_name, Device.device_nickname)
+        .order_by(Elderly.full_name, Device.device_nickname, Device.id)
+        .offset(offset)
+        .limit(limit)
     )
     if elderly_id is not None:
         stmt = stmt.where(Device.elderly_id == elderly_id)
     rows = (await session.execute(stmt)).all()
+    total = rows[0].total if rows else await _count_devices(session, user, elderly_id, offset)
     return [
         DeviceListItem(
             id=d.id,
@@ -324,8 +384,24 @@ async def list_devices(
             estimated_battery_days_remaining=battery_days(d, settings),
             last_seen_at=d.last_heartbeat,
         )
-        for d, e in rows
-    ]
+        for d, e, _ in rows
+    ], total
+
+
+async def _count_devices(session: AsyncSession, user: User, elderly_id: UUID | None, offset: int) -> int:
+    """Total for an empty page: 0 on the first page, else a count (a page past the end)."""
+    if offset == 0:
+        return 0
+    stmt = (
+        select(func.count())
+        .select_from(Device)
+        .join(Elderly, Elderly.id == Device.elderly_id)
+        .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
+        .where(UserElderlyRole.user_id == user.id, Elderly.deleted_at.is_(None))
+    )
+    if elderly_id is not None:
+        stmt = stmt.where(Device.elderly_id == elderly_id)
+    return int(await session.scalar(stmt) or 0)
 
 
 async def active_slots(session: AsyncSession, device_id: UUID) -> set[int]:
@@ -340,7 +416,8 @@ async def active_slots(session: AsyncSession, device_id: UUID) -> set[int]:
 async def detail(session: AsyncSession, user: User, device_id: UUID) -> DeviceDetail:
     device, role = await get_device_for_user(session, user.id, device_id, ALL_ROLES)
     active = await active_slots(session, device.id)
-    assert device.elderly_id is not None
+    if device.elderly_id is None:  # get_device_for_user only returns paired devices
+        raise not_found(message="Device not found")
     return DeviceDetail(
         id=device.id,
         device_code=device.device_code,
@@ -386,10 +463,10 @@ async def update_settings(
     if config_changed:
         await bump_config(session, device)
     await session.commit()
-    await session.refresh(device)
     if config_changed:
         await notify_config_changed(device.id, device.config_version)
-    assert device.elderly_id is not None
+    if device.elderly_id is None:  # get_device_for_user only returns paired devices
+        raise not_found(message="Device not found")
     return DeviceUpdateOut(
         id=device.id,
         device_nickname=device.device_nickname,
@@ -407,6 +484,8 @@ async def remove(session: AsyncSession, user: User, device_id: UUID, now: dateti
     await unpair(session, device, now)
     await session.commit()
     logger.info("device_unpaired", extra={"device_id": str(device.id)})
+    # A WebSocket device drops its schedules now instead of at its next heartbeat.
+    await notify_config_changed(device.id, device.config_version)
 
 
 async def status(session: AsyncSession, user: User, device_id: UUID, settings: Settings) -> DeviceStatusOut:
@@ -463,8 +542,8 @@ async def calibrate(
     session: AsyncSession, user: User, device_id: UUID, pin: str, settings: Settings, now: datetime
 ) -> tuple[Device, CommandAck]:
     device, _ = await get_device_for_user(session, user.id, device_id, EDITOR_ROLES)
+    await session.commit()  # end the read transaction before the PIN check and the device wait
     await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT")
-    await session.commit()  # end the read transaction before waiting on the device
     ack = await send_command_or_raise(
         device,
         DeviceCommand.TIME_SYNC,
@@ -478,7 +557,7 @@ async def calibrate(
         except ValueError:
             device_time = None
         if device_time is not None:
-            await session.refresh(device, with_for_update=True)
+            await session.refresh(device, with_for_update={"key_share": True})
             device.rtc_time = device_time
             device.rtc_reported_at = ack.acked_at
             device.rtc_speed = 1.0  # time_sync also puts the emulator's lab clock back to 1x
@@ -489,21 +568,36 @@ async def calibrate(
 async def trigger_alarm(
     session: AsyncSession, user: User, device_id: UUID, slot_number: int | None, duration_seconds: int, settings: Settings
 ) -> CommandResultOut:
+    payload = {"slot_number": slot_number, "duration_seconds": duration_seconds, "reason": ALARM_REASON_CAREGIVER}
+    return await _alarm_command(session, user, device_id, DeviceCommand.TRIGGER_ALARM, payload, settings)
+
+
+async def stop_alarm(session: AsyncSession, user: User, device_id: UUID, settings: Settings) -> CommandResultOut:
+    """Silences an alarm a caregiver started (trigger_alarm). A dose reminder keeps ringing:
+    the device ignores stop_alarm for it (docs/DEVICE_CONTRACT.md §3)."""
+    payload = {"reason": ALARM_REASON_CAREGIVER}
+    return await _alarm_command(session, user, device_id, DeviceCommand.STOP_ALARM, payload, settings)
+
+
+async def _alarm_command(
+    session: AsyncSession,
+    user: User,
+    device_id: UUID,
+    command: DeviceCommand,
+    payload: dict[str, Any],
+    settings: Settings,
+) -> CommandResultOut:
+    """OWNER/ADMIN; succeeds only after the device acks (errors: command_error_to_app_error)."""
     started = timing.now_ms()
-    timing.log_timing("app_to_iot", "backend_received", command=DeviceCommand.TRIGGER_ALARM.value)
+    timing.log_timing("app_to_iot", "backend_received", command=command.value)
     device, _ = await get_device_for_user(session, user.id, device_id, EDITOR_ROLES)
     await session.commit()  # do not hold a transaction while waiting for the ack
     timing.log_timing("app_to_iot", "access_checked", db_ms=timing.since_ms(started))
-    ack = await send_command_or_raise(
-        device,
-        DeviceCommand.TRIGGER_ALARM,
-        {"slot_number": slot_number, "duration_seconds": duration_seconds, "reason": "caregiver_request"},
-        settings,
-    )
-    logger.info("alarm_triggered", extra={"device_id": str(device.id), "user_id": str(user.id)})
+    ack = await send_command_or_raise(device, command, payload, settings)
+    logger.info("alarm_command", extra={"device_id": str(device.id), "user_id": str(user.id), "command": command.value})
     return CommandResultOut(
         device_id=device.id,
-        command=DeviceCommand.TRIGGER_ALARM.value,
+        command=command.value,
         command_id=ack.command_id,
         acknowledged=True,
         acked_at=ack.acked_at,

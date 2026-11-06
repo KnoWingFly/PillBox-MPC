@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -15,7 +16,9 @@ from app.core.errors import AppError, unauthorized
 from app.core.security import TokenConfigError, verify_app_token, verify_supabase_token
 from app.db.session import get_db
 from app.models import AuthIdentity, Device, User
+from app.schemas.common import PG_INT_MAX
 from app.services.device_protocol import authenticate_device
+from app.services.error_messages import request_language_var
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,10 @@ async def get_current_user(
 ) -> User:
     if credentials is None:
         raise unauthorized()
-    return await user_from_token(credentials.credentials, settings, db)
+    user = await user_from_token(credentials.credentials, settings, db)
+    # Errors the app shows as they are come in the caller's language (services/error_messages.py).
+    request_language_var.set(user.interface_language)
+    return user
 
 
 async def user_from_token(token: str, settings: Settings, db: AsyncSession) -> User:
@@ -62,7 +68,11 @@ async def user_from_token(token: str, settings: Settings, db: AsyncSession) -> U
     verified_ms = timing.since_ms(started)
 
     if settings.auth_mode == "app_jwt":
-        user = await db.get(User, subject)
+        user = _cached_user(subject, settings)
+        if user is None:
+            user = await db.get(User, subject)
+            if user is not None:
+                _remember_user(user, settings)
     else:
         user = (
             await db.execute(
@@ -81,6 +91,27 @@ async def user_from_token(token: str, settings: Settings, db: AsyncSession) -> U
         verify_ms=verified_ms, user_lookup_ms=round(timing.since_ms(started) - verified_ms, 1),
     )
     return user
+
+
+# user id -> (column values, monotonic time loaded). Process memory, like the other caches.
+_user_cache: dict[UUID, tuple[dict[str, Any], float]] = {}
+_USER_COLUMNS = [attr.key for attr in User.__mapper__.column_attrs]
+
+
+def _cached_user(user_id: UUID, settings: Settings) -> User | None:
+    """A fresh, session-free User built from the cached columns (never a shared instance)."""
+    entry = _user_cache.get(user_id)
+    if entry is None or time.monotonic() - entry[1] >= settings.auth_user_cache_seconds:
+        return None
+    return User(**entry[0])
+
+
+def _remember_user(user: User, settings: Settings) -> None:
+    if settings.auth_user_cache_seconds <= 0:
+        return
+    if len(_user_cache) >= settings.auth_user_cache_max_entries:
+        _user_cache.clear()  # simple bound; the next requests reload what they need
+    _user_cache[user.id] = ({key: getattr(user, key) for key in _USER_COLUMNS}, time.monotonic())
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
@@ -104,7 +135,8 @@ class Pagination:
     def __init__(
         self,
         settings: SettingsDep,
-        page: Annotated[int, Query(ge=1)] = 1,
+        # Bounded so (page - 1) * limit always fits Postgres' bigint OFFSET (else a 500).
+        page: Annotated[int, Query(ge=1, le=PG_INT_MAX)] = 1,
         limit: Annotated[int | None, Query(ge=1)] = None,
     ) -> None:
         self.page = page

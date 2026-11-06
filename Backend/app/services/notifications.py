@@ -9,15 +9,17 @@ Push delivery (Expo/FCM) is NOT implemented: see dispatch_push().
 """
 
 import logging
+from collections import Counter
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, String, case, cast, event, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session, SessionTransaction
 
 from app.core import timing
 from app.services.app_hub import queue_notifications
@@ -26,14 +28,15 @@ from app.models.enums import NotificationType, Severity
 
 logger = logging.getLogger(__name__)
 
+# users.interface_language default (Prisma schema) and the fallback for unknown languages.
+DEFAULT_LANGUAGE = "ID"
+
 
 @dataclass(frozen=True)
 class Preferences:
     """Effective preferences when a caregiver never saved preferences.
-    Mirrors the column defaults in migrations/0001, except notify_on_taken:
-    the app has no preferences screen yet, so a FALSE default meant on-time
-    doses were never reported at all (PUT /notification-preferences still
-    turns it off)."""
+    Mirrors the column defaults (migrations 0001 and 0009: notify_on_taken defaults to TRUE,
+    PUT /notification-preferences still turns it off)."""
 
     push_enabled: bool = True
     notify_on_missed: bool = True
@@ -86,8 +89,45 @@ def wants(prefs: Preferences, ntype: NotificationType) -> bool:
 
 
 async def load_recipients(session: AsyncSession, elderly_id: UUID) -> list[Recipient]:
+    return (await load_recipients_many(session, [elderly_id])).get(elderly_id, [])
+
+
+_RECIPIENTS_CACHE_KEY = "notifications_recipients_cache"  # {elderly_id: [Recipient, ...]}
+
+
+def cache_recipients(session: AsyncSession) -> None:
+    """Reuse loaded recipients until this transaction ends (a telemetry batch notifies the same
+    caregivers once per event). Only for transactions that do not change roles or preferences."""
+    session.info.setdefault(_RECIPIENTS_CACHE_KEY, {})
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _drop_recipients_cache(session: Session, transaction: SessionTransaction) -> None:
+    if transaction.parent is None:
+        session.info.pop(_RECIPIENTS_CACHE_KEY, None)
+
+
+async def load_recipients_many(session: AsyncSession, elderly_ids: Collection[UUID]) -> dict[UUID, list[Recipient]]:
+    """Recipients of several elderly in one query (background passes notify many at once)."""
+    cache: dict[UUID, list[Recipient]] | None = session.info.get(_RECIPIENTS_CACHE_KEY)
+    if cache is not None:
+        missing = [e for e in elderly_ids if e not in cache]
+        if missing:
+            loaded = await _query_recipients(session, missing)
+            for elderly_id in missing:
+                cache[elderly_id] = loaded.get(elderly_id, [])
+        return {e: cache[e] for e in elderly_ids if cache[e]}
+    return await _query_recipients(session, elderly_ids)
+
+
+async def _query_recipients(session: AsyncSession, elderly_ids: Collection[UUID]) -> dict[UUID, list[Recipient]]:
+    if not elderly_ids:
+        return {}
     rows = await session.execute(
-        select(User.id, User.interface_language, NotificationPreference, Elderly.nickname, Elderly.full_name)
+        select(
+            UserElderlyRole.elderly_id, User.id, User.interface_language, NotificationPreference,
+            Elderly.nickname, Elderly.full_name,
+        )
         .join(UserElderlyRole, UserElderlyRole.user_id == User.id)
         .join(Elderly, Elderly.id == UserElderlyRole.elderly_id)
         .outerjoin(
@@ -95,17 +135,19 @@ async def load_recipients(session: AsyncSession, elderly_id: UUID) -> list[Recip
             (NotificationPreference.user_id == User.id)
             & (NotificationPreference.elderly_id == UserElderlyRole.elderly_id),
         )
-        .where(UserElderlyRole.elderly_id == elderly_id, Elderly.deleted_at.is_(None))
+        .where(UserElderlyRole.elderly_id.in_(list(elderly_ids)), Elderly.deleted_at.is_(None))
     )
-    return [
-        Recipient(
-            user_id=uid,
-            language=(lang or "ID").upper(),
-            prefs=Preferences.from_row(pref),
-            elderly_name=nickname or full_name,
+    by_elderly: dict[UUID, list[Recipient]] = {}
+    for elderly_id, uid, lang, pref, nickname, full_name in rows.all():
+        by_elderly.setdefault(elderly_id, []).append(
+            Recipient(
+                user_id=uid,
+                language=(lang or DEFAULT_LANGUAGE).upper(),
+                prefs=Preferences.from_row(pref),
+                elderly_name=nickname or full_name,
+            )
         )
-        for uid, lang, pref, nickname, full_name in rows.all()
-    ]
+    return by_elderly
 
 
 # --- message templates ------------------------------------------------------
@@ -161,12 +203,64 @@ _VARIANTS: dict[tuple[NotificationType, str], dict[str, str]] = {
 }
 
 
+# Notes stored on resolved notifications and dose confirmations, per language like the messages.
+NOTE_TAKEN_AFTER_MISSED = "TAKEN_AFTER_MISSED"
+NOTE_BY_SENSOR = "BY_SENSOR"
+NOTE_BY_CAREGIVER = "BY_CAREGIVER"
+NOTE_DOSE_REPLAYED = "DOSE_REPLAYED"
+NOTE_CONFIRMED_FROM_NOTIFICATION = "CONFIRMED_FROM_NOTIFICATION"
+
+_NOTES: dict[str, dict[str, str]] = {
+    NOTE_TAKEN_AFTER_MISSED: {
+        "ID": "Diminum terlambat pukul {taken} (+{delay} menit), {how}.",
+        "EN": "Taken late at {taken} (+{delay} min), {how}.",
+    },
+    NOTE_BY_SENSOR: {"ID": "tercatat oleh sensor pillbox", "EN": "recorded by the pillbox sensor"},
+    NOTE_BY_CAREGIVER: {"ID": "dikonfirmasi oleh {name}", "EN": "confirmed by {name}"},
+    NOTE_DOSE_REPLAYED: {
+        "ID": "Jam pillbox dimundurkan; dosis ini diulang.",
+        "EN": "The pillbox clock was set back; this dose is repeated.",
+    },
+    NOTE_CONFIRMED_FROM_NOTIFICATION: {"ID": "Dikonfirmasi dari notifikasi", "EN": "Confirmed from the notification"},
+}
+
+# A note in every supported language: {"ID": ..., "EN": ...}.
+LocalizedText = dict[str, str]
+
+
+def note_texts(key: str, **params: Any) -> LocalizedText:
+    """The note in every language; a param may itself be a LocalizedText (e.g. `how`)."""
+    templates = _NOTES[key]
+    return {
+        language: template.format_map(_SafeDict({
+            name: (value.get(language, value.get(DEFAULT_LANGUAGE)) if isinstance(value, dict) else value)
+            for name, value in params.items()
+        }))
+        for language, template in templates.items()
+    }
+
+
+def text_for(text: LocalizedText, language: str | None) -> str:
+    """One language of a LocalizedText (unknown language: the default one)."""
+    return text.get((language or DEFAULT_LANGUAGE).upper(), text[DEFAULT_LANGUAGE])
+
+
+def localized_for_recipient(text: LocalizedText) -> ColumnElement[str]:
+    """SQL choosing `text` by the notification owner's language, for an UPDATE of notifications
+    joined to users (users.interface_language is a Postgres enum: compared as text)."""
+    language = cast(User.interface_language, String)
+    return case(
+        *((language == lang, value) for lang, value in text.items() if lang != DEFAULT_LANGUAGE),
+        else_=text[DEFAULT_LANGUAGE],
+    )
+
+
 def render_message(ntype: NotificationType, language: str, params: dict[str, Any], variant: str | None = None) -> str:
     """A param value may be a {"ID": ..., "EN": ...} dict for localized fragments."""
     templates = _VARIANTS.get((ntype, variant or ""), _TEMPLATES[ntype])
-    template = templates.get(language, templates["ID"])
+    template = templates.get(language, templates[DEFAULT_LANGUAGE])
     resolved = {
-        key: (value.get(language, value.get("ID")) if isinstance(value, dict) else value)
+        key: (value.get(language, value.get(DEFAULT_LANGUAGE)) if isinstance(value, dict) else value)
         for key, value in params.items()
     }
     return template.format_map(_SafeDict(resolved))
@@ -209,72 +303,88 @@ async def notify(
     Does not commit."""
     if recipients is None:
         recipients = await load_recipients(session, spec.elderly_id)
-    targets = [
-        r for r in recipients
-        if wants(r.prefs, spec.type) and (only_user_ids is None or r.user_id in only_user_ids)
-    ]
-    if not targets:
-        return []
-    values = [
-        {
-            "user_id": r.user_id,
-            "elderly_id": spec.elderly_id,
-            "device_id": spec.device_id,
-            "telemetry_log_id": spec.telemetry_log_id,
-            "type": spec.type.value,
-            "severity": spec.severity.value,
-            "message": render_message(spec.type, r.language, spec.params, spec.variant),
-            "event_key": spec.event_key,
-        }
-        for r in targets
-    ]
-    stmt = (
-        insert(Notification)
-        .values(values)
-        .on_conflict_do_nothing(
-            index_elements=[Notification.event_key, Notification.user_id],
-            index_where=Notification.event_key.is_not(None),
-        )
-        .returning(Notification.id, Notification.user_id, Notification.created_at)
-    )
-    inserted = (await session.execute(stmt)).all()
-    if inserted:
-        logger.info(
-            "notifications_created",
-            extra={"type": spec.type.value, "event_key": spec.event_key, "count": len(inserted)},
-        )
-        # Correlation id here is the device event_id (set by telemetry ingestion)
-        # or the rules-engine/presence pass; the app logs these notification ids.
-        timing.log_timing(
-            "iot_to_app", "notification_rows_created",
-            type=spec.type.value, notification_ids=[str(nid) for nid, _, _ in inserted],
-        )
-        # Open app sockets receive the new rows right after commit.
-        messages = {r.user_id: v["message"] for r, v in zip(targets, values, strict=True)}
-        items: dict[UUID, list[dict[str, Any]]] = {}
-        for nid, uid, created_at in inserted:
-            items.setdefault(uid, []).append(
-                {
-                    "id": str(nid),
+    return await notify_many(session, [(spec, recipients, only_user_ids)])
+
+
+async def notify_many(
+    session: AsyncSession,
+    batch: list[tuple[NotificationSpec, list[Recipient], Collection[UUID] | None]],
+) -> list[UUID]:
+    """notify() for many incidents at once (spec, its elderly's recipients, optional user filter):
+    one multi-row INSERT per chunk instead of one per incident (a backlog pass can decide
+    thousands of doses). Returns the new row ids. Does not commit."""
+    rows: list[tuple[NotificationSpec, Recipient, dict[str, Any]]] = []
+    for spec, recipients, only_user_ids in batch:
+        for r in recipients:
+            if wants(r.prefs, spec.type) and (only_user_ids is None or r.user_id in only_user_ids):
+                rows.append((spec, r, {
+                    "user_id": r.user_id,
+                    "elderly_id": spec.elderly_id,
+                    "device_id": spec.device_id,
+                    "telemetry_log_id": spec.telemetry_log_id,
                     "type": spec.type.value,
                     "severity": spec.severity.value,
-                    "elderly_id": str(spec.elderly_id),
-                    "device_id": str(spec.device_id) if spec.device_id else None,
-                    "slot_number": spec.slot_number,
-                    "delay_minutes": spec.delay_minutes,
-                    "message": messages[uid],
-                    "is_read": False,
-                    "is_resolved": False,
-                    "actions": spec.actions,
-                    "created_at": created_at.isoformat(),
-                }
-            )
-        queue_notifications(session, items)
-        push_targets = {r.user_id for r in targets if r.prefs.push_enabled}
-        await dispatch_push(
-            session, [(nid, uid) for nid, uid, _ in inserted if uid in push_targets]
+                    "message": render_message(spec.type, r.language, spec.params, spec.variant),
+                    "event_key": spec.event_key,
+                }))
+    if not rows:
+        return []
+    by_key = {(spec.event_key, r.user_id): (spec, r, values) for spec, r, values in rows}
+    # A single-row statement executed with many parameter sets: SQLAlchemy compiles it once and
+    # sends batched multi-row INSERTs ("insertmanyvalues"), instead of compiling a statement
+    # with thousands of bind parameters in Python (seconds of event-loop CPU for a backlog).
+    table = Notification.__table__
+    stmt = (
+        insert(table)
+        .on_conflict_do_nothing(index_elements=[table.c.event_key, table.c.user_id], index_where=table.c.event_key.is_not(None))
+        .returning(table.c.id, table.c.user_id, table.c.created_at, table.c.event_key)
+    )
+    result = await session.execute(stmt, [values for _, _, values in rows])
+    inserted = [(nid, uid, created_at, key) for nid, uid, created_at, key in result.all()]
+    if not inserted:
+        return []
+
+    created_by_type = Counter(by_key[(key, uid)][0].type.value for _, uid, _, key in inserted)
+    logger.info(
+        "notifications_created",
+        extra={
+            "counts": dict(created_by_type),
+            "count": len(inserted),
+            "event_key": batch[0][0].event_key if len(batch) == 1 else None,
+        },
+    )
+    # Correlation id here is the device event_id (set by telemetry ingestion)
+    # or the rules-engine/presence pass; the app logs these notification ids.
+    timing.log_timing(
+        "iot_to_app", "notification_rows_created",
+        types=sorted(created_by_type), notification_ids=[str(nid) for nid, _, _, _ in inserted],
+    )
+    # Open app sockets receive the new rows right after commit.
+    items: dict[UUID, list[dict[str, Any]]] = {}
+    push: list[tuple[UUID, UUID]] = []
+    for nid, uid, created_at, key in inserted:
+        spec, recipient, values = by_key[(key, uid)]
+        items.setdefault(uid, []).append(
+            {
+                "id": str(nid),
+                "type": spec.type.value,
+                "severity": spec.severity.value,
+                "elderly_id": str(spec.elderly_id),
+                "device_id": str(spec.device_id) if spec.device_id else None,
+                "slot_number": spec.slot_number,
+                "delay_minutes": spec.delay_minutes,
+                "message": values["message"],
+                "is_read": False,
+                "is_resolved": False,
+                "actions": spec.actions,
+                "created_at": created_at.isoformat(),
+            }
         )
-    return [nid for nid, _, _ in inserted]
+        if recipient.prefs.push_enabled:
+            push.append((nid, uid))
+    queue_notifications(session, items)
+    await dispatch_push(session, push)
+    return [nid for nid, _, _, _ in inserted]
 
 
 async def dispatch_push(session: AsyncSession, notifications: list[tuple[UUID, UUID]]) -> None:

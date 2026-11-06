@@ -20,11 +20,12 @@ from app.api.routes import (
     schedules,
     ws,
 )
+from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.config import get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging, request_id_var
 from app.core.timing import correlation_id_var
-from app.db.session import get_engine, get_sessionmaker, warm_pool
+from app.db.session import get_background_engine, get_background_sessionmaker, get_engine, warm_pool
 from app.services.background import start_background_tasks, stop_background_tasks
 
 settings = get_settings()  # only used to configure the app object itself
@@ -35,18 +36,21 @@ logger = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await warm_pool()
-    tasks = start_background_tasks(get_sessionmaker(), settings) if settings.enable_background_tasks else []
+    tasks = start_background_tasks(get_background_sessionmaker(), settings) if settings.enable_background_tasks else []
     logger.info("startup", extra={"background_tasks": len(tasks), "auth_mode": settings.auth_mode})
     try:
         yield
     finally:
         await stop_background_tasks(tasks)
         await get_engine().dispose()  # creating the engine is lazy; no connection is opened
+        await get_background_engine().dispose()
 
 
 app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
 install_error_handlers(app)
 
+# Added first so it runs inside CORS: its 413 then carries the CORS headers (Expo web reads it).
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -58,7 +62,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    request_id = _safe_correlation_id(request.headers.get("x-request-id")) or uuid.uuid4().hex
     correlation_id = _safe_correlation_id(request.headers.get("x-correlation-id")) or request_id
     token = request_id_var.set(request_id)
     correlation_token = correlation_id_var.set(correlation_id)

@@ -1,0 +1,14 @@
+# Personal overrides (copy to CLAUDE.local.md, which is gitignored)
+
+Never put secrets here. Keep keys in your own `.env` files.
+
+## My environment
+- OS / shell: <fill in>
+- Backend local URL: http://localhost:8000
+- Mobile dev server: http://localhost:8081
+- Device under test (dev only): PB-XXXXXXXX
+
+## My preferences for the agent
+- Reply language in chat: <Indonesian / English>
+- Explain trade-offs briefly when you pick between two approaches.
+- <anything else personal, e.g. "I'm working on the Mobile folder this week">

@@ -3,9 +3,9 @@
 // The hook and UI (src/hooks/use-notification-feed.ts) are the same for both.
 
 import {
-  activePillboxElderlyId,
+  activePillboxDeviceId,
   deleteBackendNotification,
-  inActiveScope,
+  deleteBackendNotificationsForDevice,
   fetchBackendNotifications,
   getMockNotifications,
   markBackendNotificationRead,
@@ -13,7 +13,6 @@ import {
   USE_MOCK,
   type BackendFeedTab,
 } from './api';
-import { deleteMyNotificationsWhere } from './devices';
 import {
   compareFeed,
   matchesFilter,
@@ -23,6 +22,8 @@ import {
   type FeedPosition,
   type NotificationFilter,
 } from './feed';
+import { AppConfig } from '@/config';
+
 import type { AppNotification } from './types';
 
 export {
@@ -45,9 +46,9 @@ const MOCK_FAIL_DELETES = false;
 const MOCK_FAIL_PAGES = false;
 /**
  * Server rows read per request when the app filters on the phone ("Tepat Waktu", "Sistem" have
- * no backend tab). The backend caps limit at 100 (Backend/app/core/config.py max_page_limit).
+ * no backend tab): the backend's largest page.
  */
-const BACKEND_SCAN_PAGE = 100;
+const BACKEND_SCAN_PAGE = AppConfig.backendPageLimit;
 
 function mockDelay(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 250 + Math.round(Math.random() * 150)));
@@ -87,20 +88,22 @@ async function fetchMockPage(filter: NotificationFilter, cursor: FeedCursor | nu
  * Backend: GET /notifications?tab&page&limit&elderly_id (offset pagination, newest first).
  * "Semua" and "Terlambat & Terlewat" map to the ALL and LATE_MISSED tabs. Note that LATE_MISSED
  * only lists unresolved incidents. "Tepat Waktu" and "Sistem" have no tab yet, so they read ALL
- * and filter on the phone. The feed shows only the active pillbox: the server narrows by its
- * elderly profile, the phone by device (inActiveScope).
- * The unread badge is the server's count across ALL pillboxes (the backend counts per user).
- * TODO(backend): ON_TIME and SYSTEM tabs, a device_id filter, and cursor pagination (handoff list).
+ * and filter on the phone. The server narrows the feed to the active pillbox (device_id: its own
+ * rows plus its elderly's device-less ones), and the unread badge counts that pillbox only.
+ * TODO(backend): ON_TIME and SYSTEM tabs and cursor pagination (handoff list).
  */
 async function fetchBackendPage(filter: NotificationFilter, cursor: FeedCursor | null, limit: number): Promise<NotificationPage> {
+  const deviceId = activePillboxDeviceId();
+  if (!deviceId) return { items: [], nextCursor: null, unreadCount: 0, latest: null }; // nothing paired yet
   const tab: BackendFeedTab = filter === 'issues' ? 'LATE_MISSED' : 'ALL';
-  const elderlyId = activePillboxElderlyId();
+  const serverFiltered = filter === 'all' || filter === 'issues';
   const page = await pageFromOffsets({
-    fetchRaw: (pageNumber, pageSize) => fetchBackendNotifications(tab, pageNumber, pageSize, elderlyId),
-    pageSize: BACKEND_SCAN_PAGE,
+    fetchRaw: (pageNumber, pageSize) => fetchBackendNotifications(tab, pageNumber, pageSize, null, deviceId),
+    // Exactly one request per page when the server applies the whole filter.
+    pageSize: serverFiltered ? limit : BACKEND_SCAN_PAGE,
     limit,
     cursor,
-    match: (n) => inActiveScope(n) && (filter === 'all' || filter === 'issues' || matchesFilter(n, filter)),
+    match: serverFiltered ? undefined : (n) => matchesFilter(n, filter),
   });
   return {
     items: page.items,
@@ -143,18 +146,14 @@ export async function deleteNotification(id: string): Promise<void> {
 /**
  * Permanently deletes the active pillbox's notifications up to and including `upTo` (the newest
  * one the user saw when confirming), so anything that arrives after the confirmation survives.
- * Other pillboxes' notifications are kept. Backend: one DELETE /notifications/{id} per row; the
- * bulk DELETE /notifications?up_to_created_at has no device filter and would clear every pillbox.
- * TODO(backend-branch): DELETE /notifications?device_id=&up_to_created_at= (handoff item 3).
+ * Other pillboxes' notifications are kept. Backend: one DELETE /notifications?device_id=&up_to_*
+ * (it used to page through the feed and send one DELETE per row).
  */
 export async function clearNotifications(upTo: FeedPosition): Promise<{ deleted: number }> {
   if (!USE_MOCK) {
-    const result = await deleteMyNotificationsWhere(
-      (n) => inActiveScope(n) && isAtOrOlder(n, upTo),
-      activePillboxElderlyId(),
-    );
-    if (result.failed > 0) throw new Error(`${result.failed} notifications could not be deleted`);
-    return { deleted: result.deleted };
+    const deviceId = activePillboxDeviceId();
+    if (!deviceId) return { deleted: 0 };
+    return { deleted: await deleteBackendNotificationsForDevice(deviceId, upTo) };
   }
   await mockDelay();
   if (MOCK_FAIL_DELETES) throw new Error('mock clear failure');

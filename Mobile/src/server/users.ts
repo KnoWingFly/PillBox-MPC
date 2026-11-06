@@ -1,10 +1,12 @@
-import { Prisma, type User } from '@prisma/client';
+import type { User } from '@prisma/client';
 
 import { db } from './db';
 import { unauthorized } from './errors';
 
 function hasPrismaCode(err: unknown, code: string): boolean {
-  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === code;
+  // `instanceof` can fail when an error was created by a different loaded copy
+  // of Prisma Client. The stable part of a known request error is its code.
+  return typeof err === 'object' && err !== null && 'code' in err && err.code === code;
 }
 
 export const isUniqueViolation = (err: unknown) => hasPrismaCode(err, 'P2002');

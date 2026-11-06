@@ -1,10 +1,15 @@
 import re
-from datetime import time
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Any
 
 from pydantic import AfterValidator, BeforeValidator, PlainSerializer, StringConstraints
 
+from app.core.config import get_settings
 from app.services.timeutil import is_valid_timezone
+
+# Largest value of a Postgres INTEGER column. A bigger number from a client would fail the
+# INSERT with a DataError (a 500 the client retries forever), so int fields are bounded by it.
+PG_INT_MAX = 2_147_483_647
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
@@ -32,10 +37,40 @@ def _check_tz(value: str) -> str:
 
 
 TimeZoneName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64), AfterValidator(_check_tz)]
-E164 = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^\+[1-9]\d{6,14}$")]
+E164_PATTERN = r"^\+[1-9]\d{6,14}$"
+E164 = Annotated[str, StringConstraints(strip_whitespace=True, pattern=E164_PATTERN)]
 Name100 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 Label50 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 FreeText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
+
+# Largest UTC offset in use (UTC+14): "today" for the caller is at most this far ahead of UTC,
+# so a birth date picked as today anywhere in the world is never rejected as future.
+_MAX_UTC_OFFSET = timedelta(hours=14)
+
+
+def _check_elderly_name(value: str) -> str:
+    min_length = get_settings().elderly_name_min_length
+    if len(value) < min_length:
+        raise ValueError(f"must be at least {min_length} characters")
+    return value
+
+
+def _check_birth_date(value: date) -> date:
+    latest_today = (datetime.now(UTC) + _MAX_UTC_OFFSET).date()
+    if value > latest_today:
+        raise ValueError("must not be in the future")
+    max_age = get_settings().elderly_max_age_years
+    try:
+        earliest = latest_today.replace(year=latest_today.year - max_age)
+    except ValueError:  # 29 Feb in a non-leap target year
+        earliest = latest_today.replace(year=latest_today.year - max_age, day=latest_today.day - 1)
+    if value < earliest:
+        raise ValueError(f"must not be more than {max_age} years ago")
+    return value
+
+
+ElderlyName = Annotated[Name100, AfterValidator(_check_elderly_name)]
+BirthDate = Annotated[date, AfterValidator(_check_birth_date)]
 
 
 def _check_days(days: list[int]) -> list[int]:

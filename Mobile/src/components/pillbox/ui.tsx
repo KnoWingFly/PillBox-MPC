@@ -5,6 +5,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import type { ComponentProps, ReactNode } from 'react';
 import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 
+import { Strings } from '@/constants/strings';
 import * as tokens from '@/theme/tokens';
 
 export type IconName = ComponentProps<typeof Ionicons>['name'];
@@ -35,7 +36,7 @@ export function IconBadge({ icon, tone, size = 'md' }: { icon: IconName; tone: T
   );
 }
 
-type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'danger-soft' | 'success' | 'warning' | 'ghost';
+export type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'danger-soft' | 'success' | 'warning' | 'ghost';
 
 const BUTTON: Record<ButtonVariant, { box: string; text: string; color: string }> = {
   primary: { box: 'bg-primary', text: 'text-white', color: '#FFFFFF' },
@@ -209,7 +210,7 @@ export function LoadErrorBox({ text, onRetry }: { text: string; onRetry: () => v
         <Icon name="cloud-offline-outline" size={22} color={tokens.colors.missed.fg} />
         <Text className="flex-1 text-body text-missed-fg">{text}</Text>
       </View>
-      <Button label="Coba lagi" icon="refresh" variant="danger-soft" size="sm" onPress={onRetry} />
+      <Button label={Strings.common.retry} icon="refresh" variant="danger-soft" size="sm" onPress={onRetry} />
     </View>
   );
 }

@@ -1,8 +1,10 @@
+import { serverConfig } from '@/server/config';
 import { db } from '@/server/db';
 import { HttpError } from '@/server/errors';
 import { json, parseBody, route } from '@/server/http';
 import { OTP_MAX_ATTEMPTS, hashOtp, otpMatches } from '@/server/otp';
 import { hashPassword } from '@/server/passwords';
+import { consumeAttempt } from '@/server/rate-limit';
 import { resetPasswordSchema } from '@/server/schemas';
 import { revokeAllForUser } from '@/server/tokens';
 
@@ -11,6 +13,8 @@ const invalidOtp = () => new HttpError(400, 'INVALID_OTP', 'OTP code is invalid 
 
 export const POST = route(async (request) => {
   const body = await parseBody(request, resetPasswordSchema);
+  // On top of the per-OTP attempt counter: also caps guesses across freshly requested OTPs.
+  await consumeAttempt('reset:email', body.email, serverConfig.limits.resetPerEmail);
 
   const user = await db.user.findUnique({ where: { email: body.email }, select: { id: true } });
   const otp = user

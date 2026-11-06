@@ -38,14 +38,16 @@ def device_key_invalid() -> AppError:
 
 async def find_device(session: AsyncSession, device_ref: str, *, lock: bool = False) -> Device | None:
     """device_ref is a device_code (what the device knows) or the device UUID.
-    lock=True loads the row FOR UPDATE (fresh values, held until commit)."""
+    lock=True loads the row FOR NO KEY UPDATE (fresh values, held until commit). Not FOR
+    UPDATE: inserting a telemetry_logs row takes FOR KEY SHARE on its device (FK check), and
+    FOR UPDATE would deadlock device requests against the rules engine's dose inserts."""
     try:
         as_uuid = UUID(device_ref)
     except ValueError:
         as_uuid = None
     stmt = select(Device).where(Device.id == as_uuid) if as_uuid else select(Device).where(Device.device_code == device_ref)
     if lock:
-        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        stmt = stmt.with_for_update(key_share=True).execution_options(populate_existing=True)
     device = (await session.execute(stmt)).scalar_one_or_none()
     if lock and device is not None:
         mark_row_locked(session, device)
@@ -55,14 +57,18 @@ async def find_device(session: AsyncSession, device_ref: str, *, lock: bool = Fa
 async def authenticate_device(
     session: AsyncSession, device_ref: str, secret: str | None, *, lock: bool = False
 ) -> Device:
-    """lock=True: REST device routes, which all call mark_seen() next. Locking
-    here saves mark_seen() its own SELECT ... FOR UPDATE round trip. Never lock
-    from a long-lived session (the WebSocket handler)."""
-    device = await find_device(session, device_ref, lock=lock)
+    """lock=True: REST device routes, which all call mark_seen() next; the row is locked
+    (FOR NO KEY UPDATE) only AFTER the key matched, so requests with a wrong key for a known
+    device_code cannot queue on that device's row lock. Never lock from a long-lived session
+    (the WebSocket handler)."""
+    device = await find_device(session, device_ref)
     # verify_device_secret runs in constant time and also when device is None.
     if not verify_device_secret(secret, device.device_secret_hash if device else None) or device is None:
         logger.warning("device_auth_failed", extra={"device_ref": device_ref})
         raise device_key_invalid()
+    if lock:
+        await session.refresh(device, with_for_update={"key_share": True})
+        mark_row_locked(session, device)
     return device
 
 
@@ -83,7 +89,12 @@ async def process_heartbeat(
         device.rtc_backup_active = hb.rtc_backup_active
     if hb.chambers:
         device.chamber_doors = [{"slot_number": c.slot_number, "door": c.door} for c in hb.chambers]
-    if hb.config_version_applied is not None:
+    # A version above the latest was never issued (device DB from another server, a restored
+    # backend): it is stale, not newer. Keep the stored one and tell the device to re-sync.
+    reported_unknown_version = (
+        hb.config_version_applied is not None and hb.config_version_applied > device.config_version
+    )
+    if hb.config_version_applied is not None and not reported_unknown_version:
         device.config_version_applied = hb.config_version_applied
 
     # The device holds the physical sachets, so its count is authoritative.
@@ -115,7 +126,7 @@ async def process_heartbeat(
     return HeartbeatResponse(
         server_time=now,
         latest_config_version=device.config_version,
-        config_update_available=device.config_version > applied,
+        config_update_available=reported_unknown_version or device.config_version > applied,
         heartbeat_interval_seconds=settings.device_heartbeat_interval_seconds,
         is_paired=device.elderly_id is not None,
     )
@@ -201,4 +212,6 @@ async def ack_config(
 
 
 def is_fresh(occurred_at: datetime, now: datetime, settings: Settings) -> bool:
-    return occurred_at >= now - timedelta(seconds=2 * settings.device_heartbeat_interval_seconds)
+    return occurred_at >= now - timedelta(
+        seconds=settings.telemetry_fresh_heartbeat_intervals * settings.device_heartbeat_interval_seconds
+    )

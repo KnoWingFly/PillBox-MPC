@@ -50,11 +50,23 @@ export function onSessionExpired(listener: Listener): () => void {
   return () => sessionExpiredListeners.delete(listener);
 }
 
+/** Error codes that mean "the server could not be reached or answered badly", not "you were refused". */
+const TRANSIENT_CODES = new Set(['NETWORK_ERROR', 'TIMEOUT', 'INVALID_RESPONSE', 'SERVICE_UNAVAILABLE', 'INTERNAL_ERROR']);
+
+/**
+ * True for failures worth retrying later (offline, timeout, 5xx, unreadable answer). A 4xx such as
+ * UNAUTHORIZED or REFRESH_TOKEN_INVALID is final.
+ */
+export function isTransientError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  return TRANSIENT_CODES.has(err.code) || err.status >= 500;
+}
+
 /**
  * fetch() with a deadline. React Native's fetch has no default timeout, so an unreachable host
  * (stale LAN IP, Wi-Fi switching networks) can otherwise hang a request, and the splash screen
- * that waits on it, until the OS gives up. A timeout is reported as NETWORK_ERROR so callers keep
- * their existing offline handling (e.g. session restore keeps the session).
+ * that waits on it, until the OS gives up. A timeout is reported as TIMEOUT (the server may still
+ * have applied a write), an unreachable host as NETWORK_ERROR; both count as transient.
  */
 export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = AppConfig.requestTimeoutMs): Promise<Response> {
   const controller = new AbortController();
@@ -62,9 +74,23 @@ export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch {
-    throw new ApiError(0, 'NETWORK_ERROR', controller.signal.aborted ? 'Request timed out' : 'Network request failed');
+    throw controller.signal.aborted
+      ? new ApiError(0, 'TIMEOUT', 'Request timed out')
+      : new ApiError(0, 'NETWORK_ERROR', 'Network request failed');
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * Body of a successful response. A 2xx that is not JSON (a proxy's HTML page, a truncated body)
+ * becomes INVALID_RESPONSE instead of a SyntaxError that callers cannot classify.
+ */
+export async function readJson<T>(res: Response): Promise<T> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new ApiError(res.status, 'INVALID_RESPONSE', `Response from ${res.url || 'server'} is not valid JSON`);
   }
 }
 
@@ -109,7 +135,7 @@ async function doRefresh(): Promise<string | null> {
     if (res.status === 401) return null; // refresh token rejected: session is over
     throw await toApiError(res);
   }
-  const tokens = (await res.json()) as TokenResponse;
+  const tokens = await readJson<TokenResponse>(res);
   await tokenStore.setTokens(tokens.access_token, tokens.refresh_token);
   return tokens.access_token;
 }
@@ -183,5 +209,5 @@ export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Prom
 
   if (!res.ok) throw await toApiError(res);
   if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  return readJson<T>(res);
 }

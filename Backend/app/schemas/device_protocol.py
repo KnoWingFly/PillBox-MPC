@@ -3,9 +3,11 @@ Field names follow the API List "[Perangkat]" rows; extra fields are additive
 so the existing emulator keeps working. See docs/DEVICE_CONTRACT.md."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.schemas.common import PG_INT_MAX
 
 
 # --- heartbeat -----------------------------------------------------------
@@ -13,17 +15,17 @@ class ChamberStatus(BaseModel):
     slot_number: int = Field(..., ge=1, le=8)
     door: Literal["OPEN", "CLOSED"]
     # Physical sachet count reported by the device (emulator sends it).
-    stock_count: int | None = Field(None, ge=0)
+    stock_count: int | None = Field(None, ge=0, le=PG_INT_MAX)
 
 
 class HeartbeatRequest(BaseModel):
     sent_at: datetime | None = None
     battery_percent: int = Field(..., ge=0, le=100)
-    wifi_rssi_dbm: int | None = None
+    wifi_rssi_dbm: int | None = Field(None, ge=-PG_INT_MAX, le=PG_INT_MAX)
     rtc_time: datetime | None = None
     # How fast rtc_time advances per real second (the emulator's lab clock runs 1x/10x/60x).
     rtc_speed: float | None = Field(None, gt=0, le=10_000)
-    config_version_applied: int | None = Field(None, ge=0)
+    config_version_applied: int | None = Field(None, ge=0, le=PG_INT_MAX)
     chambers: list[ChamberStatus] = Field(default_factory=list, max_length=8)
     rtc_backup_active: bool | None = None
 
@@ -59,7 +61,7 @@ class ConfigResponse(BaseModel):
 
 
 class ConfigAckRequest(BaseModel):
-    config_version: int = Field(..., ge=0)
+    config_version: int = Field(..., ge=0, le=PG_INT_MAX)
     applied_at: datetime | None = None
 
 
@@ -77,7 +79,7 @@ class TelemetryEvent(BaseModel):
     slot_number: int | None = Field(None, ge=1, le=8)
     schedule_id: str | None = Field(None, max_length=64)
     occurred_at: datetime
-    chime_count: int | None = Field(None, ge=0)
+    chime_count: int | None = Field(None, ge=0, le=PG_INT_MAX)
     # BATTERY_STATUS
     battery_percent: int | None = Field(None, ge=0, le=100)
     on_external_power: bool | None = None
@@ -85,12 +87,29 @@ class TelemetryEvent(BaseModel):
     command_id: str | None = Field(None, max_length=64)
     reason: str | None = Field(None, max_length=200)
 
+    @field_validator("event_id", "event_type", "schedule_id", "command_id", "reason")
+    @classmethod
+    def _no_nul(cls, value: str | None) -> str | None:
+        # Postgres text and jsonb cannot hold U+0000: the claim INSERT would fail for the whole
+        # batch on every retry. Rejected here, per event, like any other invalid field.
+        if value is not None and "\x00" in value:
+            raise ValueError("must not contain NUL characters")
+        return value
+
 
 class TelemetryRequest(BaseModel):
     batch_id: str | None = Field(None, max_length=64)
+
+    @field_validator("batch_id")
+    @classmethod
+    def _no_nul(cls, value: str | None) -> str | None:
+        return TelemetryEvent._no_nul(value)
     # True when the batch is a post-reconnect flush of the offline buffer.
     is_offline_flush: bool = False
-    events: list[TelemetryEvent]
+    # An item that is not a valid TelemetryEvent is kept as sent and answered "rejected" with a
+    # reason (services/telemetry.py) instead of failing the whole batch with 422, which would
+    # block the device's outbox behind that one event.
+    events: list[Annotated[TelemetryEvent | Any, Field(union_mode="left_to_right")]]
 
 
 class RejectedEvent(BaseModel):

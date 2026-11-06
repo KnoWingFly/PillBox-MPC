@@ -1,6 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from 'react';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
 
+import { AppConfig } from '@/config';
+import { Strings } from '@/constants/strings';
+import { usePolling } from '@/hooks/use-polling';
 import { authApi, deviceTimezone, type RegisterInput } from '@/lib/api/auth';
 import { ApiError, onSessionExpired, type TokenResponse } from '@/lib/api/client';
 import { settingApi } from '@/lib/api/setting';
@@ -28,6 +31,7 @@ type AuthContextValue = {
   signUp: (input: Omit<RegisterInput, 'timezone'>) => Promise<void>;
   /** Resolves false when the user cancels the Google picker. */
   signInWithGoogle: (remember: boolean) => Promise<boolean>;
+  completeGoogleSignIn: (code: string, remember: boolean) => Promise<void>;
   signOut: () => Promise<void>;
   forgotPassword: (email: string) => Promise<void>;
   resetPassword: (email: string, otpCode: string, newPassword: string) => Promise<void>;
@@ -35,8 +39,21 @@ type AuthContextValue = {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-const NOTICE_SESSION_AGED_OUT = 'Sesi Anda telah berakhir setelah 30 hari. Silakan masuk kembali.';
-const NOTICE_SESSION_EXPIRED = 'Sesi Anda telah berakhir. Silakan masuk kembali.';
+const NOTICE_SESSION_AGED_OUT = Strings.session.agedOut;
+const NOTICE_SESSION_EXPIRED = Strings.session.expired;
+
+function withGoogleSignInStage(err: unknown, stage: string): Error & { googleSignInStage: string } {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const previousStage = (error as Error & { googleSignInStage?: unknown }).googleSignInStage;
+  return Object.assign(error, { googleSignInStage: typeof previousStage === 'string' ? previousStage : stage });
+}
+
+/** The only answers that end a stored session. Offline, timeouts and 5xx keep it. */
+const SESSION_REJECTED_CODES = new Set(['UNAUTHORIZED', 'REFRESH_TOKEN_INVALID']);
+
+function sessionRejected(err: unknown): boolean {
+  return err instanceof ApiError && SESSION_REJECTED_CODES.has(err.code);
+}
 
 async function sessionAgedOut(): Promise<boolean> {
   const loginAt = await tokenStore.getLoginAt();
@@ -81,8 +98,16 @@ export default function AuthProvider({ children }: PropsWithChildren) {
     [markSignedOut],
   );
 
-  // Restore on launch: a stored refresh token means "signed in"; the profile call also
-  // exercises the refresh path. Offline keeps the session instead of signing out.
+  /** Loads the caregiver profile; also registers this phone for push, which needs a live session. */
+  const loadProfile = useCallback(async () => {
+    const setting = await settingApi.get();
+    setUser({ id: setting.id, full_name: setting.full_name, email: setting.email });
+    void registerPushToken();
+  }, []);
+
+  // Restore on launch: a stored refresh token means "signed in"; the profile call also exercises
+  // the refresh path. Only a rejected session (UNAUTHORIZED / REFRESH_TOKEN_INVALID) signs out:
+  // offline, a timeout or a server error keeps the session and the profile is retried below.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -100,26 +125,29 @@ export default function AuthProvider({ children }: PropsWithChildren) {
         }
         // Sessions stored before the 30-day cap existed have no login time: start counting now.
         if ((await tokenStore.getLoginAt()) === null) await tokenStore.markLoginNow();
-        const setting = await settingApi.get();
+        await loadProfile();
         if (cancelled) return;
-        setUser({ id: setting.id, full_name: setting.full_name, email: setting.email });
         setStatus('signedIn');
         perfLoginStep('session_restored', { result: 'signed_in' });
       } catch (err) {
         if (cancelled) return;
         perfLoginStep('session_restored', { result: 'error', code: err instanceof ApiError ? err.code : 'UNKNOWN' });
-        if (err instanceof ApiError && err.code === 'NETWORK_ERROR') setStatus('signedIn');
-        else {
+        if (sessionRejected(err)) {
           await tokenStore.clear();
-          if (err instanceof ApiError && err.code === 'UNAUTHORIZED') setSessionNotice(NOTICE_SESSION_EXPIRED);
+          setSessionNotice(NOTICE_SESSION_EXPIRED);
           markSignedOut();
-        }
+        } else setStatus('signedIn'); // user stays null until the retry below succeeds
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [markSignedOut, endSession]);
+  }, [markSignedOut, endSession, loadProfile]);
+
+  // Signed in without a profile (the server was unreachable at startup): retry on a timer and when
+  // the app returns to the foreground. A rejected session is handled by onSessionExpired below.
+  const retryProfile = useCallback(() => loadProfile().catch(() => undefined), [loadProfile]);
+  usePolling(retryProfile, status === 'signedIn' && user === null ? AppConfig.sessionRetryMs : null);
 
   // Refresh token rejected mid-session (revoked, expired, reused): tokens are already cleared.
   useEffect(
@@ -172,29 +200,74 @@ export default function AuthProvider({ children }: PropsWithChildren) {
     [startSession],
   );
 
-  const signInWithGoogle = useCallback<AuthContextValue['signInWithGoogle']>(async (remember) => {
-    perfLoginStep('google_sign_in_started');
-    const idToken = await getGoogleIdToken();
-    if (!idToken) return false; // cancelled: silent
-    perfLoginStep('google_sign_in_returned');
+  const exchangeGoogleSession = useCallback(
+    async (supabaseAccessToken: string, remember: boolean) => {
+      let stage = 'pillcare_auth_api';
+      try {
+        const res = await authApi.google({ supabase_access_token: supabaseAccessToken, timezone: deviceTimezone() });
+        perfLoginStep('google_exchange_returned');
+        stage = 'save_app_session';
+        await startSession(res, res.caregiver, remember);
+      } catch (err) {
+        throw withGoogleSignInStage(err, stage);
+      }
+    },
+    [startSession],
+  );
 
-    const supabase = getSupabase();
-    try {
-      const { data, error } = await supabase.auth.signInWithIdToken({ provider: 'google', token: idToken });
-      if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
-      perfLoginStep('supabase_session_ready');
-      const res = await authApi.google({
-        supabase_access_token: data.session.access_token,
-        timezone: deviceTimezone(),
-      });
-      perfLoginStep('google_exchange_returned');
-      await startSession(res, res.caregiver, remember);
-      return true;
-    } finally {
-      // Never keep a second live session: ours is the only one.
-      await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
-    }
-  }, [startSession]);
+  const completeGoogleSignIn = useCallback<AuthContextValue['completeGoogleSignIn']>(
+    async (code, remember) => {
+      const supabase = getSupabase();
+      try {
+        const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+        if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
+        perfLoginStep('supabase_session_ready');
+        await exchangeGoogleSession(data.session.access_token, remember);
+      } finally {
+        await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+      }
+    },
+    [exchangeGoogleSession],
+  );
+
+  const signInWithGoogle = useCallback<AuthContextValue['signInWithGoogle']>(
+    async (remember) => {
+      perfLoginStep('google_sign_in_started');
+      if (Platform.OS === 'web') {
+        const callbackUrl = new URL('/auth/google-callback', window.location.origin);
+        callbackUrl.searchParams.set('remember', String(remember));
+        const { error } = await getSupabase().auth.signInWithOAuth({
+          provider: 'google',
+          options: { redirectTo: callbackUrl.toString() },
+        });
+        if (error) throw error;
+        return true;
+      }
+
+      let stage = 'native_google_sign_in';
+      let supabase: ReturnType<typeof getSupabase> | null = null;
+      try {
+        const idToken = await getGoogleIdToken();
+        if (!idToken) return false;
+        perfLoginStep('google_sign_in_returned');
+
+        stage = 'supabase_token_exchange';
+        supabase = getSupabase();
+        const { data, error } = await supabase.auth.signInWithIdToken({ provider: 'google', token: idToken });
+        if (error || !data.session) throw new ApiError(401, 'GOOGLE_TOKEN_INVALID', error?.message ?? 'No session');
+        perfLoginStep('supabase_session_ready');
+
+        stage = 'pillcare_auth_api';
+        await exchangeGoogleSession(data.session.access_token, remember);
+        return true;
+      } catch (err) {
+        throw withGoogleSignInStage(err, stage);
+      } finally {
+        if (supabase) await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+      }
+    },
+    [exchangeGoogleSession],
+  );
 
   const signOut = useCallback(() => endSession(null), [endSession]);
   const clearSessionNotice = useCallback(() => setSessionNotice(null), []);
@@ -218,11 +291,24 @@ export default function AuthProvider({ children }: PropsWithChildren) {
       signIn,
       signUp,
       signInWithGoogle,
+      completeGoogleSignIn,
       signOut,
       forgotPassword,
       resetPassword,
     }),
-    [status, user, sessionNotice, clearSessionNotice, signIn, signUp, signInWithGoogle, signOut, forgotPassword, resetPassword],
+    [
+      status,
+      user,
+      sessionNotice,
+      clearSessionNotice,
+      signIn,
+      signUp,
+      signInWithGoogle,
+      completeGoogleSignIn,
+      signOut,
+      forgotPassword,
+      resetPassword,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -24,12 +24,20 @@ from uuid import UUID, uuid4
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.core import timing
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# WebSocket close codes (docs/DEVICE_CONTRACT.md §3).
+WS_CLOSE_AUTH_FAILED = 4401
+WS_CLOSE_REPLACED = 4000
+# Server-side failure or a send the device did not read in time: reconnect with backoff.
+WS_CLOSE_INTERNAL_ERROR = 1011
 
 
 class DeviceCommand(StrEnum):
     TRIGGER_ALARM = "trigger_alarm"
+    STOP_ALARM = "stop_alarm"
     SCHEDULE_UPDATED = "schedule_updated"
     TIME_SYNC = "time_sync"
     REFILL_MODE = "refill_mode"
@@ -88,10 +96,13 @@ class CommandRecord:
 
 
 class ConnectionManager:
-    def __init__(self, history_size: int = 200) -> None:
+    def __init__(self, history_size: int | None = None) -> None:
         self._connections: dict[UUID, DeviceConnection] = {}
         self._pending: dict[str, _Pending] = {}
-        self.history: deque[CommandRecord] = deque(maxlen=history_size)
+        self._closing: set[asyncio.Task[None]] = set()  # bounded closes of dropped sockets
+        self.history: deque[CommandRecord] = deque(
+            maxlen=history_size if history_size is not None else get_settings().device_command_history_size
+        )
 
     # --- connections --------------------------------------------------
     def is_connected(self, device_id: UUID) -> bool:
@@ -101,9 +112,13 @@ class ConnectionManager:
         return self._connections.get(device_id)
 
     def register(self, conn: DeviceConnection) -> DeviceConnection | None:
-        """Returns the connection this one replaced (caller should close it)."""
+        """Returns the connection this one replaced (caller should close it). Commands sent on
+        the replaced socket are failed now (502 DEVICE_DISCONNECTED) instead of waiting for the
+        ack timeout: the old socket will never deliver their acks."""
         previous = self._connections.get(conn.device_id)
         self._connections[conn.device_id] = conn
+        if previous is not None:
+            self._fail_pending(conn.device_id)
         return previous
 
     def unregister(self, conn: DeviceConnection) -> bool:
@@ -111,15 +126,65 @@ class ConnectionManager:
         if self._connections.get(conn.device_id) is not conn:
             return False
         del self._connections[conn.device_id]
+        self._fail_pending(conn.device_id)
+        return True
+
+    def _fail_pending(self, device_id: UUID) -> None:
         for command_id, pending in list(self._pending.items()):
-            if pending.device_id == conn.device_id and not pending.future.done():
+            if pending.device_id == device_id and not pending.future.done():
                 pending.future.set_exception(DeviceDisconnectedError(command_id))
+
+    async def close(self, device_id: UUID, code: int, reason: str) -> bool:
+        """Closes the device's socket (e.g. its secret was rotated). The socket handler then
+        unregisters it, fails its pending commands and marks the device offline.
+        Returns False when the device had no socket."""
+        conn = self._connections.get(device_id)
+        if conn is None:
+            return False
+        try:
+            await asyncio.wait_for(self._locked_close(conn, code, reason), get_settings().device_ws_send_timeout_seconds)
+        except TimeoutError:
+            # The socket does not drain: forget it now so no command waits on it. Its handler
+            # cleans up whenever the transport finally fails.
+            logger.warning("device_ws_close_timeout", extra={"device_id": str(device_id)})
+            self.unregister(conn)
+        except (WebSocketDisconnect, RuntimeError, OSError):
+            pass  # already gone
+        logger.info("device_ws_closed_by_server", extra={"device_id": str(device_id), "code": code})
         return True
 
     # --- commands -----------------------------------------------------
-    async def _send(self, conn: DeviceConnection, message: dict[str, Any]) -> None:
+    async def close_socket(self, conn: DeviceConnection, code: int, reason: str) -> None:
+        """Closes one (already unregistered) socket, bounded by the send timeout."""
+        try:
+            await asyncio.wait_for(self._locked_close(conn, code, reason), get_settings().device_ws_send_timeout_seconds)
+        except (TimeoutError, WebSocketDisconnect, RuntimeError, OSError):
+            pass  # gone or stalled; its handler cleans up when the transport fails
+
+    async def _locked_close(self, conn: DeviceConnection, code: int, reason: str) -> None:
+        async with conn.send_lock:
+            await conn.websocket.close(code=code, reason=reason)
+
+    async def _locked_send(self, conn: DeviceConnection, message: dict[str, Any]) -> None:
         async with conn.send_lock:
             await conn.websocket.send_json(message)
+
+    async def send(self, conn: DeviceConnection, message: dict[str, Any]) -> None:
+        """Bounded by DEVICE_WS_SEND_TIMEOUT_SECONDS (waiting for the lock included), so one
+        pillbox whose TCP connection stalled cannot hang the caregiver request that notifies it.
+        A timeout drops the socket and raises TimeoutError (an OSError, like a broken pipe)."""
+        try:
+            await asyncio.wait_for(self._locked_send(conn, message), get_settings().device_ws_send_timeout_seconds)
+        except TimeoutError:
+            logger.warning("device_ws_send_timeout", extra={"device_id": str(conn.device_id)})
+            self.unregister(conn)
+            # Close it in the background (also bounded) so the device notices and reconnects.
+            task = asyncio.get_running_loop().create_task(
+                self.close_socket(conn, WS_CLOSE_INTERNAL_ERROR, "send timed out")
+            )
+            self._closing.add(task)
+            task.add_done_callback(self._closing.discard)
+            raise
 
     def _envelope(self, command: DeviceCommand, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -145,7 +210,7 @@ class ConnectionManager:
         started = timing.now_ms()
         try:
             try:
-                await self._send(conn, message)
+                await self.send(conn, message)
             except (WebSocketDisconnect, RuntimeError, OSError) as exc:
                 record.status = "DISCONNECTED"
                 raise DeviceDisconnectedError(command_id) from exc
@@ -180,7 +245,7 @@ class ConnectionManager:
             return False
         message = self._envelope(command, payload)
         try:
-            await self._send(conn, message)
+            await self.send(conn, message)
         except (WebSocketDisconnect, RuntimeError, OSError):
             return False
         self.history.append(
@@ -202,7 +267,8 @@ class ConnectionManager:
         pending.future.set_result(
             CommandAck(
                 command_id=command_id,
-                ok=bool(message.get("ok", False)),
+                # Only a JSON true is success: a string "false" is truthy.
+                ok=message.get("ok") is True,
                 result=result if isinstance(result, dict) else None,
                 error=str(error) if error is not None else None,
                 acked_at=datetime.now(UTC),

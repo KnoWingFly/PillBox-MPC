@@ -24,3 +24,25 @@ BACKGROUND = "#0F172A"
 TEXT_LIGHT = "#F8FAFC"
 TEXT_MUTED = "#94A3B8"
 TEXT_DARK = "#475569"
+
+# Dose LED while a chamber is popped up (breathing): yellow before meal, blue after meal.
+LED_BEFORE_MEAL = "#FACC15"   # Yellow 400
+LED_AFTER_MEAL = "#3B82F6"    # Blue 500
+
+# LCD alerts and sound badge
+LCD_ALERT = "#F87171"         # Red 400: stock empty
+LCD_REFILL_BORDER = IDLE_COLOR
+SOUND_BADGE_BG = "#FBBF24"    # Amber 400
+SOUND_BADGE_TEXT = WINDOW_BG
+
+# Lab workbench and status bar
+BUTTON_BG = CHASSIS_BORDER
+BUTTON_HOVER_BG = IDLE_COLOR
+BUTTON_TEXT = TEXT_LIGHT
+STATUS_BAR_TEXT = "#888888"
+WIFI_ONLINE_BG = "#065F46"    # Emerald 800
+WIFI_OFFLINE_BG = "#7F1D1D"   # Red 900
+REFILL_ACTIVE_BG = "#0E7490"  # Cyan 700
+STATUS_OK = "#6EE7B7"         # Emerald 300: paired
+STATUS_WARN = "#FCD34D"       # Amber 300: waiting for pairing / outbox not empty
+STATUS_ERROR = "#FCA5A5"      # Red 300: not registered, key rejected, server unreachable

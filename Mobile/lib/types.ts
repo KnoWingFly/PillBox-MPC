@@ -20,7 +20,8 @@ export interface Slot {
 export interface DeviceStatus {
   deviceName: string;
   online: boolean;
-  batteryPercent: number;
+  /** null until the pillbox reports it. */
+  batteryPercent: number | null;
   wifiLabel: string;
   /** Epoch milliseconds of the last successful sync. */
   lastSyncedAt: number;

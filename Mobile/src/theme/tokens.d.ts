@@ -16,5 +16,6 @@ export declare const colors: {
 };
 export declare const spacing: { xs: 4; sm: 8; md: 12; lg: 16; xl: 24; xxl: 32 };
 export declare const radius: { sm: 8; md: 12; lg: 16; xl: 24; full: 9999 };
-export declare const fontSize: Record<'caption' | 'body-sm' | 'body' | 'title' | 'heading' | 'display' | 'time', [number, number]>;
+export declare const fontSize: Record<'caption' | 'body-sm' | 'body' | 'title' | 'heading' | 'display' | 'time' | 'hero', [number, number]>;
 export declare const shadow: { card: string; raised: string };
+export declare const breakpoints: { md: number; lg: number; xl: number; '2xl': number };

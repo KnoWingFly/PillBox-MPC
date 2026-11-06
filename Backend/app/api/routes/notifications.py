@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Response, status
 
 from app.api.deps import CurrentUser, DbSession, PaginationDep, SettingsDep
+from app.core.errors import unprocessable
 from app.schemas.journal import ManualConfirmationOut
 from app.schemas.notifications import (
     ConfirmTakenIn,
@@ -31,8 +32,11 @@ async def list_notifications(
     pagination: PaginationDep,
     tab: Tab = Query("ALL"),
     elderly_id: UUID | None = Query(None),
+    device_id: UUID | None = Query(None, description="only this pillbox's feed (plus its elderly's device-less rows)"),
 ) -> NotificationPage:
-    items, total, unread = await svc.list_feed(db, user, tab, elderly_id, pagination.offset, pagination.limit)
+    items, total, unread = await svc.list_feed(
+        db, user, tab, elderly_id, pagination.offset, pagination.limit, device_id=device_id
+    )
     return NotificationPage(unread_count=unread, data=items, page=pagination.page, limit=pagination.limit, total=total)
 
 
@@ -45,11 +49,20 @@ async def read_all(user: CurrentUser, db: DbSession) -> ReadAllOut:
 async def delete_all(
     user: CurrentUser,
     db: DbSession,
-    up_to_created_at: datetime = Query(..., description="created_at of the newest notification the user saw"),
-    up_to_id: UUID = Query(..., description="its id (tie-break)"),
+    up_to_created_at: datetime | None = Query(None, description="created_at of the newest notification the user saw"),
+    up_to_id: UUID | None = Query(None, description="its id (tie-break)"),
+    device_id: UUID | None = Query(None, description="only this pillbox's notifications"),
 ) -> DeleteAllOut:
-    """ "Hapus semua": the caller's notifications at or older than (up_to_created_at, up_to_id)."""
-    return DeleteAllOut(deleted=await svc.delete_up_to(db, user, up_to_created_at, up_to_id))
+    """ "Hapus semua": the caller's notifications at or older than (up_to_created_at, up_to_id),
+    optionally only one pillbox's (Mobile/BACKEND_HANDOFF.md item 3: one call instead of one
+    DELETE per row). Without device_id the boundary is required."""
+    if (up_to_created_at is None) != (up_to_id is None) or (device_id is None and up_to_id is None):
+        raise unprocessable(
+            "VALIDATION_ERROR",
+            "Send up_to_created_at and up_to_id together; they are required without device_id",
+        )
+    boundary = (up_to_created_at, up_to_id) if up_to_created_at is not None and up_to_id is not None else None
+    return DeleteAllOut(deleted=await svc.delete_up_to(db, user, boundary, device_id))
 
 
 @router.delete("/{notification_id}", status_code=status.HTTP_204_NO_CONTENT)

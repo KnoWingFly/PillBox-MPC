@@ -42,8 +42,8 @@ router = APIRouter(prefix="/devices", tags=["devices"])
 
 
 @router.post("/pairing/scan", response_model=PairingScanOut)
-async def pairing_scan(body: PairingScanIn, _: CurrentUser, db: DbSession) -> PairingScanOut:
-    return await svc.scan(db, body.device_qr_payload)
+async def pairing_scan(body: PairingScanIn, user: CurrentUser, db: DbSession, settings: SettingsDep) -> PairingScanOut:
+    return await svc.scan(db, user, body.device_qr_payload, settings)
 
 
 @router.post("", response_model=PairDeviceOut, status_code=status.HTTP_201_CREATED)
@@ -53,10 +53,14 @@ async def pair_device(body: PairDeviceIn, user: CurrentUser, db: DbSession, sett
 
 @router.get("", response_model=DeviceList)
 async def list_devices(
-    user: CurrentUser, db: DbSession, settings: SettingsDep, elderly_id: UUID | None = Query(None)
+    user: CurrentUser,
+    db: DbSession,
+    settings: SettingsDep,
+    pagination: PaginationDep,
+    elderly_id: UUID | None = Query(None),
 ) -> DeviceList:
-    items = await svc.list_devices(db, user, elderly_id, settings)
-    return DeviceList(data=items, total=len(items))
+    items, total = await svc.list_devices(db, user, elderly_id, settings, pagination.offset, pagination.limit)
+    return DeviceList(data=items, page=pagination.page, limit=pagination.limit, total=total)
 
 
 @router.post("/{device_id}/join", response_model=JoinDeviceOut)
@@ -133,6 +137,21 @@ async def trigger_alarm(
 ) -> CommandResultOut:
     """Rings the pillbox (OWNER/ADMIN). Succeeds only after the device acks."""
     return await svc.trigger_alarm(db, user, device_id, body.slot_number, body.duration_seconds, settings)
+
+
+@router.delete(
+    "/{device_id}/alarm",
+    response_model=CommandResultOut,
+    responses={
+        409: {"description": "DEVICE_OFFLINE or DEVICE_COMMAND_CHANNEL_UNAVAILABLE"},
+        502: {"description": "DEVICE_DISCONNECTED or DEVICE_REJECTED_COMMAND"},
+        504: {"description": "DEVICE_ACK_TIMEOUT"},
+    },
+)
+async def stop_alarm(device_id: UUID, user: CurrentUser, db: DbSession, settings: SettingsDep) -> CommandResultOut:
+    """Stops an alarm a caregiver started (OWNER/ADMIN); dose reminders keep ringing.
+    Succeeds only after the device acks."""
+    return await svc.stop_alarm(db, user, device_id, settings)
 
 
 @router.get("/{device_id}/events", response_model=DeviceEventPage)

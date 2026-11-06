@@ -13,26 +13,66 @@ start-up, at midnight and when the clock moves backwards (restore_day).
 
 from __future__ import annotations
 
+import functools
+import logging
 from datetime import datetime, time, timedelta
 from typing import Callable
 
+from smart_pillbox import config
 from smart_pillbox.db.database import Database
 from smart_pillbox.core.rtc import SimulatedClock
-from smart_pillbox.models import ChamberState, Compartment
+from smart_pillbox.models import ChamberState, Compartment, parse_hhmm
+
+logger = logging.getLogger(__name__)
+
+# Distinct schedule times seen by _parse_hhmm (2 per chamber, plus a few old ones after edits).
+_PARSE_CACHE_SIZE = 64
 
 
-def _today_scheduled_datetime(compartment: Compartment, today: datetime) -> datetime:
-    hour, minute = map(int, compartment.schedule_time.split(":"))
-    return today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+@functools.lru_cache(maxsize=_PARSE_CACHE_SIZE)
+def _parse_hhmm(value: object) -> time | None:
+    """"HH:MM" -> time, or None (logged once per bad value) so one broken slot never stops the
+    tick loop for the other slots."""
+    try:
+        return parse_hhmm(value)
+    except ValueError:
+        logger.error("Ignoring a schedule with an unreadable time %r.", value)
+        return None
+
+
+def _today_scheduled_datetime(compartment: Compartment, today: datetime) -> datetime | None:
+    """When the compartment's window starts on `today`'s date; None when its time is unreadable."""
+    start = _parse_hhmm(compartment.schedule_time)
+    if start is None:
+        return None
+    return datetime.combine(today.date(), start)
 
 
 def _deadline(compartment: Compartment, due_at: datetime) -> datetime:
-    return due_at + timedelta(minutes=compartment.tolerance_minutes)
+    """window_end + tolerance, like the backend (contract §5); window_start + tolerance when the
+    config sent no window_end. A window_end before window_start ends on the next day."""
+    end_time = _parse_hhmm(compartment.window_end) if compartment.window_end else None
+    end = due_at if end_time is None else datetime.combine(due_at.date(), end_time)
+    if end < due_at:
+        end += timedelta(days=1)
+    return end + timedelta(minutes=compartment.tolerance_minutes)
 
 
 def _scheduled_on(compartment: Compartment, day: datetime) -> bool:
     """days_of_week uses 1=Monday ... 7=Sunday; an empty list means every day."""
     return compartment.is_active and (not compartment.days_of_week or day.isoweekday() in compartment.days_of_week)
+
+
+def _window_closed(compartment: Compartment, now: datetime) -> bool:
+    """Today's window of this compartment already ended (False when it has no readable time)."""
+    due_at = _today_scheduled_datetime(compartment, now)
+    return due_at is not None and now >= _deadline(compartment, due_at)
+
+
+def _dose_key(compartment: Compartment, fallback: datetime) -> tuple[int, str]:
+    """_actioned_today key: the date the dose was SCHEDULED for, not when it was actioned, so a
+    deadline after midnight does not mark the next day's dose as done."""
+    return compartment.id, (compartment.due_at or fallback).date().isoformat()
 
 
 class PillboxScheduler:
@@ -44,8 +84,8 @@ class PillboxScheduler:
         self._queue: list[int] = []
         self._actioned_today: set[tuple[int, str]] = set()  # (compartment_id, iso-date)
 
-        # Refill mode
-        self.is_refill_mode: bool = False
+        # Refill mode survives a restart (it is also set by the config and the refill_mode command).
+        self.is_refill_mode: bool = db.get_device_state(config.STATE_IS_REFILL_MODE) == config.STATE_TRUE
 
         # GUI (or tests) can append callables here; called with the Compartment.
         self.on_activated: list[Callable[[Compartment], None]] = []
@@ -64,21 +104,27 @@ class PillboxScheduler:
         compartments = self.db.get_compartments()
         self.compartments: dict[int, Compartment] = {c.id: c for c in compartments}
 
-    def reload_schedules(self) -> None:
+    def set_refill_mode(self, enabled: bool) -> None:
+        self.is_refill_mode = enabled
+        self.db.update_device_state(config.STATE_IS_REFILL_MODE, config.STATE_TRUE if enabled else config.STATE_FALSE)
+
+    def reload_schedules(self, fresh_compartments: list[Compartment] | None = None) -> None:
         """Applies a freshly pulled config (schedule time, tolerance, days,
         active flag) to the live chambers without losing their runtime state
-        (an alarm that is ringing keeps ringing).
+        (an alarm that is ringing keeps ringing). fresh_compartments: already read from the
+        database (by the sync worker, off the GUI thread); read here when not given.
 
         A chamber whose timing changed is re-armed for today: otherwise a slot
         that was already TAKEN/MISSED today would ignore its new time until
         tomorrow, and the caregiver's change would look like it did nothing."""
-        for fresh in self.db.get_compartments():
+        for fresh in fresh_compartments if fresh_compartments is not None else self.db.get_compartments():
             current = self.compartments.get(fresh.id)
             if current is None:
                 self.compartments[fresh.id] = fresh
                 continue
             timing_changed = (
                 current.schedule_time != fresh.schedule_time
+                or current.window_end != fresh.window_end
                 or current.days_of_week != fresh.days_of_week
                 or current.is_active != fresh.is_active
             )
@@ -91,6 +137,8 @@ class PillboxScheduler:
                 if current.id in self._queue:
                     self._queue.remove(current.id)
             current.schedule_time = fresh.schedule_time
+            current.window_end = fresh.window_end
+            current.schedule_id = fresh.schedule_id
             current.tolerance_minutes = fresh.tolerance_minutes
             current.medication_name = fresh.medication_name
             current.days_of_week = fresh.days_of_week
@@ -99,7 +147,7 @@ class PillboxScheduler:
                 # A time whose window already closed today starts tomorrow, as on the backend
                 # (it never creates doses from before the schedule existed): no instant MISSED.
                 now = self.clock.now()
-                if _scheduled_on(current, now) and now >= _deadline(current, _today_scheduled_datetime(current, now)):
+                if _scheduled_on(current, now) and _window_closed(current, now):
                     self._actioned_today.add((current.id, now.date().isoformat()))
 
     def restore_day(self) -> None:
@@ -129,6 +177,8 @@ class PillboxScheduler:
             if not _scheduled_on(compartment, now):
                 continue
             due_at = _today_scheduled_datetime(compartment, now)
+            if due_at is None:
+                continue
             # Only events of the current schedule time count (a pop-up is never before it).
             seen = [etype for at, etype in outcomes.get(compartment.id, []) if at >= due_at]
             if seen:
@@ -137,6 +187,7 @@ class PillboxScheduler:
                 compartment.state = ChamberState.MISSED  # the window closed while the device was off
             else:
                 continue
+            compartment.due_at = due_at  # keeps the dose date (see _dose_key, release_late)
             self._actioned_today.add((compartment.id, today_key))
         for cb in self.on_restored:
             cb()
@@ -144,7 +195,8 @@ class PillboxScheduler:
     # -- main loop, call this from a QTimer every ~1s --------------------------
     def tick(self) -> None:
         now = self.clock.now()
-        if self._last_tick_at is not None and (now.date() != self._day or now < self._last_tick_at - timedelta(seconds=1)):
+        guard = timedelta(seconds=config.CLOCK_BACKWARDS_GUARD_SECONDS)
+        if self._last_tick_at is not None and (now.date() != self._day or now < self._last_tick_at - guard):
             # Midnight (a new day of doses) or the clock was set back.
             self.restore_day()
         self._last_tick_at = now
@@ -156,7 +208,15 @@ class PillboxScheduler:
                 continue
 
             if compartment.state != ChamberState.IDLE:
-                continue  # already TAKEN/MISSED for today
+                if compartment.due_at is None or compartment.due_at.date() >= now.date():
+                    continue  # already TAKEN/MISSED for today
+                # Yesterday's dose whose deadline ran past midnight (restore_day left it ACTIVE then):
+                # done now, so today's dose of this chamber may pop up.
+                compartment.state = ChamberState.IDLE
+                compartment.activated_at = None
+                compartment.due_at = None
+                for cb in self.on_restored:
+                    cb()
             if not compartment.is_active:
                 continue  # no schedule configured for this chamber
             if (compartment.id, today_key) in self._actioned_today:
@@ -165,9 +225,10 @@ class PillboxScheduler:
                 continue
 
             due_at = _today_scheduled_datetime(compartment, now)
-            if now < due_at:
+            if due_at is None or now < due_at:
                 continue
             if now >= _deadline(compartment, due_at):
+                compartment.due_at = due_at
                 self._miss_unattended(compartment, now)  # the clock jumped past the whole window
             else:
                 self._due(compartment, due_at, now)
@@ -186,7 +247,7 @@ class PillboxScheduler:
         another chamber). No ALARM_TIMEOUT: the device never rang; the backend's rules engine
         decides MISSED for the dose on its own."""
         compartment.state = ChamberState.MISSED
-        self._actioned_today.add((compartment.id, now.date().isoformat()))
+        self._actioned_today.add(_dose_key(compartment, now))
         if compartment.id in self._queue:
             self._queue.remove(compartment.id)
         for cb in self.on_missed:
@@ -201,14 +262,13 @@ class PillboxScheduler:
             cb(compartment)
 
     def _check_tolerance(self, compartment: Compartment, now: datetime) -> None:
-        assert compartment.activated_at is not None
-        deadline = compartment.release_until or _deadline(compartment, compartment.due_at or compartment.activated_at)
+        started = compartment.due_at or compartment.activated_at or now
+        deadline = compartment.release_until or _deadline(compartment, started)
         if now >= deadline:
             compartment.state = ChamberState.MISSED
             compartment.release_until = None
             compartment.door_open = False
-            today_key = now.date().isoformat()
-            self._actioned_today.add((compartment.id, today_key))
+            self._actioned_today.add(_dose_key(compartment, started))
             # Stamped at the deadline, not "now": after a clock jump the timeout still lands
             # inside the dose window the backend matches it against.
             self.db.log_event(compartment.id, compartment.slot_number, "ALARM_TIMEOUT", min(now, deadline))
@@ -249,13 +309,15 @@ class PillboxScheduler:
             if compartment.stock_count > 0:
                 compartment.stock_count = self.db.update_stock(compartment.slot_number, -1)
             
-            # Estimate chime count (assume 1 chime per second, up to 60 per minute)
-            elapsed_seconds = (now - compartment.activated_at).total_seconds()
-            chimes = int(elapsed_seconds / 2) # approx 1 every 2 seconds
-            
+            # Estimate chime count: about one chime per CHIME_ESTIMATE_SECONDS popped up.
+            elapsed_seconds = (now - (compartment.activated_at or now)).total_seconds()
+            # Never negative: the RTC may have been set back while the chamber was up, and the
+            # backend rejects a negative chime_count.
+            chimes = max(0, int(elapsed_seconds / config.CHIME_ESTIMATE_SECONDS))
+
             self.db.log_event(compartment_id, compartment.slot_number, "COMPARTMENT_OPENED", now, chime_count=chimes)
-            
-            self._actioned_today.add((compartment_id, now.date().isoformat()))
+
+            self._actioned_today.add(_dose_key(compartment, now))
             if self.active_chamber_id == compartment_id:
                 self.active_chamber_id = None
             for cb in self.on_taken:
@@ -317,7 +379,7 @@ class PillboxScheduler:
             compartment.due_at = None
             compartment.release_until = None
             compartment.door_open = False
-            if _scheduled_on(compartment, now) and now >= _deadline(compartment, _today_scheduled_datetime(compartment, now)):
+            if _scheduled_on(compartment, now) and _window_closed(compartment, now):
                 self._actioned_today.add((compartment.id, now.date().isoformat()))
         self.active_chamber_id = None
 
@@ -330,7 +392,7 @@ class PillboxScheduler:
         for c in self.compartments.values():
             if c.state == ChamberState.IDLE and _scheduled_on(c, now):
                 sched_dt = _today_scheduled_datetime(c, now)
-                if sched_dt >= now:
+                if sched_dt is not None and sched_dt >= now:
                     candidates.append((sched_dt, c))
 
         if not candidates:
@@ -339,11 +401,12 @@ class PillboxScheduler:
         candidates.sort(key=lambda item: (item[0], item[1].slot_number))
         return candidates[0][1]
 
-    def release_late(self, slot_number: int, until: datetime) -> str | None:
+    def release_late(self, slot_number: int, until: datetime, scheduled_for: datetime | None = None) -> str | None:
         """A caregiver re-opened a MISSED dose from the app ("Buka bilik sekarang", backend
         command release_slot): pop the chamber up again until `until`. Opening it then logs
         COMPARTMENT_OPENED, which the backend records as taken late. Returns why it cannot
-        (shown to the caregiver), or None when the chamber popped up."""
+        (shown to the caregiver), or None when the chamber popped up. `scheduled_for` (the
+        dose's window start) keeps a released dose of yesterday from blocking today's."""
         compartment = next((c for c in self.compartments.values() if c.slot_number == slot_number), None)
         now = self.clock.now()
         if compartment is None:
@@ -361,8 +424,10 @@ class PillboxScheduler:
         compartment.state = ChamberState.ACTIVE
         compartment.activated_at = now
         compartment.release_until = until
+        if scheduled_for is not None:
+            compartment.due_at = scheduled_for
         self.active_chamber_id = compartment.id
-        self._actioned_today.add((compartment.id, now.date().isoformat()))
+        self._actioned_today.add(_dose_key(compartment, now))
         self.db.log_event(compartment.id, compartment.slot_number, "POPUP_ACTIVATED", now)
         for cb in self.on_activated:
             cb(compartment)
@@ -373,7 +438,7 @@ class PillboxScheduler:
         "jump to next dose" control."""
         now = self.clock.now()
         today_key = now.date().isoformat()
-        for offset in range(8):
+        for offset in range(config.DAYS_PER_WEEK + 1):
             day = now + timedelta(days=offset)
             times = [
                 _today_scheduled_datetime(c, day)
@@ -381,7 +446,7 @@ class PillboxScheduler:
                 if _scheduled_on(c, day)
                 and (offset > 0 or (c.state == ChamberState.IDLE and (c.id, today_key) not in self._actioned_today))
             ]
-            upcoming = [t for t in times if t > now]
+            upcoming = [t for t in times if t is not None and t > now]
             if upcoming:
                 return min(upcoming)
         return None

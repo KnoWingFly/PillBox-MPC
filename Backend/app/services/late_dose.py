@@ -40,6 +40,8 @@ from app.services.access import get_device_for_user
 from app.services.adherence import dose_instants, is_scheduled_on
 from app.services.connection_manager import DeviceCommand
 from app.services.device_clock import device_now
+from app.services.error_messages import DOSE_NOT_MISSED, LATE_DOSE_TOO_LATE, error_text
+from app.services.notifications import NOTE_CONFIRMED_FROM_NOTIFICATION, note_texts, text_for
 from app.services.timeutil import zone
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,8 @@ async def release_cutoff(
     session: AsyncSession, device_id: UUID, log: TelemetryLog, tz: ZoneInfo, settings: Settings
 ) -> datetime:
     """Latest moment a missed dose may still be taken."""
-    assert log.scheduled_for is not None and log.scheduled_date is not None
+    if log.scheduled_for is None or log.scheduled_date is None:
+        raise conflict("NOT_A_DOSE_NOTIFICATION", "This notification is not about a scheduled dose")
     schedules = (
         await session.execute(
             select(Schedule).where(
@@ -63,13 +66,14 @@ async def release_cutoff(
     ).scalars().all()
     upcoming = []
     for schedule in schedules:
-        for offset in range(3):
+        for offset in range(settings.late_release_lookahead_days + 1):
             day = log.scheduled_date + timedelta(days=offset)
             if not is_scheduled_on(schedule.days_of_week, day):
                 continue
             inst = dose_instants(day, schedule.window_start, schedule.window_end, schedule.tolerance_minutes, tz)
             if inst.scheduled_for > log.scheduled_for:
                 upcoming.append(inst.scheduled_for)
+    # No other dose in the lookahead: the same slot tomorrow is the next one.
     next_dose = min(upcoming, default=log.scheduled_for + timedelta(days=1))
     return log.scheduled_for + (next_dose - log.scheduled_for) * settings.late_release_cutoff_fraction
 
@@ -77,26 +81,27 @@ async def release_cutoff(
 def _too_late(cutoff: datetime, tz: ZoneInfo) -> Exception:
     return conflict(
         "LATE_DOSE_TOO_LATE",
-        f"Sudah lewat batas aman (pukul {cutoff.astimezone(tz):%H:%M}): terlalu dekat dengan jadwal berikutnya. "
-        "Jangan diminum, tunggu jadwal berikutnya.",
+        error_text(LATE_DOSE_TOO_LATE, cutoff=f"{cutoff.astimezone(tz):%H:%M}"),
         details={"cutoff_at": cutoff.isoformat()},
     )
 
 
 async def _missed_dose(
-    session: AsyncSession, user: User, notification_id: UUID
+    session: AsyncSession, user: User, notification_id: UUID, *, lock: bool = True
 ) -> tuple[Notification, TelemetryLog, Device]:
-    """The missed dose behind one of the caregiver's notifications, locked; OWNER/ADMIN only."""
+    """The missed dose behind one of the caregiver's notifications (locked unless lock=False);
+    OWNER/ADMIN only."""
     n = await session.get(Notification, notification_id)
     if n is None or n.user_id != user.id:
         raise not_found(message="Notification not found")
-    log = (
-        await session.execute(select(TelemetryLog).where(TelemetryLog.id == n.telemetry_log_id).with_for_update())
-    ).scalar_one_or_none() if n.telemetry_log_id else None
+    stmt = select(TelemetryLog).where(TelemetryLog.id == n.telemetry_log_id)
+    if lock:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    log = (await session.execute(stmt)).scalar_one_or_none() if n.telemetry_log_id else None
     if log is None or log.scheduled_for is None or log.slot_number is None:
         raise conflict("NOT_A_DOSE_NOTIFICATION", "This notification is not about a scheduled dose")
     if log.status != DoseStatus.MISSED:
-        raise conflict("DOSE_NOT_MISSED", "Dosis ini sudah tercatat diminum.")
+        raise conflict("DOSE_NOT_MISSED", error_text(DOSE_NOT_MISSED))
     device, _ = await get_device_for_user(session, user.id, log.device_id, EDITOR_ROLES)
     return n, log, device
 
@@ -107,10 +112,14 @@ async def release(
     # Imported here: device_management imports the notification feed chain at module level.
     from app.services.device_management import _check_pin, send_command_or_raise
 
-    n, log, device = await _missed_dose(session, user, notification_id)
+    n, log, device = await _missed_dose(session, user, notification_id, lock=False)
     if n.type != NotificationType.DOSE_MISSED:
         raise conflict("NOT_A_MISSED_NOTIFICATION", "Only a missed-dose notification can re-open the compartment")
+    # The PIN check (scrypt) runs with no transaction or dose-row lock held; the dose is then
+    # locked and re-checked (it may have been taken meanwhile).
+    await session.commit()
     await _check_pin(user.id, device, pin, settings, "DEVICE_PIN_INCORRECT")
+    n, log, device = await _missed_dose(session, user, notification_id)
     tz = zone(device.timezone)
     clock = device_now(device, now, settings)
     cutoff = await release_cutoff(session, device.id, log, tz, settings)
@@ -163,7 +172,10 @@ async def confirm_taken(
     if clock >= cutoff:
         raise _too_late(cutoff, tz)
     body = ManualConfirmationIn(
-        override_status="TAKEN_LATE", confirmed_at=clock, note=note or "Dikonfirmasi dari notifikasi"
+        override_status="TAKEN_LATE",
+        confirmed_at=clock,
+        # A caregiver's note is stored as written; the default one in their own language.
+        note=note or text_for(note_texts(NOTE_CONFIRMED_FROM_NOTIFICATION), user.interface_language),
     )
     return await journal.manual_confirmation(session, user, log.id, body, now, settings)
 
