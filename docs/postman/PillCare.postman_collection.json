@@ -1436,6 +1436,131 @@
       ]
     },
     {
+      "name": "Access control demo",
+      "description": "Membuktikan caregiver yang tidak terhubung ke perangkat orang lain tidak dapat mengubah jadwal. Gunakan perangkat/jadwal akun utama yang sudah ada; akun kedua harus terdaftar dan tidak boleh bergabung ke lansia/perangkat tersebut.",
+      "item": [
+        {
+          "name": "Log in as unrelated caregiver",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{auth_base_url}}/api/auth/login",
+              "host": [
+                "{{auth_base_url}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Login akun caregiver kedua yang tidak memiliki hubungan dengan lansia pemilik perangkat. Token disimpan terpisah dari sesi akun utama.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{other_caregiver_email}}\",\n  \"password\": \"{{other_caregiver_password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Login akun kedua berhasil', () => pm.expect(pm.response.code).to.equal(200));",
+                  "if (pm.response.code === 200) {",
+                  "  const token = pm.response.json().access_token;",
+                  "  pm.environment.set('other_caregiver_access_token', token);",
+                  "  pm.test('Token akun kedua tersimpan di environment', () => pm.expect(token).to.be.a('string').and.not.empty);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Try to update the first caregiver schedule",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_caregiver_access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/devices/:device_id/schedules/:schedule_id",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                ":device_id",
+                "schedules",
+                ":schedule_id"
+              ],
+              "variable": [
+                {
+                  "key": "device_id",
+                  "value": "{{device_id}}",
+                  "description": "ID perangkat milik akun caregiver utama."
+                },
+                {
+                  "key": "schedule_id",
+                  "value": "{{schedule_id}}",
+                  "description": "ID jadwal milik perangkat akun caregiver utama."
+                }
+              ]
+            },
+            "description": "Jalankan setelah login dengan akun utama dan setelah `device_id` serta `schedule_id` menunjuk perangkat/jadwal akun utama. Request memakai token caregiver kedua. Karena ia bukan anggota lansia terkait, hasil yang diharapkan adalah 404 `NOT_FOUND` (resource disembunyikan dari pengguna yang tidak terkait). Body mencoba mengubah nama obat; server seharusnya tidak menerapkan perubahan.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"medication_name\": \"Unauthorized change attempt\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Unrelated caregiver cannot update the schedule (404)', () => pm.expect(pm.response.code).to.equal(404));",
+                  "pm.test('Response hides the unrelated resource', () => pm.expect(pm.response.json().error.code).to.equal('NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "Account",
       "description": "Profil caregiver, preferensi aplikasi, dan token push. Berada di server auth.",
       "item": [
