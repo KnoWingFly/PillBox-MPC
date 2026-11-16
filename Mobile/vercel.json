@@ -1,0 +1,15 @@
+{
+  "buildCommand": "pnpm exec prisma generate && pnpm exec expo export --platform web",
+  "outputDirectory": "dist/client",
+  "functions": {
+    "api/index.ts": {
+      "includeFiles": "dist/server/**"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
+  ]
+}

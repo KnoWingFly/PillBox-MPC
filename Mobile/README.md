@@ -63,6 +63,37 @@ For iOS, configure a Google iOS OAuth client for the app's bundle ID, add it to 
 reversed iOS client ID (`com.googleusercontent.apps.<client-id-prefix>`) before generating the
 development build. An iOS build requires macOS/Xcode or an EAS Build environment.
 
+### Deploy the web app and auth API to Vercel
+
+Create a Vercel project for this repository and set **Root Directory** to `Mobile`. The
+`vercel.json` here builds the Expo web server and routes requests through Expo Router API routes.
+The build command also generates the Prisma client; Vercel serves static assets from `dist/client`.
+
+Add these values in **Vercel → Project Settings → Environment Variables**. Use different URLs and
+credentials for Preview and Production as appropriate:
+
+- Required server variables: `DATABASE_URL` (Supabase transaction pooler), `DIRECT_URL` (database
+  direct/session connection), `JWT_ACCESS_SECRET` (at least 32 characters and identical to the
+  Backend's value), `EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_KEY`, and
+  `SUPABASE_SECRET_KEY`.
+- Required client build variables: `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_KEY`.
+  These are public Supabase values; all `EXPO_PUBLIC_*` variables are included in the web bundle.
+- Set `EXPO_PUBLIC_PILLBOX_API_URL` to the deployed Backend HTTPS base URL to use real devices
+  instead of mock dashboard data.
+- For native app builds that call the auth API, set `EXPO_PUBLIC_API_URL` to this Vercel deployment
+  URL. Leave it empty for the web app, which calls the API on the same origin.
+- For native Google sign-in, set `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID`. For hosted web sign-in,
+  add `https://<your-vercel-domain>/auth/google-callback` to Supabase's allowed redirect URLs and
+  the Vercel origin to Google Cloud's authorized JavaScript origins. The Google client secret
+  belongs in Supabase, not in Vercel or an `EXPO_PUBLIC_*` variable.
+- To send password-reset emails, set `RESEND_API_KEY` and `EMAIL_FROM`. `OTP_PEPPER` is optional;
+  if set, keep it server-only and stable.
+
+Never put `JWT_ACCESS_SECRET`, `SUPABASE_SECRET_KEY`, database URLs, Resend keys, or OTP peppers
+in an `EXPO_PUBLIC_*` variable. Copy the variable names and connection-string format from
+`.env.example`, but enter real values directly in Vercel rather than committing them. Redeploy after
+changing client build variables.
+
 ### Other setup steps
 
 - To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
