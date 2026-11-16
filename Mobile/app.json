@@ -24,7 +24,8 @@
       "package": "com.knowingfly.pillcareapp"
     },
     "web": {
-      "output": "server",
+      "bundler": "metro",
+      "output": "single",
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
