@@ -2,7 +2,7 @@
   "buildCommand": "pnpm exec prisma generate && pnpm exec expo export --platform web",
   "outputDirectory": "dist/client",
   "functions": {
-    "api/index.ts": {
+    "api/index.js": {
       "includeFiles": "dist/server/**"
     }
   },
