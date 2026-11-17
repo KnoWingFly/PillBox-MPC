@@ -1,9 +1,9 @@
 {
-  "buildCommand": "pnpm exec prisma generate && pnpm exec expo export --platform web",
+  "buildCommand": "pnpm exec prisma generate && pnpm exec expo export --platform web && node scripts/copy-prisma-engine.js",
   "outputDirectory": "dist/client",
   "functions": {
     "api/index.js": {
-      "includeFiles": "{dist/server/**,node_modules/.pnpm/@prisma+client*/node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node}"
+      "includeFiles": "dist/server/**"
     }
   },
   "rewrites": [
