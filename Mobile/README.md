@@ -39,10 +39,20 @@ This command will move the starter code to the **app-example** directory and cre
 
 The website uses Supabase's Google OAuth redirect. Configure the Google provider in the Supabase
 Dashboard with a Google **Web application** OAuth client ID and secret. In Google Cloud, add the
-website origin (for local development, `http://localhost:8081`) as an authorized JavaScript origin,
-and add the Supabase callback URL shown on the Supabase Google provider page as an authorized
-redirect URI. In Supabase URL Configuration, allow the app callback URL
-`http://localhost:8081/auth/google-callback`.
+website origins (for example, `https://mpc-mobile.vercel.app` and, for local development,
+`http://localhost:8081`) as authorized JavaScript origins. Add the **Supabase callback URL** shown
+on the Supabase Google provider page as Google's authorized redirect URI; this is not the app
+callback URL.
+
+In Supabase **Authentication → URL Configuration**, set the **Site URL** to
+`https://mpc-mobile.vercel.app` and add these app callback URLs to the redirect allowlist:
+
+- `https://mpc-mobile.vercel.app/auth/google-callback`
+- `http://localhost:8081/auth/google-callback` (local development)
+
+The web app sends the current website origin as Supabase's `redirectTo`. If that URL is not allowed,
+Supabase falls back to the Site URL, which can send users to an old `localhost` address if the Site
+URL is still configured for local development.
 
 Set `EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_KEY`, and `SUPABASE_SECRET_KEY` in the local
 environment; the last value is server-only. The auth API also needs its normal database and
@@ -67,7 +77,8 @@ development build. An iOS build requires macOS/Xcode or an EAS Build environment
 
 Create a Vercel project for this repository and set **Root Directory** to `Mobile`. The
 `vercel.json` here builds the Expo web server and routes requests through Expo Router API routes.
-The build command also generates the Prisma client; Vercel serves static assets from `dist/client`.
+The build command also generates Prisma's Vercel Linux query engine and includes it in the server
+function bundle; Vercel serves static assets from `dist/client`.
 
 Add these values in **Vercel → Project Settings → Environment Variables**. Use different URLs and
 credentials for Preview and Production as appropriate:
