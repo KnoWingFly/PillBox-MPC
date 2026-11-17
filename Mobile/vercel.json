@@ -3,10 +3,7 @@
   "outputDirectory": "dist/client",
   "functions": {
     "api/index.js": {
-      "includeFiles": [
-        "dist/server/**",
-        "node_modules/.pnpm/@prisma+client*/node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node"
-      ]
+      "includeFiles": "{dist/server/**,node_modules/.pnpm/@prisma+client*/node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node}"
     }
   },
   "rewrites": [
