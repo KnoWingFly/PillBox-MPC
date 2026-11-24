@@ -36,16 +36,18 @@ Items marked **Decided** describe what the code already does: follow it. The oth
    - The Mobile auth server signs access tokens with HS256 using `JWT_ACCESS_SECRET` (`sub` = `users.id`). The Backend verifies them with the same `JWT_ACCESS_SECRET` (`AUTH_MODE=app_jwt`; `AUTH_MODE=supabase` exists but the app does not use it). Both `.env` files must hold the same value.
    - Never hard-code the secret; read it from env and fail fast when missing.
 
-3. **The auth server runs on the Expo dev server (`:8081`).**
-   - Problem: that host exists only during `expo start`. A real deployment needs a place to host Expo API routes (check the current Expo docs, I did not verify hosting options), or auth moves into FastAPI later.
-   - Fix: for the course demo keep it; keep auth logic in framework-agnostic modules under `Mobile/src/server/` so it can move without a rewrite.
+3. **Where the auth server runs. Decided: Vercel for the hosted web app, the Expo dev server (`:8081`) locally.**
+   - `Mobile/vercel.json` builds the Expo web server output (`expo export --platform web`, `web.output: "server"` in `app.json`) and routes every request through `Mobile/api/index.js` (`expo-server/adapter/vercel`), so the Expo API routes under `src/app/api/` run as one Vercel function. `scripts/copy-prisma-engine.js` copies Prisma's `rhel-openssl-3.0.x` query engine (`binaryTargets` in `prisma/schema.prisma`) into that function. Setup and environment variables: `Mobile/README.md`, "Deploy the web app and auth API to Vercel".
+   - Native builds call the hosted auth API through `EXPO_PUBLIC_API_URL`; the web app calls it on the same origin.
+   - Keep auth logic in framework-agnostic modules under `Mobile/src/server/` so it can still move into FastAPI later without a rewrite.
+   - Not decided: where the **Backend** (FastAPI) is hosted. It must stay one process (`Backend/CLAUDE.md`), so it cannot be a serverless function.
 
 4. **Google verification path. Decided.**
    - The app signs in with Google through Supabase Auth; `src/app/api/auth/google+api.ts` verifies the Supabase user with the admin client (`SUPABASE_SECRET_KEY`), maps it into `users` + `auth_identities` (`supabase_user_id`), and issues the app's own tokens.
 
-5. **Deleting an account can orphan an elderly profile.**
-   - Problem: `DELETE /setting` removes the user; `user_elderly_roles` rows cascade, so an OWNER's elderly profile can end up with no OWNER (the partial unique index only prevents two).
-   - Fix: reject account deletion with `409` while the user is OWNER of an elderly that still has other caregivers (they must transfer ownership first); if the user is the only caregiver, soft-delete the elderly (`deleted_at`) in the same transaction.
+5. **Deleting an account while OWNER. Decided: reject with `409`.**
+   - Problem: `DELETE /setting` removes the user; `user_elderly_roles` rows cascade, so an OWNER's elderly profile could end up with no OWNER (the partial unique index only prevents two).
+   - Implemented in `Mobile/src/app/api/setting/index+api.ts`: while the user is OWNER of any elderly profile that is not soft-deleted, account deletion answers `409 CANNOT_REMOVE_OWNER`. This applies even when the user is the only caregiver: they must transfer ownership or delete the elderly profile first. (The earlier proposal to soft-delete the elderly automatically in that case was not implemented.)
 
 6. **`notify_on_taken` default. Decided: TRUE.**
    - The code always treated a missing `notification_preferences` row as `notify_on_taken = true`. Migration `0009_notify_on_taken_default.sql` sets the column default to `TRUE` too, so behavior no longer depends on whether a row exists. Existing rows keep their value; `PUT /notification-preferences` still turns it off.
