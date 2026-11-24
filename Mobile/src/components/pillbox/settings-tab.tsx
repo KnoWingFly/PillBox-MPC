@@ -7,6 +7,7 @@ import type { Pillbox } from '@root/lib/devices';
 import type { ElderlyDetail, NotificationPreferences, PreferenceToggle } from '@root/lib/insights';
 import { SLOT_IDS, type DeviceStatus } from '@root/lib/types';
 
+import { ProfilesWithoutPillboxCard } from '../members/profiles-without-pillbox';
 import { Avatar, ListRow, SectionTitle, SwitchRow } from './blocks';
 import { ageInYears, batteryText, deviceLook } from './helpers';
 import { Button, Card, Divider, LoadErrorBox, ScreenHeader, StatusPill } from './ui';
@@ -189,6 +190,8 @@ export function SettingsTab({
   onOpenDevice,
   onAddElderly,
   onAddDevice,
+  onOpenMembers,
+  onJoinWithCode,
   onSignOut,
 }: {
   now: number;
@@ -209,6 +212,9 @@ export function SettingsTab({
   /** Omitted when profiles or pairing are unavailable (mock mode). */
   onAddElderly?: () => void;
   onAddDevice?: () => void;
+  /** Omitted when the elderly profile is unknown or in mock mode. */
+  onOpenMembers?: () => void;
+  onJoinWithCode?: () => void;
   onSignOut: () => void;
 }) {
   const version = Constants.expoConfig?.version;
@@ -223,6 +229,22 @@ export function SettingsTab({
         right={elderly ? <Text className="text-caption text-ink-muted">{S.caregivers(elderly.caregiverCount)}</Text> : undefined}
       />
       <ElderlyCard elderly={elderly} pillbox={pillbox} nowMs={pillboxNow} onCall={onCallElder} onSwitch={onOpenDevice} onAdd={onAddElderly} />
+      {(onOpenMembers || onJoinWithCode) && (
+        <Card>
+          {onOpenMembers && (
+            <ListRow
+              icon="people-outline"
+              title={S.membersTitle}
+              subtitle={elderly ? S.membersCount(elderly.caregiverCount) : undefined}
+              onPress={onOpenMembers}
+            />
+          )}
+          {onJoinWithCode && (
+            <ListRow icon="key-outline" tone="neutral" title={S.joinWithCode} subtitle={S.joinWithCodeText} onPress={onJoinWithCode} />
+          )}
+        </Card>
+      )}
+      <ProfilesWithoutPillboxCard refreshKey={pillbox?.id ?? null} />
 
       <SectionTitle
         icon="hardware-chip-outline"

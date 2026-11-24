@@ -60,6 +60,7 @@ function RootNavigator() {
         <Stack.Screen name="explore" />
         <Stack.Screen name="elderly/new" />
         <Stack.Screen name="elderly/[id]/schedule" />
+        <Stack.Screen name="elderly/[id]/members" />
       </Stack.Protected>
       <Stack.Protected guard={!signedIn} redirectTo="/">
         <Stack.Screen name="onboarding" />

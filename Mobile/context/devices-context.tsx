@@ -146,6 +146,9 @@ export function DevicesProvider({ children }: PropsWithChildren) {
   // Background refresh of online state and battery; paused while the app is in the background.
   usePolling(refresh, api.USE_MOCK ? null : AppConfig.deviceListRefreshMs);
 
+  // A role change (invited, removed, access changed) arrives as a push: reload at once.
+  useEffect(() => api.subscribeToRoleChanges(() => void refresh()), [refresh]);
+
   const select = useCallback(
     (id: string) => {
       const target = stateRef.current.all?.find((p) => p.id === id);
