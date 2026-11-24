@@ -132,12 +132,27 @@ export default function PillboxScreen() {
  */
 function PillboxGate() {
   const devices = useDevices();
-  // `/?tab=schedule&at=<ms>` opens a tab (e.g. "Atur Jadwal Obat Sekarang" after saving a profile);
-  // `at` makes the same tab requested twice count as two requests.
-  const params = useLocalSearchParams<{ tab?: string; at?: string }>();
+  // `/?tab=schedule&at=<ms>` opens a tab; `at` makes the same tab requested twice count as two
+  // requests. `device=<id>` first makes that pillbox active (a tapped push, a profile's schedule
+  // page); `pair=1` opens "Tambah pillbox".
+  const params = useLocalSearchParams<{ tab?: string; at?: string; device?: string; pair?: string }>();
   const requestedTab = isTabKey(params.tab) ? params.tab : null;
   const tabRequest = requestedTab ? { tab: requestedTab, id: params.at ?? requestedTab } : null;
+  const pairRequest = params.pair ? { id: params.at ?? params.pair } : null;
   const [carriedTab, setCarriedTab] = useState<TabKey>(requestedTab ?? 'home');
+  // A pillbox asked for through the route, applied once per request once the list is known. The
+  // dashboard remounts for the new pillbox, so the requested tab is carried over first.
+  const deviceKey = params.device && devices.pillboxes ? `${params.device}:${params.at ?? ''}` : null;
+  const [seenDeviceKey, setSeenDeviceKey] = useState<string | null>(null);
+  if (deviceKey && deviceKey !== seenDeviceKey) {
+    setSeenDeviceKey(deviceKey);
+    if (requestedTab) setCarriedTab(requestedTab);
+  }
+  const requestedDevice = seenDeviceKey ? params.device : undefined;
+  const selectDevice = devices.select;
+  useEffect(() => {
+    if (requestedDevice) selectDevice(requestedDevice);
+  }, [requestedDevice, seenDeviceKey, selectDevice]);
   // Toasts that must outlive a remount (e.g. "dihapus" after removing the active pillbox) live here.
   const [carriedToast, setCarriedToast] = useState<ToastData | null>(null);
   const hideCarried = useCallback((id: number) => {
@@ -169,7 +184,13 @@ function PillboxGate() {
       {needsPairing ? (
         <NeedsPairingScreen onCarry={carry} />
       ) : (
-        <PillboxDashboard key={devices.active?.id ?? 'none'} initialTab={carriedTab} tabRequest={tabRequest} onCarry={carry} />
+        <PillboxDashboard
+          key={devices.active?.id ?? 'none'}
+          initialTab={carriedTab}
+          tabRequest={tabRequest}
+          pairRequest={pairRequest}
+          onCarry={carry}
+        />
       )}
       {carriedToast && <Toast key={carriedToast.id} toast={carriedToast} onDone={hideCarried} />}
     </>
@@ -242,11 +263,14 @@ function signOutRequest(signOut: () => Promise<void>): ConfirmRequest {
 function PillboxDashboard({
   initialTab,
   tabRequest,
+  pairRequest,
   onCarry,
 }: {
   initialTab: TabKey;
   /** A tab asked for through the route (see PillboxGate); applied once per request id. */
   tabRequest: { tab: TabKey; id: string } | null;
+  /** "Tambah pillbox" asked for through the route; opened once per request id. */
+  pairRequest: { id: string } | null;
   onCarry: (carry: Carry) => void;
 }) {
   const devices = useDevices();
@@ -264,6 +288,11 @@ function PillboxDashboard({
   const [dashboardError, setDashboardError] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [seenPairRequest, setSeenPairRequest] = useState<string | null>(null);
+  if (pairRequest && pairRequest.id !== seenPairRequest) {
+    setSeenPairRequest(pairRequest.id);
+    if (!api.USE_MOCK) setAddOpen(true);
+  }
   const [renameTarget, setRenameTarget] = useState<Pillbox | null>(null);
 
   const [savedSlots, setSavedSlots] = useState<Slot[]>([]);

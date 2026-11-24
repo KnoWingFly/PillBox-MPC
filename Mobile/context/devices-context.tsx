@@ -15,7 +15,7 @@ import type { Pillbox } from '@root/lib/devices';
 type DevicesValue = {
   /** Visible pillboxes (hidden ones excluded); null until the first load finishes. */
   pillboxes: Pillbox[] | null;
-  /** Pillboxes hidden on this phone. */
+  /** Pillboxes this caregiver stopped following (muted on the server: hidden on every phone). */
   hidden: Pillbox[];
   /** Every pillbox on the account, hidden included (duplicate checks). */
   all: Pillbox[];
@@ -95,8 +95,9 @@ export function DevicesProvider({ children }: PropsWithChildren) {
   );
 
   const applyList = useCallback(
-    (list: Pillbox[], hidden: string[], preferred: string | null) => {
-      const visible = list.filter((p) => !hidden.includes(p.id));
+    (list: Pillbox[], preferred: string | null) => {
+      const hidden = list.filter((p) => p.muted).map((p) => p.id);
+      const visible = list.filter((p) => !p.muted);
       const current = visible.find((p) => p.id === preferred);
       // Same pillbox still active: only refresh lib/api.ts (its elderly may have changed).
       if (current && current.id === stateRef.current.activeId) {
@@ -115,7 +116,7 @@ export function DevicesProvider({ children }: PropsWithChildren) {
       const list = await devices.listPillboxes();
       if (startedAt !== epoch.current) return; // a change happened meanwhile: this list may be stale
       setLoadError(false);
-      applyList(list, stateRef.current.hiddenIds, stateRef.current.activeId);
+      applyList(list, stateRef.current.activeId);
     } catch {
       if (stateRef.current.all === null) setLoadError(true);
     }
@@ -125,15 +126,22 @@ export function DevicesProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [saved, hidden] = await Promise.all([
+      const [saved, legacyHidden] = await Promise.all([
         devices.loadActivePillboxId(userId),
         devices.loadHiddenPillboxIds(userId),
       ]);
       try {
-        const list = await devices.listPillboxes();
+        let list = await devices.listPillboxes();
+        // Pillboxes hidden on this phone before the server kept mutes: mute them once, then forget.
+        const toMute = list.filter((p) => legacyHidden.includes(p.id) && !p.muted && p.myRole !== 'OWNER');
+        if (legacyHidden.length > 0) {
+          const results = await Promise.allSettled(toMute.map((p) => devices.mutePillbox(p.id)));
+          if (results.every((r) => r.status === 'fulfilled')) await devices.clearHiddenPillboxIds(userId);
+          if (toMute.length > 0) list = await devices.listPillboxes();
+        }
         if (cancelled) return;
         setLoadError(false);
-        applyList(list, hidden, saved);
+        applyList(list, saved);
       } catch {
         if (!cancelled) setLoadError(true);
       }
@@ -159,13 +167,16 @@ export function DevicesProvider({ children }: PropsWithChildren) {
 
   const added = useCallback(
     async (deviceId: string) => {
-      const hidden = stateRef.current.hiddenIds.filter((id) => id !== deviceId);
-      if (hidden.length !== stateRef.current.hiddenIds.length) await devices.saveHiddenPillboxIds(userId, hidden);
-      const list = await devices.listPillboxes();
+      let list = await devices.listPillboxes();
+      // Joined a pillbox this caregiver had stopped following: follow it again.
+      if (list.some((p) => p.id === deviceId && p.muted)) {
+        await devices.unmutePillbox(deviceId);
+        list = list.map((p) => (p.id === deviceId ? { ...p, muted: false } : p));
+      }
       setLoadError(false);
-      applyList(list, hidden, deviceId);
+      applyList(list, deviceId);
     },
-    [applyList, userId],
+    [applyList],
   );
 
   /**
@@ -175,7 +186,7 @@ export function DevicesProvider({ children }: PropsWithChildren) {
   const reconcile = useCallback(async (): Promise<Pillbox[] | null> => {
     try {
       const list = await devices.listPillboxes();
-      applyList(list, stateRef.current.hiddenIds, stateRef.current.activeId);
+      applyList(list, stateRef.current.activeId);
       return list;
     } catch {
       return null;
@@ -238,24 +249,36 @@ export function DevicesProvider({ children }: PropsWithChildren) {
       const next = [...before.filter((x) => x !== id), id];
       setHiddenIds(next);
       if (wasActive === id) applyActive(pickActive((list ?? []).filter((p) => !next.includes(p.id)), null));
+      beginMutation();
       try {
-        await devices.saveHiddenPillboxIds(userId, next);
+        await devices.mutePillbox(id);
+        setAll((prev) => prev?.map((p) => (p.id === id ? { ...p, muted: true } : p)) ?? prev);
         return true;
       } catch {
         setHiddenIds(before);
         const restored = list?.find((p) => p.id === wasActive);
         if (wasActive === id && restored) applyActive(restored);
         return false;
+      } finally {
+        endMutation();
       }
     },
-    [applyActive, userId],
+    [applyActive],
   );
 
   const unhideAll = useCallback(async () => {
+    const ids = stateRef.current.hiddenIds;
     setHiddenIds([]);
-    await devices.saveHiddenPillboxIds(userId, []).catch(() => undefined);
-    if (!stateRef.current.activeId) applyActive(pickActive(stateRef.current.all ?? [], null));
-  }, [applyActive, userId]);
+    beginMutation();
+    try {
+      await Promise.allSettled(ids.map((id) => devices.unmutePillbox(id)));
+    } finally {
+      endMutation();
+    }
+    // The server decides what is still muted (a failed call keeps that pillbox hidden).
+    const server = await reconcile();
+    if (!server && !stateRef.current.activeId) applyActive(pickActive(stateRef.current.all ?? [], null));
+  }, [applyActive, reconcile]);
 
   const value = useMemo<DevicesValue>(() => {
     const list = all ?? [];

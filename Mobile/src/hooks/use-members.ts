@@ -1,7 +1,9 @@
 // Members and pending invitations of one elderly profile, kept fresh by the backend's "roles" push.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { AppConfig } from '@/config';
 import { useAuth } from '@/hooks/use-auth';
+import { usePolling } from '@/hooks/use-polling';
 import { BackendError, subscribeToRoleChanges } from '@root/lib/api';
 import type { PillboxRole } from '@root/lib/devices';
 import { canInvite, listMembers, listPendingInvitations, type Member, type PendingInvitation } from '@root/lib/members';
@@ -91,8 +93,10 @@ export function useMembers(elderlyId: string): MembersState {
     void load();
   }, [load]);
 
-  // Someone joined, left or got another role: the backend pushes {"type":"roles"}.
+  // Someone joined, left or got another role: the backend pushes {"type":"roles"}. The push needs the
+  // app's realtime socket, which is closed while the account has no pillbox: polling is the fallback.
   useEffect(() => subscribeToRoleChanges(() => void load()), [load]);
+  usePolling(load, AppConfig.deviceListRefreshMs);
 
   const myRole = useMemo(() => members?.find((m) => m.caregiver_id === userId)?.role ?? null, [members, userId]);
 

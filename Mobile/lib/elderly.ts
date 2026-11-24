@@ -19,6 +19,21 @@ export type ElderlySummary = {
   device_count: number;
 };
 
+/** GET /elderly/{id} (ElderlyDetail), the fields the profile pages use. */
+export type ElderlyProfile = {
+  id: string;
+  full_name: string;
+  nickname: string | null;
+  my_role: PillboxRole;
+  devices: { id: string; device_nickname: string | null; connectivity: 'ONLINE' | 'OFFLINE' }[];
+  caregiver_count: number;
+};
+
+export async function getElderlyProfile(elderlyId: string): Promise<ElderlyProfile> {
+  requireBackend();
+  return backend<ElderlyProfile>(`/elderly/${elderlyId}`);
+}
+
 /** The profiles the caller belongs to, with or without a pillbox. */
 export async function listMyElderly(): Promise<ElderlySummary[]> {
   requireBackend();

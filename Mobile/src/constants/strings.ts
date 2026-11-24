@@ -291,11 +291,20 @@ export const Strings = {
       phoneInvalid: 'Nomor handphone tidak valid',
     },
   },
-  // Placeholder for the medication schedule page (src/app/elderly/[id]/schedule.tsx).
+  // Medication schedule of one elderly profile (src/app/elderly/[id]/schedule.tsx). Schedules
+  // live on a pillbox, so this page leads to the right pillbox's Jadwal tab.
   elderlySchedule: {
     title: 'Jadwal Obat',
-    comingSoonTitle: 'Segera hadir',
-    comingSoonText: 'Halaman jadwal obat untuk profil ini sedang disiapkan. Pasangkan dispenser pillbox dari tab Perangkat.',
+    loadError: 'Gagal memuat profil lansia. Periksa koneksi lalu coba lagi.',
+    opening: 'Membuka jadwal pillbox…',
+    noPillboxTitle: 'Belum ada pillbox',
+    noPillboxText: 'Jadwal obat disimpan di pillbox. Hubungkan pillbox untuk profil ini, lalu atur jadwalnya.',
+    pairPillbox: 'Hubungkan pillbox',
+    choosePillbox: 'Pilih pillbox',
+    choosePillboxText: 'Profil ini punya beberapa pillbox. Jadwal diatur per pillbox.',
+    online: 'Online',
+    offline: 'Offline',
+    pillboxFallback: 'Pillbox',
     backToDashboard: 'Kembali ke beranda',
   },
   // Messages for API error codes; unknown codes fall back to common.unexpectedError.
@@ -360,9 +369,9 @@ export const Strings = {
     removeFailed: (name: string) => `Gagal menghapus "${name}". Pillbox dikembalikan ke daftar.`,
     removedPartly: (name: string) => `"${name}" dihapus, tetapi sebagian riwayat notifikasinya gagal dihapus.`,
     removed: (name: string) => `"${name}" dihapus`,
-    hideTitle: (name: string) => `Sembunyikan "${name}"?`,
+    hideTitle: (name: string) => `Berhenti memantau "${name}"?`,
     hideMessage: (admin: boolean) =>
-      `Pillbox hanya disembunyikan di HP ini. Anda tetap terhubung sebagai ${admin ? 'admin' : 'pemantau'} di server, dan hanya pemilik yang dapat melepas pillbox. Anda bisa menampilkannya lagi dari tab Perangkat.`,
+      `Pillbox ini disembunyikan di semua HP Anda dan Anda tidak menerima peringatan barunya. Anda tetap ${admin ? 'Pengelola' : 'Pemantau'} profil lansianya, dan hanya pemilik yang dapat melepas pillbox. Tampilkan lagi kapan saja dari tab Perangkat.`,
     hideConfirm: 'Sembunyikan',
     hidden: (name: string) => `"${name}" disembunyikan`,
     hideFailed: 'Gagal menyembunyikan pillbox',
@@ -815,7 +824,5 @@ export const Strings = {
     MEMBER_LIMIT_REACHED: 'Anggota sudah penuh.',
     CAREGIVER_NOT_FOUND: 'Anggota ini sudah tidak ada.',
     CANNOT_CHANGE_OWNER_ROLE: 'Akses pemilik hanya berubah lewat pengalihan kepemilikan.',
-    CAREGIVER_NOT_REGISTERED: 'Email ini belum punya akun PillCare.',
-    CANNOT_INVITE_SELF: 'Anda tidak bisa mengundang diri sendiri.',
   } as Record<string, string>,
 } as const;

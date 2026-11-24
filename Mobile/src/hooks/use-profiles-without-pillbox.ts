@@ -3,6 +3,8 @@
 // with an invitation code, before the owner pairs a pillbox).
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { AppConfig } from '@/config';
+import { usePolling } from '@/hooks/use-polling';
 import { subscribeToRoleChanges, USE_MOCK } from '@root/lib/api';
 import { listMyElderly, type ElderlySummary } from '@root/lib/elderly';
 
@@ -35,8 +37,9 @@ export function useProfilesWithoutPillbox(refreshKey?: string | null): ElderlySu
     void load();
   }, [load, refreshKey]);
 
-  // Joined, left or removed: the backend pushes {"type":"roles"}.
+  // Joined, left or removed: the backend pushes {"type":"roles"}; polling covers a closed socket.
   useEffect(() => subscribeToRoleChanges(() => void load()), [load]);
+  usePolling(load, USE_MOCK ? null : AppConfig.deviceListRefreshMs);
 
   return profiles;
 }

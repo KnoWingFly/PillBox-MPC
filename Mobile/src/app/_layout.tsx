@@ -42,10 +42,15 @@ function RootNavigator() {
   const signedIn = status === 'signedIn';
 
   // Foreground display, token rotation and taps on pushes, only while a caregiver is signed in.
-  // A tap opens the dashboard (the notification list is a tab there).
+  // A tap opens the Notifikasi tab of the pillbox the push is about (see PillboxGate params).
   useEffect(() => {
     if (!signedIn) return;
-    return watchPushNotifications(() => router.navigate('/'));
+    return watchPushNotifications((data) =>
+      router.navigate({
+        pathname: '/',
+        params: { tab: 'notifications', at: String(Date.now()), ...(data.device_id ? { device: data.device_id } : {}) },
+      }),
+    );
   }, [signedIn]);
 
   if (status === 'loading' || onboarding === 'loading') return <AppLoading />;

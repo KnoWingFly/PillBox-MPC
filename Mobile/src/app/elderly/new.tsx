@@ -105,8 +105,9 @@ export default function NewElderlyScreen() {
       <ElderlySavedSheet
         values={saved?.values ?? null}
         phone={saved?.phone ?? null}
-        // Schedules live on the pillbox: open the dashboard's schedule tab (`at` makes a repeat count).
-        onSchedule={() => router.dismissTo({ pathname: '/', params: { tab: 'schedule', at: String(Date.now()) } })}
+        // Schedules live on a pillbox: the profile's schedule page opens this profile's pillbox
+        // (or offers pairing when it has none yet), not whichever pillbox happens to be active.
+        onSchedule={() => saved && router.replace({ pathname: '/elderly/[id]/schedule', params: { id: saved.id } })}
         onHome={() => router.dismissTo('/')}
       />
       {toast && <Toast key={toast.id} toast={toast} onDone={onToastDone} />}
