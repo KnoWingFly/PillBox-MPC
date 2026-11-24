@@ -2,11 +2,12 @@ import type { User as SupabaseUser, UserIdentity } from '@supabase/supabase-js';
 
 import { db } from '@/server/db';
 import { HttpError, unauthorized } from '@/server/errors';
-import { json, parseBody, route, userAgent } from '@/server/http';
+import { parseBody, route, userAgent } from '@/server/http';
 import { googleSchema } from '@/server/schemas';
 import { supabaseAdmin } from '@/server/supabase-admin';
 import { timed } from '@/server/perf';
-import { issueTokens, toTokenResponse } from '@/server/tokens';
+import { sessionResponse } from '@/server/session-cookie';
+import { issueTokens, pruneEndedSessionPushTokens, sessionTtlMs } from '@/server/tokens';
 import { isUniqueViolation } from '@/server/users';
 
 const invalidToken = () => unauthorized('GOOGLE_TOKEN_INVALID', 'Google sign-in token is invalid');
@@ -109,9 +110,11 @@ export const POST = route(async (request) => {
   }
 
   const { user, isNew } = resolved;
-  const tokens = await timed(request, 'issue_tokens', () => issueTokens(user.id, { userAgent: userAgent(request) }));
-  return json({
-    ...toTokenResponse(tokens),
+  const tokens = await timed(request, 'issue_tokens', () =>
+    issueTokens(user.id, { userAgent: userAgent(request), ttlMs: sessionTtlMs(body.remember ?? true) }),
+  );
+  await pruneEndedSessionPushTokens(user.id);
+  return sessionResponse(request, tokens, {
     caregiver: { id: user.id, full_name: user.fullName, email: user.email, google_linked: true },
     is_new_account: isNew,
   });

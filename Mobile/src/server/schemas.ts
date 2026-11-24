@@ -31,17 +31,23 @@ export const registerSchema = z.object({
   timezone,
 });
 
+// `remember` false ("Ingat saya" off): a short session (REFRESH_TOKEN_SHORT_TTL_HOURS).
+const remember = z.boolean().optional();
+
 export const loginSchema = z.object({
   email,
   password: anyPassword,
+  remember,
 });
 
 export const googleSchema = z.object({
   supabase_access_token: z.string().min(1),
   timezone,
+  remember,
 });
 
-export const refreshSchema = z.object({ refresh_token: z.string().min(1) });
+// The web app sends no refresh_token: it rides in the HttpOnly cookie (src/server/session-cookie.ts).
+export const refreshSchema = z.object({ refresh_token: z.string().min(1).optional() });
 
 export const forgotPasswordSchema = z.object({ email });
 

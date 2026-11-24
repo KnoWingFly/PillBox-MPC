@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { AppState, Platform } from 'react-native';
 
 import { AppConfig } from '@/config';
+import { COOKIE_SESSION_MARKER } from '@/constants/auth';
 import { Strings } from '@/constants/strings';
 import { usePolling } from '@/hooks/use-polling';
 import { authApi, deviceTimezone, type RegisterInput } from '@/lib/api/auth';
@@ -173,7 +174,8 @@ export default function AuthProvider({ children }: PropsWithChildren) {
   }, [status, endSession]);
 
   const startSession = useCallback(async (tokens: TokenResponse, nextUser: AuthUser, remember: boolean) => {
-    await tokenStore.startSession(tokens.access_token, tokens.refresh_token, remember);
+    // Web: no refresh token in the body, it is in the HttpOnly cookie (src/constants/auth.ts).
+    await tokenStore.startSession(tokens.access_token, tokens.refresh_token ?? COOKIE_SESSION_MARKER, remember);
     resetPillboxSession(); // never reuse the previous account's pillbox selection
     setSessionNotice(null);
     setUser(nextUser);
@@ -184,7 +186,7 @@ export default function AuthProvider({ children }: PropsWithChildren) {
   const signIn = useCallback<AuthContextValue['signIn']>(
     async (email, password, remember) => {
       perfLoginStep('password_login_sent');
-      const res = await authApi.login({ email, password });
+      const res = await authApi.login({ email, password, remember });
       perfLoginStep('password_login_returned');
       await startSession(res, { id: res.caregiver.id, full_name: res.caregiver.full_name, email }, remember);
     },
@@ -204,7 +206,7 @@ export default function AuthProvider({ children }: PropsWithChildren) {
     async (supabaseAccessToken: string, remember: boolean) => {
       let stage = 'pillcare_auth_api';
       try {
-        const res = await authApi.google({ supabase_access_token: supabaseAccessToken, timezone: deviceTimezone() });
+        const res = await authApi.google({ supabase_access_token: supabaseAccessToken, timezone: deviceTimezone(), remember });
         perfLoginStep('google_exchange_returned');
         stage = 'save_app_session';
         await startSession(res, res.caregiver, remember);

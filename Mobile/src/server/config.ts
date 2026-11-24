@@ -16,7 +16,19 @@ function limit(max: string | undefined, maxDefault: number, windowMinutes: strin
   return { max: intFromEnv(max, maxDefault, 1), windowMs, lockMs: windowMs };
 }
 
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 export const serverConfig = {
+  /**
+   * A session (refresh-token family) ends this long after sign-in, however often it is refreshed:
+   * rotation keeps the first token's expiry (Mobile/BACKEND_HANDOFF.md item 9).
+   */
+  refreshTokenTtlMs: intFromEnv(process.env.REFRESH_TOKEN_TTL_DAYS, 30, 1) * DAY_MS,
+  /** Session length when "Ingat saya" is off (`remember: false` on login / Google sign-in). */
+  refreshTokenShortTtlMs: intFromEnv(process.env.REFRESH_TOKEN_SHORT_TTL_HOURS, 12, 1) * HOUR_MS,
+  /** HttpOnly cookie that carries the web app's refresh token, sent only to the auth routes. */
+  refreshCookie: { name: 'pillcare_refresh', path: '/api/auth' },
   /**
    * A refresh token presented again this soon after it was rotated (a retry after a lost response,
    * two tabs refreshing at once) gets a fresh pair instead of revoking the whole session.

@@ -8,7 +8,6 @@ import { env } from './env';
 import { unauthorized } from './errors';
 
 export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
-const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export type AccessClaims = { userId: string; familyId: string };
 
@@ -49,20 +48,30 @@ function newRefreshToken(): string {
 
 type DbClient = Prisma.TransactionClient | typeof db;
 
+/** A pair as issued, with what the HTTP layer needs that is not part of the response body. */
+export type IssuedTokens = TokenResponse & { refreshTokenId: string; refreshExpiresAt: Date };
+
+/** Session length for a new sign-in: "Ingat saya" off gets a short-lived refresh token. */
+export function sessionTtlMs(remember: boolean): number {
+  return remember ? serverConfig.refreshTokenTtlMs : serverConfig.refreshTokenShortTtlMs;
+}
+
 // Issues an access + refresh pair. Pass familyId to continue an existing family (rotation), and
-// `client` to write inside a transaction.
+// `client` to write inside a transaction. A new session lasts `ttlMs`; a rotation passes the old
+// token's `expiresAt`, so a session ends a fixed time after sign-in however often it is refreshed.
 export async function issueTokens(
   userId: string,
-  opts: { familyId?: string; userAgent?: string | null; client?: DbClient } = {},
-): Promise<TokenResponse & { refreshTokenId: string }> {
+  opts: { familyId?: string; userAgent?: string | null; client?: DbClient; ttlMs?: number; expiresAt?: Date } = {},
+): Promise<IssuedTokens> {
   const familyId = opts.familyId ?? crypto.randomUUID();
   const refreshToken = newRefreshToken();
+  const expiresAt = opts.expiresAt ?? new Date(Date.now() + (opts.ttlMs ?? serverConfig.refreshTokenTtlMs));
   const row = await (opts.client ?? db).refreshToken.create({
     data: {
       userId,
       familyId,
       tokenHash: await sha256Hex(refreshToken),
-      expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+      expiresAt,
       userAgent: opts.userAgent ?? null,
     },
   });
@@ -72,47 +81,74 @@ export async function issueTokens(
     token_type: 'Bearer',
     expires_in: ACCESS_TOKEN_TTL_SECONDS,
     refreshTokenId: row.id,
+    refreshExpiresAt: expiresAt,
   };
 }
 
-export function toTokenResponse({ refreshTokenId: _id, ...tokens }: TokenResponse & { refreshTokenId: string }) {
+export function toTokenResponse({ refreshTokenId: _id, refreshExpiresAt: _exp, ...tokens }: IssuedTokens): TokenResponse {
   return tokens;
 }
 
+/** Ends a session. Push tokens registered under it stop receiving alerts too. */
 export async function revokeFamily(familyId: string): Promise<void> {
   await db.refreshToken.updateMany({ where: { familyId, revokedAt: null }, data: { revokedAt: new Date() } });
+  await db.pushToken.deleteMany({ where: { refreshFamilyId: familyId } });
+}
+
+/**
+ * Deletes the user's push tokens whose session ended without a logout (app killed with "Ingat saya"
+ * off, the 30-day cap, revoked elsewhere), so a phone nobody is signed in on gets no medication
+ * alerts. Tokens from before sessions were recorded (no family) are left alone.
+ */
+export async function pruneEndedSessionPushTokens(userId: string): Promise<void> {
+  const tokens = await db.pushToken.findMany({
+    where: { userId, refreshFamilyId: { not: null } },
+    select: { id: true, refreshFamilyId: true },
+  });
+  if (tokens.length === 0) return;
+  const families = [...new Set(tokens.map((t) => t.refreshFamilyId as string))];
+  const live = await db.refreshToken.findMany({
+    where: { familyId: { in: families }, revokedAt: null, expiresAt: { gt: new Date() } },
+    select: { familyId: true },
+    distinct: ['familyId'],
+  });
+  const liveFamilies = new Set(live.map((r) => r.familyId));
+  const ended = tokens.filter((t) => !liveFamilies.has(t.refreshFamilyId as string)).map((t) => t.id);
+  if (ended.length > 0) await db.pushToken.deleteMany({ where: { id: { in: ended } } });
 }
 
 export async function revokeAllForUser(userId: string, opts: { exceptFamilyId?: string } = {}): Promise<void> {
-  await db.refreshToken.updateMany({
+  const except = opts.exceptFamilyId ? { familyId: { not: opts.exceptFamilyId } } : {};
+  await db.refreshToken.updateMany({ where: { userId, revokedAt: null, ...except }, data: { revokedAt: new Date() } });
+  // Phones of the ended sessions stop receiving alerts (the kept session's phone keeps its token).
+  await db.pushToken.deleteMany({
     where: {
       userId,
-      revokedAt: null,
-      ...(opts.exceptFamilyId ? { familyId: { not: opts.exceptFamilyId } } : {}),
+      refreshFamilyId: opts.exceptFamilyId ? { not: null, notIn: [opts.exceptFamilyId] } : { not: null },
     },
-    data: { revokedAt: new Date() },
   });
 }
 
 /** Rotations a grace-window replay may follow (two tabs plus a retry); more looks like abuse. */
 const MAX_GRACE_HOPS = 3;
 
-type RotateOutcome = { ok: TokenResponse } | { revokeFamily: string } | { invalid: true };
+type RotateOutcome = { ok: IssuedTokens } | { revokeFamily: string } | { invalid: true; endedFamily?: string };
 
 /** Claims `id` (marks it rotated) and chains a new token to it. null = someone else claimed it first. */
 async function claimAndIssue(
   tx: Prisma.TransactionClient,
-  row: { id: string; userId: string; familyId: string },
+  row: { id: string; userId: string; familyId: string; expiresAt: Date },
   userAgent: string | null,
-): Promise<TokenResponse | null> {
+): Promise<IssuedTokens | null> {
   const claimed = await tx.refreshToken.updateMany({
     where: { id: row.id, revokedAt: null, replacedById: null },
     data: { revokedAt: new Date() },
   });
   if (claimed.count !== 1) return null;
-  const next = await issueTokens(row.userId, { familyId: row.familyId, userAgent, client: tx });
+  // Same expiry as the token it replaces: the session ends a fixed time after sign-in.
+  const next = await issueTokens(row.userId, { familyId: row.familyId, userAgent, client: tx, expiresAt: row.expiresAt });
   await tx.refreshToken.update({ where: { id: row.id }, data: { replacedById: next.refreshTokenId } });
-  return toTokenResponse(next);
+  return next;
 }
 
 // Rotates a refresh token in one transaction (claim, insert, link), so a crash or a lost
@@ -121,13 +157,15 @@ async function claimAndIssue(
 // within serverConfig.refreshReuseGraceMs of the rotation while its replacement is still unused:
 // that is a retry after a lost response (or two tabs refreshing together), and gets a fresh pair
 // chained after the unused replacement.
-export async function rotateRefreshToken(refreshToken: string, userAgent: string | null): Promise<TokenResponse> {
+export async function rotateRefreshToken(refreshToken: string, userAgent: string | null): Promise<IssuedTokens> {
   const invalid = () => unauthorized('REFRESH_TOKEN_INVALID', 'Refresh token is invalid or expired');
   const tokenHash = await sha256Hex(refreshToken);
 
   const outcome = await db.$transaction(async (tx): Promise<RotateOutcome> => {
     const existing = await tx.refreshToken.findUnique({ where: { tokenHash } });
-    if (!existing || existing.expiresAt.getTime() <= Date.now()) return { invalid: true };
+    if (!existing) return { invalid: true };
+    // Past the session's end (30 days, or the short "Ingat saya" off session): signed out.
+    if (existing.expiresAt.getTime() <= Date.now()) return { invalid: true, endedFamily: existing.familyId };
 
     if (!existing.revokedAt && !existing.replacedById) {
       const rotated = await claimAndIssue(tx, existing, userAgent);
@@ -154,6 +192,9 @@ export async function rotateRefreshToken(refreshToken: string, userAgent: string
   if ('ok' in outcome) return outcome.ok;
   // Outside the transaction: an error thrown inside it would roll the revocation back.
   if ('revokeFamily' in outcome) await revokeFamily(outcome.revokeFamily);
+  if ('endedFamily' in outcome && outcome.endedFamily) {
+    await db.pushToken.deleteMany({ where: { refreshFamilyId: outcome.endedFamily } });
+  }
   throw invalid();
 }
 
