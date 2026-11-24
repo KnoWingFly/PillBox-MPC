@@ -1,39 +1,46 @@
-# Welcome to your Expo app 👋
+# PillCare Mobile: caregiver app and auth server
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Expo SDK 58 app for caregivers of the Smart Pillbox, plus the auth server (Expo Router API routes under
+`src/app/api/`). The elderly person never uses this app. Contributor guide: `CLAUDE.md` in this folder.
+Backend work the app already expects: `BACKEND_HANDOFF.md`. Project status: `../docs/PROJECT_STATUS.md`.
 
-## Get started
+## Get started (local)
 
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
+1. Install dependencies with **pnpm** (the lockfile is `pnpm-lock.yaml`):
 
    ```bash
-   npx expo start
+   pnpm install
+   pnpm exec prisma generate
    ```
 
-In the output, you'll find options to open the app in a
+2. Copy `.env.example` to `.env` and fill in the values. `JWT_ACCESS_SECRET` must be identical to the
+   Backend's. Never put a server secret in an `EXPO_PUBLIC_*` variable.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+3. Start the app and the auth server together:
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+   ```bash
+   pnpm start        # expo start; press w for web, a for Android
+   ```
 
-## Get a fresh project
+   The auth API is served by the same dev server at `http://localhost:8081/api`.
 
-When you're ready, run:
+4. To use real pillboxes instead of mock data, set `EXPO_PUBLIC_PILLBOX_API_URL` to the Backend
+   (for example `http://localhost:8000`, or the laptop's LAN IP on a phone) and restart with
+   `pnpm exec expo start -c`. When it is empty, the dashboard runs on in-memory mock data (`lib/api.ts`).
 
-```bash
-npm run reset-project
-```
+Useful checks: `pnpm exec tsc --noEmit` (typecheck) and `pnpm exec expo lint src lib components context`.
+There is no test runner yet.
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Database migrations: on the shared database use only `pnpm exec prisma migrate deploy`. Never run
+`prisma migrate dev`, `migrate reset` or `db push` there (see `../docs/ai/architecture.md`, conflict 1).
+
+## Where it runs
+
+| Target | How |
+|---|---|
+| Web, local | `pnpm start`, then `w` |
+| Web, hosted | Vercel, see "Deploy the web app and auth API to Vercel" below |
+| Android/iOS | A development build (`expo run:android`) or an EAS build (`eas.json`: `development`, `preview` builds an APK, `production`). Expo Go cannot run native Google sign-in |
 
 ## Google sign-in
 
@@ -105,22 +112,15 @@ in an `EXPO_PUBLIC_*` variable. Copy the variable names and connection-string fo
 `.env.example`, but enter real values directly in Vercel rather than committing them. Redeploy after
 changing client build variables.
 
-### Other setup steps
+### Native builds with EAS
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+`eas.json` defines three profiles: `development` (development client, internal), `preview` (internal,
+Android APK) and `production` (store build, version auto-incremented). The EAS project ID is in
+`app.json` (`extra.eas.projectId`); it also lets `expo-notifications` obtain an Expo push token.
+Set the `EXPO_PUBLIC_*` values for the build in EAS environment variables. iOS still needs the real
+`iosUrlScheme` in `app.json` (see "Google sign-in" above).
 
-## Learn more
+## Expo references
 
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+The app follows Expo SDK 58. Check the versioned docs before changing an Expo API:
+https://docs.expo.dev/versions/v58.0.0/
