@@ -535,6 +535,28 @@ Table invitations {
 }
 ```
 
+Tabel baru `device_mutes` (migrasi `0012`, P1 item 6) dan kolom baru di `push_tokens` (Prisma `20261124000000_push_token_session`):
+
+```dbml
+Table device_mutes {
+  id uuid [pk, default: `gen_random_uuid()`]
+  user_id uuid [not null, ref: > users.id]
+  device_id uuid [not null, ref: > devices.id]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (user_id, device_id) [unique, name: 'device_mutes_user_device_key']
+    device_id [name: 'device_mutes_device_idx']
+  }
+  Note: 'Caregiver berhenti mengikuti satu pillbox; perannya di profil lansia tetap'
+}
+
+// Tambahkan ke Table push_tokens:
+//   refresh_family_id uuid [note: 'Sesi (refresh_tokens.family_id) saat HP didaftarkan; logout menghapus token ini']
+```
+
+Header ERD saat ini masih menyebut commit `341e9bd` (17 Okt 2026); ganti menjadi tanggal pembaruan.
+
 Bila `attempt_counters` ada di ERD, nilai `scope` kini: `DEVICE_PIN | DEVICE_PIN_JOIN | PAIRING_SCAN | CAREGIVER_INVITE | INVITE_CODE` (migrasi `0010`–`0011`).
 
 ### Langkah sebelum dipakai

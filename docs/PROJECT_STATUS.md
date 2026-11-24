@@ -87,14 +87,14 @@
 
 | Aspek | Status |
 |---|---|
-| Endpoint | ✅ **63 operasi HTTP** (57 + 6 untuk Roles, 24 Nov, belum di-commit) + 2 WebSocket (`/ws/device/{code}`, `/ws/app`) |
+| Endpoint | ✅ **65 operasi HTTP** (24 Nov: +6 Roles, +2 mute per pillbox, +1 factory reset, −1 undangan email) + 2 WebSocket (`/ws/device/{code}`, `/ws/app`) |
 | Protokol perangkat | ✅ Heartbeat, config bernomor versi (`304` bila tidak berubah), config-ack, telemetry idempoten per `event_id`, penolakan per event |
 | Perintah ke perangkat | ✅ `trigger_alarm`, `stop_alarm`, `schedule_updated`, `time_sync`, `refill_mode`, `release_slot`, dengan ack ≤ 10 detik |
 | Tugas latar | ✅ Rules engine (30 detik) dan presence (5 detik), pool koneksi terpisah, *advisory lock* agar hanya satu instance yang menjalankan |
 | Keamanan | ✅ JWT HS256, device key SHA-256, PIN scrypt, batas percobaan PIN per perangkat di database, 404 vs 403, `lock_timeout` |
-| Push notification ke HP | ❌ `dispatch_push()` masih stub (`services/notifications.py`). Notifikasi hanya sampai lewat WebSocket `/ws/app` dan polling |
+| Push notification ke HP | ✅ Expo Push API setelah commit (`services/push.py`), judul per bahasa, prioritas tinggi untuk peringatan, receipt dibaca 15 menit kemudian. Diuji dengan server Expo tiruan; belum dicoba ke HP sungguhan |
 | WhatsApp | ❌ Hanya kolom `whatsapp_enabled`/`whatsapp_number` di model lansia, tanpa pengiriman |
-| Hosting | 🟡 Belum diputuskan. Backend wajib **satu proses** (state socket dan ack di memori), jadi tidak bisa serverless |
+| Hosting | 🟡 Konfigurasi siap (Render: `render.yaml` + `Backend/Dockerfile`; Railway: Dockerfile), belum di-deploy. Langkah: `docs/DEPLOY_BACKEND.md` |
 | Roles (24 Nov, belum di-commit) | 🟡 Ubah akses, undangan berkode sekali pakai, batas anggota dan batas undangan, ADMIN hanya memberi PEMANTAU, push `roles` lewat `/ws/app`. Migrasi `0010`–`0011` sudah diterapkan ke database bersama (24 Nov). Uji alur lewat API: 54/54 cek lulus setelah perbaikan review kode. Rincian `docs/ROLES_FEATURE_PLAN.md` |
 | Test | 110 fungsi test di `Backend/tests/` (12 baru di `test_caregivers.py`); tidak dijalankan untuk dokumen ini |
 
@@ -158,7 +158,7 @@
 | **4. Hardening dan audit** | Audit reliabilitas, perbaikan C1–M16, rate limit, penghitung di database, perbaikan emulator | ✅ Hampir selesai. Sisa: H9 (keputusan hosting), L6 (indeks redundan), M8 (retensi notifikasi) |
 | **5. Auth dan Grand Bonus (Modul 8)** | Login Google web, laporan auth, video demo | 🟡 Kode selesai (6 Nov). Laporan dan video: status pengumpulan tidak tercatat di repo |
 | **6. Deployment** | Web dan auth di Vercel, build mobile EAS, hosting backend | 🟡 Berjalan: konfigurasi Vercel dan EAS ada; **hosting backend belum ada**, sehingga web yang di-hosting masih memakai data tiruan |
-| **7. Fitur lanjutan** | Push notification ke HP, WhatsApp, halaman jadwal lansia, item handoff 5–9 | ❌ Belum dimulai |
+| **7. Fitur lanjutan** | Push notification ke HP, halaman jadwal lansia, item handoff 5–9 (24 Nov); WhatsApp belum | 🟡 Sebagian besar selesai |
 
 ---
 
@@ -166,10 +166,10 @@
 
 | # | Masalah | Dampak | Bukti | Perbaikan |
 |---|---|---|---|---|
-| 🐞 B1 | `PUT /devices/{id}/schedules/{schedule_id}` memakai `body.model_dump(exclude_unset=True)`. Serializer `HHMM` mengubah jam menjadi string `"07:00"`, lalu string itu disimpan ke kolom `TIME` | Mengubah satu jadwal lewat endpoint tunggal (misalnya request Postman *Update slot schedule*) gagal dengan error server. Aplikasi tidak terdampak karena memakai simpan batch, yang sudah menghindari masalah ini (`services/schedules.py`, baris 402–403) | Dijalankan langsung: `ScheduleUpdateIn(window_start='07:00').model_dump(exclude_unset=True)` menghasilkan `str` | Cherry-pick `a3bac7f` dari branch `hezki` (1 baris, sama dengan cara endpoint batch) |
-| ⚠️ B2 | Respons dari handler `Exception` umum (`500`, `503` saat database sibuk, `409 CONFLICT` dari *unique violation*) dibuat oleh `ServerErrorMiddleware` di lapisan terluar, di luar `CORSMiddleware`, jadi tanpa header CORS | Di browser (web), error tersebut tampil sebagai "tidak bisa menjangkau server", bukan pesan yang sebenarnya | Pembacaan kode (`app/main.py`, `app/core/errors.py`); belum dijalankan | Tambahkan header CORS di handler itu, atau tangkap error di middleware di dalam lapisan CORS |
-| ⚠️ B3 | Push notification ke HP belum ada | Caregiver tidak menerima notifikasi saat aplikasi tertutup | `services/notifications.py`, `dispatch_push()` | Kirim lewat Expo Push API setelah commit (petunjuk ada di docstring) |
-| ⚠️ B4 | Backend belum di-hosting | Web di Vercel hanya menampilkan data tiruan; demo nyata butuh laptop yang menjalankan backend | `Mobile/README.md`; tidak ada konfigurasi deploy di `Backend/` | Putuskan host yang menjalankan **satu proses** jangka panjang, lalu isi `EXPO_PUBLIC_PILLBOX_API_URL` |
+| ✅ B1 | `PUT /devices/{id}/schedules/{schedule_id}` gagal 500 (jam disimpan sebagai string) | — | — | **Diperbaiki 24 Nov**: cherry-pick `a3bac7f` + test `test_single_schedule_update_*`; diuji end-to-end |
+| ✅ B2 | Error umum (500, 503, 409 race) tanpa header CORS | — | — | **Diperbaiki 24 Nov**: `UnhandledErrorMiddleware` di dalam CORS (`app/core/errors.py`) + test; diuji pada app nyata |
+| ✅ B3 | Push notification ke HP belum ada | — | — | **Diperbaiki 24 Nov**: `services/push.py` + `tests/test_push.py`; diuji dengan server Expo tiruan |
+| 🟡 B4 | Backend belum di-hosting | Web di Vercel hanya menampilkan data tiruan | — | Konfigurasi Render/Railway siap (`docs/DEPLOY_BACKEND.md`), tim tinggal membuat akun dan deploy |
 | ⚠️ B5 | Skalabilitas satu proses | p95 di atas 500 ms setelah sekitar 100 perangkat; satu worker mendekati 100% CPU di sekitar 2.500 socket app (hasil uji beban audit) | `docs/audits/backend-iot-audit-2026-11-03.md` §9 | Butuh keputusan hosting; lebih dari satu worker berarti memindahkan state socket ke luar proses |
 | ℹ️ B6 | `Mobile/src/app/explore.tsx` sisa template Expo masih bisa dibuka | Tidak berbahaya, tetapi membingungkan | `_layout.tsx` baris 60 | Hapus route dan file bila tidak dipakai |
 | ℹ️ B7 | Koleksi Postman belum punya `DELETE /devices/{id}/alarm` | Endpoint hentikan alarm tidak bisa didemokan lewat koleksi | Perbandingan route vs koleksi | Tambahkan ke folder *Devices* |
@@ -180,32 +180,35 @@
 
 ### P0: sebelum demo atau pengumpulan berikutnya
 
-- [ ] Perbaiki B1: `git cherry-pick a3bac7f` ke `main` (atau tulis ulang satu baris yang sama), lalu jalankan test backend.
-- [ ] Putuskan apakah web di Vercel dipakai untuk demo. Jika ya, backend perlu di-hosting (B4). Jika tidak, demo tetap memakai backend di laptop.
-- [ ] Laporan Grand Bonus: isi link video YouTube dan kumpulkan (catatan lokal ada di `docs/notes/`).
-- [ ] Jalankan test backend dengan database uji (`uv run pytest`, `TEST_DATABASE_URL` mengarah ke Postgres lokal) supaya angka test bisa dipertanggungjawabkan. Termasuk `tests/test_caregivers.py` (Roles).
-- [ ] Roles: commit per scope (`feat(db)`, `feat(backend)`, `feat(mobile)`, `docs(agents)`), lalu coba alurnya di aplikasi (undang → kode → gabung → ubah akses).
+- [ ] Push branch `feat/roles-invitations` dan buat PR (semua pekerjaan 24 Nov ada di sana).
+- [ ] Jalankan test backend dengan database uji (`uv run pytest`, `TEST_DATABASE_URL` ke Postgres lokal): 117 test terkumpul, belum pernah dijalankan di mesin ini.
+- [ ] Laporan Grand Bonus: isi `[ISI LINK YOUTUBE DI SINI]` di `docs/notes/AUTH_GRAND_BONUS_REPORT.md` dan `AUTH_REPORT_FINAL.md` (lokal), lalu kumpulkan.
+- [ ] Tempel DBML di `docs/ROLES_FEATURE_PLAN.md` ("Perubahan ERD") ke dbdiagram.io (butuh akun pemilik diagram).
+- [ ] Kabari tim: database bersama sudah sampai `0012` + Prisma `20261124000000`, API list memuat endpoint baru, undangan email dihapus.
 - [ ] Aplikasi tetap bisa dipakai saat pillbox mati (beranda dan menu lain tetap terbuka).
+- [ ] Peringatan "Hydration failed" di web: ikon Ionicons dirender berbeda di server dan browser (font dimuat hanya di browser, `src/app/_layout.tsx`).
 
 ### P1: kelengkapan fitur
 
-- [ ] Push notification lewat Expo Push API (B3). `projectId` EAS sudah ada di `app.json`.
-- [ ] Halaman jadwal untuk profil lansia baru (`Mobile/src/app/elderly/[id]/schedule.tsx`).
-- [ ] Item `Mobile/BACKEND_HANDOFF.md` yang masih terbuka:
-  - [ ] 5: `DELETE /devices/{id}?purge_my_notifications=true`;
-  - [ ] 6: keputusan "keluar" per pillbox untuk non-OWNER (butuh perubahan model);
-  - [ ] 7: `POST /admin/devices/{code}/reset` untuk "Reset Identitas" emulator;
-  - [ ] 9: batas sesi absolut 30 hari, refresh token pendek saat "Ingat saya" mati, cookie `HttpOnly` di web, pembersihan push token.
-- [ ] Perbaiki header CORS pada respons error umum (B2).
+- [x] Push notification lewat Expo Push API (B3).
+- [x] Halaman jadwal untuk profil lansia (`Mobile/src/app/elderly/[id]/schedule.tsx`).
+- [x] Item `Mobile/BACKEND_HANDOFF.md` 5, 6 (mute per pillbox), 7 (factory reset), 9 (sesi absolut, "Ingat saya" pendek, cookie `HttpOnly` di web, pembersihan push token).
+- [x] Header CORS pada respons error umum (B2).
+- [x] Endpoint undangan email lama dihapus (`POST /elderly/{id}/caregivers`).
+- [x] Konfigurasi hosting Backend (Render/Railway).
+- [ ] Deploy Backend dan isi `EXPO_PUBLIC_PILLBOX_API_URL` di Vercel (`docs/DEPLOY_BACKEND.md`).
+- [ ] Coba push di HP sungguhan (development build, bukan Expo Go).
+- [ ] WhatsApp: hanya kolom di database, belum ada pengiriman.
 - [ ] Isi `iosUrlScheme` di `app.json` bila build iOS dibutuhkan.
 
 ### P2: dokumentasi dan kerapian
 
-- [ ] Perbarui API list (spreadsheet): `device_id` di `GET`/`DELETE /notifications`, pagination `GET /devices` dan `GET /elderly/{id}/caregivers`, `DELETE /devices/{id}/alarm`, (baris Roles sudah ditambahkan 24 Nov). Perbarui ERD `invitations` di dbdiagram.io dengan DBML di `docs/ROLES_FEATURE_PLAN.md`.
-- [ ] Tambahkan `DELETE /devices/{id}/alarm` dan 6 request Roles ke koleksi Postman (B7).
+- [x] API list diperbarui untuk pekerjaan 24 Nov: Roles (sheet *Profil_Lansia*, *Realtime*), `PUT`/`DELETE /devices/{id}/membership`, `is_muted`, `?purge_my_notifications`, `POST /admin/devices/{code}/reset` (*PerangkatPillbox*), `remember` dan cookie di login/Google/refresh/logout (*Auth&Account*); baris undangan email ditandai DIHAPUS.
+- [ ] API list masih belum memuat: `device_id` di `GET`/`DELETE /notifications`, pagination `GET /devices` dan daftar caregiver, `DELETE /devices/{id}/alarm`. Baris Google login masih menyebut `google_id_token`, padahal kode memakai `supabase_access_token`; respons register di sheet juga tidak memuat token.
+- [ ] Tambahkan `DELETE /devices/{id}/alarm`, 6 request Roles, 2 mute dan 1 reset ke koleksi Postman (B7).
 - [ ] Hapus `explore.tsx` (B6) bila tim setuju.
 - [ ] Putuskan penghapusan indeks redundan `notifications_event_key_idx` (audit L6, butuh persetujuan).
-- [ ] Hapus branch lama yang sudah ter-merge di GitHub (`backend/connect-pillbox`, `feat/*`, `fix/*`, `frontend/connect-pillbox`) dan branch `hezki` setelah B1 diperbaiki.
+- [ ] Hapus branch lama yang sudah ter-merge di GitHub (`backend/connect-pillbox`, `feat/*`, `fix/*`, `frontend/connect-pillbox`) dan branch `hezki` (B1 sudah masuk lewat cherry-pick).
 - [ ] `applied_at` config-ack memakai waktu ber-zona (SmartDevice, sisa D7).
 
 ### Selesai sejak laporan 17 Okt
