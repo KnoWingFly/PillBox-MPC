@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 
 from app.models.enums import MAX_DEVICE_OFFLINE_AFTER_MINUTES, Connectivity, Gender, Role
 from app.schemas.common import E164, BirthDate, ElderlyName, FreeText, Label50, Name100
@@ -73,12 +73,6 @@ class ElderlyDetail(BaseModel):
     devices: list[ElderlyDeviceBrief]
     caregiver_count: int
     updated_at: datetime
-
-
-class CaregiverInvite(BaseModel):
-    email: EmailStr
-    role: Literal["ADMIN", "PEMANTAU"]
-    relationship_label: Label50 | None = None
 
 
 class CaregiverOut(BaseModel):

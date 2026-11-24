@@ -18,7 +18,7 @@ import secrets
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +36,6 @@ from app.schemas.elderly import (
 from app.services import pin_attempts
 from app.services.access import GRANTABLE_ROLES, ensure_member_room, get_role, require_grantable, require_role
 from app.services.app_hub import queue_roles_changed
-from app.services.elderly import count_invite_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +71,37 @@ def _elderly_name(elderly: Elderly) -> str:
 
 
 # --- inviter side -----------------------------------------------------------------------
+
+async def count_invite_attempt(session: AsyncSession, user: User, settings: Settings) -> None:
+    """One invitation (by email or by code) toward the inviter's limit: 429 TOO_MANY_ATTEMPTS
+    when over. Commits first: the counter runs in its own short transaction and connection."""
+    await session.commit()
+    await pin_attempts.register_attempt(
+        AttemptScope.CAREGIVER_INVITE,
+        str(user.id),
+        settings.caregiver_invite_max_attempts,
+        settings.caregiver_invite_window_seconds,
+        "Too many invitations, try again later",
+    )
+
+
+async def revoke_invitations_beyond(
+    session: AsyncSession, elderly_id: UUID, inviter_id: UUID, new_role: Role | None
+) -> None:
+    """Revokes the inviter's pending invitations that their new role can no longer grant (all of
+    them when they left). Without this, codes shared by a removed or demoted ADMIN would still let
+    people join; invitations.py also refuses such codes at use time."""
+    allowed = GRANTABLE_ROLES[new_role] if new_role is not None else frozenset()
+    stmt = update(Invitation).where(
+        Invitation.elderly_id == elderly_id,
+        Invitation.invited_by_user_id == inviter_id,
+        Invitation.status == InvitationStatus.PENDING.value,
+    )
+    if allowed:
+        stmt = stmt.where(Invitation.role.not_in([r.value for r in allowed]))
+    await session.execute(stmt.values(status=InvitationStatus.REVOKED.value, responded_at=func.now()))
+
+
 
 async def create(
     session: AsyncSession, user: User, elderly_id: UUID, body: InvitationCreateIn, now: datetime, settings: Settings

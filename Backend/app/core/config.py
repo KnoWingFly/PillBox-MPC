@@ -196,6 +196,23 @@ class Settings(BaseSettings):
     pairing_scan_max_attempts: int = Field(30, ge=1)
     pairing_scan_window_seconds: int = Field(300, ge=1)
 
+    # Phone push through the Expo Push API (services/push.py). Off = notifications reach open apps
+    # (/ws/app) and polling only. EXPO_ACCESS_TOKEN is needed only when "enhanced push security"
+    # is on in the Expo dashboard; it is a secret.
+    push_enabled: bool = True
+    expo_push_send_url: str = "https://exp.host/--/api/v2/push/send"
+    expo_push_receipts_url: str = "https://exp.host/--/api/v2/push/getReceipts"
+    expo_access_token: SecretStr | None = None
+    expo_push_batch_size: int = Field(100, ge=1, le=100)  # Expo: at most 100 messages per request
+    expo_push_receipts_batch_size: int = Field(1000, ge=1, le=1000)  # Expo: at most 1000 ids
+    expo_push_timeout_seconds: float = Field(10.0, gt=0)
+    # Expo asks to read receipts about 15 minutes after sending; 0 = do not read them.
+    expo_push_receipt_delay_seconds: int = Field(900, ge=0)
+    # A push older than this is dropped by Apple/Google instead of arriving late (a day-old
+    # "missed dose" is noise; the app's notification list still has it).
+    expo_push_ttl_seconds: int = Field(86400, ge=0)
+    expo_push_android_channel_id: str | None = None
+
     # Caregivers and invitations (services/elderly.py, services/invitations.py).
     # Invitations (by email or by code) a user may create per window.
     caregiver_invite_max_attempts: int = Field(20, ge=1)

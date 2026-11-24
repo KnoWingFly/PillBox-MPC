@@ -8,26 +8,28 @@ from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import delete, func, select
-from sqlalchemy import update as sql_update  # this module has its own update() (profile edit)
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Settings
 from app.core.errors import AppError, conflict, forbidden, not_found, unprocessable
-from app.models import Device, Elderly, Invitation, Notification, NotificationPreference, User, UserElderlyRole
+from app.models import (
+    Device,
+    DeviceMute,
+    Elderly,
+    Notification,
+    NotificationPreference,
+    User,
+    UserElderlyRole,
+)
 from app.models.enums import (
     ALL_ROLES,
     EDITOR_ROLES,
-    AttemptScope,
     Connectivity,
     Gender,
-    InvitationStatus,
     Role,
     Severity,
 )
 from app.schemas.elderly import (
-    CaregiverInvite,
     CaregiverOut,
     Channels,
     ElderlyCreated,
@@ -40,10 +42,10 @@ from app.schemas.elderly import (
     TransferOwnershipOut,
 )
 from app.schemas.common import E164_PATTERN
-from app.services import pin_attempts
-from app.services.access import GRANTABLE_ROLES, ensure_member_room, require_grantable, require_role
+from app.services.access import require_role
 from app.services.app_hub import queue_roles_changed
 from app.services.device_management import unpair
+from app.services.invitations import revoke_invitations_beyond
 from app.services.journal import day_doses_many, summarize
 from app.services.timeutil import zone
 
@@ -226,100 +228,6 @@ async def soft_delete(session: AsyncSession, user: User, elderly_id: UUID, now: 
 
 # --- caregivers -------------------------------------------------------------------
 
-async def count_invite_attempt(session: AsyncSession, user: User, settings: Settings) -> None:
-    """One invitation (by email or by code) toward the inviter's limit: 429 TOO_MANY_ATTEMPTS
-    when over. Commits first: the counter runs in its own short transaction and connection."""
-    await session.commit()
-    await pin_attempts.register_attempt(
-        AttemptScope.CAREGIVER_INVITE,
-        str(user.id),
-        settings.caregiver_invite_max_attempts,
-        settings.caregiver_invite_window_seconds,
-        "Too many invitations, try again later",
-    )
-
-
-async def revoke_invitations_beyond(
-    session: AsyncSession, elderly_id: UUID, inviter_id: UUID, new_role: Role | None
-) -> None:
-    """Revokes the inviter's pending invitations that their new role can no longer grant (all of
-    them when they left). Without this, codes shared by a removed or demoted ADMIN would still let
-    people join; invitations.py also refuses such codes at use time."""
-    allowed = GRANTABLE_ROLES[new_role] if new_role is not None else frozenset()
-    stmt = sql_update(Invitation).where(
-        Invitation.elderly_id == elderly_id,
-        Invitation.invited_by_user_id == inviter_id,
-        Invitation.status == InvitationStatus.PENDING.value,
-    )
-    if allowed:
-        stmt = stmt.where(Invitation.role.not_in([r.value for r in allowed]))
-    await session.execute(stmt.values(status=InvitationStatus.REVOKED.value, responded_at=func.now()))
-
-
-async def invite(
-    session: AsyncSession, user: User, elderly_id: UUID, body: CaregiverInvite, now: datetime, settings: Settings
-) -> CaregiverOut:
-    """Legacy invite by email: adds a registered user at once. Kept for existing clients; the app
-    invites with one-time codes (services/invitations.py)."""
-    my_role = await require_role(session, user.id, elderly_id, EDITOR_ROLES)
-    require_grantable(my_role, Role(body.role))
-    email = body.email.strip().lower()  # Mobile stores emails lowercase
-    if email == user.email.lower():
-        raise AppError(400, "CANNOT_INVITE_SELF", "You cannot invite yourself")
-    await count_invite_attempt(session, user, settings)
-    await ensure_member_room(session, elderly_id, settings)
-    invitee = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
-    if invitee is None:
-        raise not_found("CAREGIVER_NOT_REGISTERED", "No PillCare account uses this email")
-    existing = (
-        await session.execute(
-            select(UserElderlyRole).where(
-                UserElderlyRole.user_id == invitee.id, UserElderlyRole.elderly_id == elderly_id
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise conflict("ALREADY_CAREGIVER", "This user is already a caregiver of this elderly")
-    # The API List adds a registered user immediately; the invitation row is
-    # kept as the audit record (status ACCEPTED). ASSUMPTION.
-    session.add(
-        Invitation(
-            elderly_id=elderly_id,
-            invited_by_user_id=user.id,
-            invitee_email=email,
-            invitee_user_id=invitee.id,
-            role=body.role,
-            relationship_label=body.relationship_label,
-            status=InvitationStatus.ACCEPTED.value,
-            responded_at=now,
-        )
-    )
-    session.add(
-        UserElderlyRole(
-            user_id=invitee.id,
-            elderly_id=elderly_id,
-            role=body.role,
-            relationship_label=body.relationship_label,
-            created_at=now,
-        )
-    )
-    queue_roles_changed(session, invitee.id)
-    try:
-        await session.commit()
-    except IntegrityError as exc:
-        # Two invites of the same person raced past the check above.
-        await session.rollback()
-        raise conflict("ALREADY_CAREGIVER", "This user is already a caregiver of this elderly") from exc
-    logger.info("caregiver_added", extra={"elderly_id": str(elderly_id), "caregiver_id": str(invitee.id)})
-    return CaregiverOut(
-        caregiver_id=invitee.id,
-        full_name=invitee.full_name,
-        role=Role(body.role),
-        relationship_label=body.relationship_label,
-        added_at=now,
-    )
-
-
 async def list_caregivers(
     session: AsyncSession, user: User, elderly_id: UUID, offset: int, limit: int
 ) -> tuple[list[CaregiverOut], int]:
@@ -371,6 +279,13 @@ async def remove_caregiver(session: AsyncSession, user: User, elderly_id: UUID, 
         raise AppError(403, "FORBIDDEN", "Only the owner can remove other caregivers")
     await session.delete(target)
     await revoke_invitations_beyond(session, elderly_id, caregiver_id, None)
+    # Their per-pillbox mutes of this profile's pillboxes go too (a rejoin starts clean).
+    await session.execute(
+        delete(DeviceMute).where(
+            DeviceMute.user_id == caregiver_id,
+            DeviceMute.device_id.in_(select(Device.id).where(Device.elderly_id == elderly_id)),
+        )
+    )
     queue_roles_changed(session, caregiver_id)
     await session.execute(
         delete(NotificationPreference).where(

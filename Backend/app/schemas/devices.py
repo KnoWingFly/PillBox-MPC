@@ -74,6 +74,8 @@ class DeviceListItem(BaseModel):
     battery_percent: int | None
     estimated_battery_days_remaining: float | None
     last_seen_at: datetime | None
+    # The caller stopped following this pillbox (DELETE /devices/{id}/membership).
+    is_muted: bool = False
 
 
 class DeviceList(BaseModel):

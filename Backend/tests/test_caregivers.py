@@ -103,10 +103,11 @@ async def test_an_admin_grants_monitor_access_only(client: httpx.AsyncClient, db
 
     res = await _invite(client, admin, device.elderly_id, "ADMIN")
     assert res.status_code == 403
+    # The old email invite is gone: nobody is added without accepting a code.
     res = await client.post(
         f"{API}/elderly/{device.elderly_id}/caregivers", json={"email": other.email, "role": "ADMIN"}, headers=admin.headers
     )
-    assert res.status_code == 403  # the legacy email invite follows the same rule
+    assert res.status_code == 405
     res = await _invite(client, admin, device.elderly_id, "PEMANTAU")
     assert res.status_code == 201, res.text
 

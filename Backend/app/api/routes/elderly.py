@@ -6,7 +6,6 @@ from fastapi import APIRouter, Query, Response, status
 from app.api.deps import CurrentUser, DbSession, PaginationDep, SettingsDep
 from app.models.enums import Role
 from app.schemas.elderly import (
-    CaregiverInvite,
     CaregiverOut,
     CaregiverPage,
     CaregiverRoleIn,
@@ -57,17 +56,9 @@ async def delete_elderly(elderly_id: UUID, user: CurrentUser, db: DbSession) -> 
 
 # --- caregivers ------------------------------------------------------------------
 
-@router.post(
-    "/{elderly_id}/caregivers",
-    response_model=CaregiverOut,
-    status_code=status.HTTP_201_CREATED,
-    deprecated=True,  # the app invites with codes: POST /elderly/{id}/invitations
-)
-async def invite_caregiver(
-    elderly_id: UUID, body: CaregiverInvite, user: CurrentUser, db: DbSession, settings: SettingsDep
-) -> CaregiverOut:
-    return await svc.invite(db, user, elderly_id, body, datetime.now(UTC), settings)
-
+# Caregivers join by invitation code (POST /elderly/{id}/invitations, then /invitations/accept) or
+# by the pillbox PIN. The old email invite added people without their consent and told the caller
+# whether an email had an account; it was removed (docs/ROLES_FEATURE_PLAN.md).
 
 @router.get("/{elderly_id}/caregivers", response_model=CaregiverPage)
 async def list_caregivers(elderly_id: UUID, user: CurrentUser, db: DbSession, pagination: PaginationDep) -> CaregiverPage:

@@ -16,9 +16,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import timing
 from app.core.config import Settings
-from app.core.errors import AppError, conflict, not_found, unprocessable
+from app.core.errors import AppError, conflict, forbidden, not_found, unprocessable
 from app.core.security import hash_pin, verify_pin
-from app.models import Device, DeviceEvent, DeviceStock, Elderly, Schedule, TelemetryLog, User, UserElderlyRole
+from app.models import (
+    Device,
+    DeviceEvent,
+    DeviceMute,
+    DeviceStock,
+    Elderly,
+    Notification,
+    Schedule,
+    TelemetryLog,
+    User,
+    UserElderlyRole,
+)
 from app.models.enums import ALL_ROLES, EDITOR_ROLES, AttemptScope, ChimeVolume, Connectivity, DoseStatus, Role
 from app.schemas.devices import (
     ChamberDoor,
@@ -204,6 +215,8 @@ async def unpair(session: AsyncSession, device: Device, now: datetime) -> None:
         .values(deleted_at=now)
     )
     await drop_undecided_doses(session, device_id=device.id)
+    # A pillbox paired again starts with nobody muting it.
+    await session.execute(delete(DeviceMute).where(DeviceMute.device_id == device.id))
     device.elderly_id = None
     device.device_pin_hash = None
     device.pin_updated_at = None
@@ -361,9 +374,10 @@ async def list_devices(
 ) -> tuple[list[DeviceListItem], int]:
     """One page and the total, in one query (the total rides along as a window count)."""
     stmt = (
-        select(Device, Elderly, func.count().over().label("total"))
+        select(Device, Elderly, DeviceMute.id.is_not(None).label("muted"), func.count().over().label("total"))
         .join(Elderly, Elderly.id == Device.elderly_id)
         .join(UserElderlyRole, UserElderlyRole.elderly_id == Elderly.id)
+        .outerjoin(DeviceMute, (DeviceMute.device_id == Device.id) & (DeviceMute.user_id == user.id))
         .where(UserElderlyRole.user_id == user.id, Elderly.deleted_at.is_(None))
         .order_by(Elderly.full_name, Device.device_nickname, Device.id)
         .offset(offset)
@@ -384,8 +398,9 @@ async def list_devices(
             battery_percent=d.battery_percentage,
             estimated_battery_days_remaining=battery_days(d, settings),
             last_seen_at=d.last_heartbeat,
+            is_muted=muted,
         )
-        for d, e, _ in rows
+        for d, e, muted, _ in rows
     ], total
 
 
@@ -460,6 +475,8 @@ async def update_settings(
     if target is not None and target != device.elderly_id:
         await require_role(session, user.id, target, EDITOR_ROLES)
         await drop_undecided_doses(session, device_id=device.id)
+        # Mutes belonged to the old profile's caregivers.
+        await session.execute(delete(DeviceMute).where(DeviceMute.device_id == device.id))
         device.elderly_id = target
     if config_changed:
         await bump_config(session, device)
@@ -480,13 +497,48 @@ async def update_settings(
     )
 
 
-async def remove(session: AsyncSession, user: User, device_id: UUID, now: datetime) -> None:
+async def remove(
+    session: AsyncSession, user: User, device_id: UUID, now: datetime, *, purge_my_notifications: bool = False
+) -> None:
+    """OWNER unpairs the pillbox for every caregiver. Other caregivers keep their notifications
+    about it (their history); purge_my_notifications deletes the caller's own in the same
+    transaction (Mobile/BACKEND_HANDOFF.md item 5)."""
     device, _ = await get_device_for_user(session, user.id, device_id, {Role.OWNER}, for_update=True)
     await unpair(session, device, now)
+    purged = 0
+    if purge_my_notifications:
+        result = await session.execute(
+            delete(Notification).where(Notification.user_id == user.id, Notification.device_id == device.id)
+        )
+        purged = result.rowcount or 0
     await session.commit()
-    logger.info("device_unpaired", extra={"device_id": str(device.id)})
+    logger.info("device_unpaired", extra={"device_id": str(device.id), "notifications_purged": purged})
     # A WebSocket device drops its schedules now instead of at its next heartbeat.
     await notify_config_changed(device.id, device.config_version)
+
+
+async def leave(session: AsyncSession, user: User, device_id: UUID) -> None:
+    """DELETE /devices/{id}/membership: stop following this one pillbox (BACKEND_HANDOFF item 6).
+    Hidden from the caller's list on every phone; no new notifications or pushes about it for them.
+    Their role on the elderly profile, and so their access, is unchanged. The OWNER cannot: they
+    unpair the pillbox instead. Idempotent."""
+    device, role = await get_device_for_user(session, user.id, device_id, ALL_ROLES)
+    if role == Role.OWNER:
+        raise forbidden(message="The owner cannot leave a pillbox; unpair it instead")
+    await session.execute(
+        insert(DeviceMute).values(user_id=user.id, device_id=device.id).on_conflict_do_nothing(
+            constraint="device_mutes_user_device_key"
+        )
+    )
+    await session.commit()
+    logger.info("device_muted", extra={"device_id": str(device.id)})
+
+
+async def rejoin(session: AsyncSession, user: User, device_id: UUID) -> None:
+    """PUT /devices/{id}/membership: follow the pillbox again. Idempotent."""
+    device, _ = await get_device_for_user(session, user.id, device_id, ALL_ROLES)
+    await session.execute(delete(DeviceMute).where(DeviceMute.user_id == user.id, DeviceMute.device_id == device.id))
+    await session.commit()
 
 
 async def status(session: AsyncSession, user: User, device_id: UUID, settings: Settings) -> DeviceStatusOut:

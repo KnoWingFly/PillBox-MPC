@@ -1,6 +1,6 @@
 from app.models.attempts import AttemptCounter
 from app.models.base import Base
-from app.models.devices import Device, DeviceStock, Refill, RefillItem, Schedule
+from app.models.devices import Device, DeviceMute, DeviceStock, Refill, RefillItem, Schedule
 from app.models.elderly import Elderly, Invitation, NotificationPreference, UserElderlyRole
 from app.models.notifications import Notification
 from app.models.telemetry import DeviceEvent, TelemetryLog
@@ -12,6 +12,7 @@ __all__ = [
     "Base",
     "Device",
     "DeviceEvent",
+    "DeviceMute",
     "DeviceStock",
     "Elderly",
     "Invitation",

@@ -44,6 +44,8 @@ os.environ.update(
         "JWT_ACCESS_SECRET": TEST_JWT_SECRET,
         "PROVISIONING_TOKEN": TEST_PROVISIONING_TOKEN,
         "ENABLE_BACKGROUND_TASKS": "false",
+        # Never reach Expo from tests; tests/test_push.py turns it on with a fake Expo server.
+        "PUSH_ENABLED": "false",
         "DB_USE_NULL_POOL": "true",
         "LOG_JSON": "false",
         "LOG_LEVEL": "WARNING",

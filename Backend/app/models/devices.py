@@ -70,6 +70,18 @@ class Schedule(Base):
     updated_at: Mapped[datetime] = updated_at_col()
 
 
+class DeviceMute(Base):
+    """A caregiver stopped following this pillbox (migration 0012): hidden from their list, no new
+    notifications or pushes about it for them. Their role on the elderly profile is unchanged."""
+
+    __tablename__ = "device_mutes"
+
+    id: Mapped[UUID] = uuid_pk()
+    user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
+    device_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("devices.id"))
+    created_at: Mapped[datetime] = created_at_col()
+
+
 class DeviceStock(Base):
     __tablename__ = "device_stocks"
 
