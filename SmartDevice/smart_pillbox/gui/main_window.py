@@ -175,6 +175,31 @@ class RegisterWorker(QRunnable):
             pass  # the window is already gone
 
 
+class ResetSignals(QObject):
+    finished = Signal(object)  # None = reset on the server, else the reason it was not
+
+
+class ResetWorker(QRunnable):
+    """Factory-resets the device on the backend off the GUI thread (Reset Identitas)."""
+
+    def __init__(self, code: str, token: str | None):
+        super().__init__()
+        self.code = code
+        self.token = token
+        self.signals = ResetSignals()
+
+    def run(self):
+        try:
+            problem = sync.reset_on_server(self.code, self.token)
+        except Exception:  # noqa: BLE001 - finished must always be emitted; logged
+            logger.exception("Server reset failed.")
+            problem = "Reset di server gagal karena galat tak terduga (lihat log)."
+        try:
+            self.signals.finished.emit(problem)
+        except RuntimeError:
+            pass  # the window is already gone
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -790,18 +815,36 @@ class MainWindow(QMainWindow):
             "Hapus kode & kunci perangkat ini dari emulator? Perangkat harus didaftarkan "
             "dan dipasangkan ulang di aplikasi.",
         )
-        if answer == QMessageBox.StandardButton.Yes:
-            sync.forget_identity(self.db)  # also drops the old identity's outbox, version and refill mode
-            self._identity = sync.get_identity(self.db)  # an env override may still give one
-            self._paired = False
-            self._link_state = None
-            self._pending = self.db.count_unsynced_events()
-            self._config_version_seen = self.db.get_device_state(config.STATE_CONFIG_VERSION)
-            if self.scheduler.is_refill_mode:
-                self._set_refill_mode(False)
-            self._apply_timezone(None)
-            self._refresh_connection_panel()
-            self._refresh_socket()
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        code, _ = self._identity
+        if not code:
+            self._finish_forget(None)
+            return
+        # First the server (unpair + delete this pillbox's data), then the local identity.
+        self._btn_forget.setEnabled(False)
+        self.statusBar().showMessage("Mereset pillbox di server…", config.STATUS_MESSAGE_MS)
+        worker = ResetWorker(code, config.provisioning_token())
+        worker.signals.finished.connect(self._finish_forget)
+        QThreadPool.globalInstance().start(worker)
+
+    def _finish_forget(self, server_problem: str | None) -> None:
+        if self._closing:
+            return
+        self._btn_forget.setEnabled(True)
+        if server_problem:
+            QMessageBox.warning(self, "Reset Identitas", f"{server_problem}\n\nIdentitas tetap dihapus dari emulator.")
+        sync.forget_identity(self.db)  # also drops the old identity's outbox, version and refill mode
+        self._identity = sync.get_identity(self.db)  # an env override may still give one
+        self._paired = False
+        self._link_state = None
+        self._pending = self.db.count_unsynced_events()
+        self._config_version_seen = self.db.get_device_state(config.STATE_CONFIG_VERSION)
+        if self.scheduler.is_refill_mode:
+            self._set_refill_mode(False)
+        self._apply_timezone(None)
+        self._refresh_connection_panel()
+        self._refresh_socket()
 
     def _on_widget_interacted(self, compartment_id: int, is_forced: bool = False) -> None:
         compartment = self.scheduler.compartments[compartment_id]
