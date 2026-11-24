@@ -11,11 +11,16 @@ PillCare = caregiver mobile app + cloud backend + emulated Smart Pillbox. The el
 | Role | Notes |
 |---|---|
 | OWNER | Exactly one per elderly (partial unique index). Creator of the elderly profile. |
-| ADMIN | Can manage schedules, stock, alarms, invites. |
+| ADMIN | Can manage schedules, stock, alarms, and invite monitors. |
 | PEMANTAU | Read-only monitor. Joining a device with its PIN grants PEMANTAU. |
 
-- OWNER only: delete elderly, transfer ownership, change device PIN, unpair device, revoke another caregiver (a caregiver may always leave on their own; the OWNER cannot be revoked).
-- OWNER or ADMIN: edit elderly profile, invite caregivers, edit device settings, create/edit/delete schedules, refill mode and refills, trigger alarm, calibrate clock, manually confirm a dose.
+App labels: OWNER = "Pemilik", ADMIN = "Pengelola", PEMANTAU = "Pemantau" (`Mobile/src/constants/strings.ts`).
+
+- OWNER only: delete elderly, transfer ownership, change device PIN, unpair device, revoke another caregiver (a caregiver may always leave on their own; the OWNER cannot be revoked), change another caregiver's role between ADMIN and PEMANTAU (`PUT /elderly/{id}/caregivers/{caregiver_id}`; the OWNER role moves only by transfer, `409 CANNOT_CHANGE_OWNER_ROLE`).
+- OWNER or ADMIN: edit elderly profile, invite caregivers, edit device settings, create/edit/delete schedules, refill mode and refills, trigger alarm, calibrate clock, manually confirm a dose. **An ADMIN may grant PEMANTAU only**; only the OWNER grants ADMIN (`GRANTABLE_ROLES`, `Backend/app/services/access.py`; otherwise `403 FORBIDDEN`).
+- At most `MAX_CAREGIVERS_PER_ELDERLY` (default 10) caregivers per elderly, counted on invite, accept and PIN join under a lock on the elderly row (`409 MEMBER_LIMIT_REACHED`). Invitations created per user are limited (`CAREGIVER_INVITE_*`, `429 TOO_MANY_ATTEMPTS`).
+- **Invitations by code** (`Backend/app/services/invitations.py`): OWNER/ADMIN create a `PENDING` invitation for a role and get a one-time code (8 characters, shown `XXXX-XXXX`, only its SHA-256 is stored, expires after `INVITATION_TTL_DAYS`, default 7). The invitee previews (`POST /invitations/preview`) and accepts (`POST /invitations/accept`); nobody is added without accepting. Every unusable code (unknown, expired, used, revoked) answers the same `404 INVITATION_INVALID`; previews and accepts are limited per user (`INVITATION_CODE_*`). OWNER revokes any pending invitation, an ADMIN only their own. A code also dies when its inviter can no longer grant its role: demoted, removed, left, or account deleted (revoked at the change and refused at use). Accepting opens the profile's members screen; profiles without a pillbox are listed in Settings and on the pairing screen. The older email invite (`POST /elderly/{id}/caregivers`) still adds a registered user at once; it is deprecated.
+- After any role change the backend pushes `{"type": "roles"}` on `/ws/app` to the affected users; the app reloads its pillbox list and member list.
 - Any related caregiver: read everything for that elderly, resolve/read notifications.
 - Unrelated caller gets `404 NOT_FOUND`; related but under-privileged gets `403 FORBIDDEN` (or `403 OWNER_ONLY`).
 
