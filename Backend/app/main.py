@@ -14,6 +14,7 @@ from app.api.routes import (
     devices,
     elderly,
     health,
+    invitations,
     journal,
     me,
     notifications,
@@ -105,6 +106,7 @@ api_v1.include_router(device_protocol.router)
 api_v1.include_router(devices.router)
 api_v1.include_router(schedules.router)
 api_v1.include_router(elderly.router)
+api_v1.include_router(invitations.router)
 api_v1.include_router(journal.router)
 api_v1.include_router(notifications.router)
 api_v1.include_router(admin.router)

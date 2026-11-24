@@ -59,10 +59,14 @@ class Invitation(Base):
     id: Mapped[UUID] = uuid_pk()
     elderly_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("elderly.id"))
     invited_by_user_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
-    invitee_email: Mapped[str] = mapped_column(String(254))
+    # NULL for an invitation by code (migration 0011).
+    invitee_email: Mapped[str | None] = mapped_column(String(254))
     invitee_user_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id"))
     role: Mapped[str] = mapped_column(String(10))
     relationship_label: Mapped[str | None] = mapped_column(String(50))
     status: Mapped[str] = mapped_column(String(10))
     created_at: Mapped[datetime] = created_at_col()
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Invitation by code (migration 0011): SHA-256 of the normalized code, never the code itself.
+    code_hash: Mapped[str | None] = mapped_column(String(64))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -38,7 +38,7 @@ from app.schemas.devices import (
     SlotLayoutOut,
 )
 from app.services import pin_attempts, stock_cache
-from app.services.access import get_device_for_user, require_role
+from app.services.access import ensure_member_room, get_device_for_user, require_role
 from app.services.app_hub import queue_roles_changed
 from app.services.connection_manager import (
     CommandAck,
@@ -325,6 +325,7 @@ async def join(
         return JoinDeviceOut(
             device_id=device.id, elderly_id=elderly_id, my_role=Role(existing.role), joined_at=existing.created_at
         )
+    await ensure_member_room(session, elderly_id, settings)
     role = UserElderlyRole(user_id=user.id, elderly_id=elderly_id, role=Role.PEMANTAU.value, created_at=now)
     session.add(role)
     queue_roles_changed(session, user.id)

@@ -1,8 +1,8 @@
 from datetime import date, datetime
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, StringConstraints
 
 from app.models.enums import MAX_DEVICE_OFFLINE_AFTER_MINUTES, Connectivity, Gender, Role
 from app.schemas.common import E164, BirthDate, ElderlyName, FreeText, Label50, Name100
@@ -95,6 +95,67 @@ class CaregiverPage(BaseModel):
     page: int
     limit: int
     total: int
+
+
+class CaregiverRoleIn(BaseModel):
+    """PUT /elderly/{id}/caregivers/{caregiver_id}: OWNER changes another caregiver's access."""
+
+    role: Literal["ADMIN", "PEMANTAU"]
+
+
+# --- invitations by code (services/invitations.py) -----------------------------------
+
+InvitationCode = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
+
+
+class InvitationCreateIn(BaseModel):
+    role: Literal["ADMIN", "PEMANTAU"]
+    relationship_label: Label50 | None = None
+
+
+class InvitationCreated(BaseModel):
+    """The code is returned once, here only: the server stores its hash."""
+
+    invitation_id: UUID
+    code: str
+    role: Role
+    relationship_label: str | None
+    expires_at: datetime
+
+
+class InvitationOut(BaseModel):
+    invitation_id: UUID
+    role: Role
+    relationship_label: str | None
+    # Lets an ADMIN see which pending invitations they may revoke (their own).
+    invited_by_user_id: UUID | None
+    invited_by_name: str | None
+    created_at: datetime
+    expires_at: datetime
+
+
+class InvitationPage(BaseModel):
+    data: list[InvitationOut]
+    page: int
+    limit: int
+    total: int
+
+
+class InvitationCodeIn(BaseModel):
+    code: InvitationCode
+
+
+class InvitationPreview(BaseModel):
+    elderly_name: str
+    invited_by_name: str | None
+    role: Role
+    relationship_label: str | None
+    expires_at: datetime
+
+
+class InvitationAccepted(BaseModel):
+    elderly_id: UUID
+    my_role: Role
 
 class TransferOwnershipIn(BaseModel):
     new_owner_caregiver_id: UUID

@@ -196,6 +196,18 @@ class Settings(BaseSettings):
     pairing_scan_max_attempts: int = Field(30, ge=1)
     pairing_scan_window_seconds: int = Field(300, ge=1)
 
+    # Caregivers and invitations (services/elderly.py, services/invitations.py).
+    # Invitations (by email or by code) a user may create per window.
+    caregiver_invite_max_attempts: int = Field(20, ge=1)
+    caregiver_invite_window_seconds: int = Field(3600, ge=1)
+    # Caregivers (any role) one elderly profile may have.
+    max_caregivers_per_elderly: int = Field(10, ge=1)
+    # An invitation code is single-use and expires after this many days.
+    invitation_ttl_days: int = Field(7, ge=1)
+    # Invitation code previews/accepts allowed per user per window (codes cannot be guessed).
+    invitation_code_max_attempts: int = Field(10, ge=1)
+    invitation_code_window_seconds: int = Field(900, ge=1)
+
     # Used when pairing a device and neither the request nor the caregiver
     # profile has a valid IANA timezone.
     default_device_timezone: str = "Asia/Jakarta"

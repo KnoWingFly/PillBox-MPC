@@ -203,9 +203,15 @@ class AppHub:
                     except (TimeoutError, WebSocketDisconnect, RuntimeError, OSError):
                         pass
             return
+        timeout = get_settings().app_ws_send_timeout_seconds
+        sends = []
         for user_id in user_ids:
             for conn in list(self._by_user.get(user_id, ())):
                 self.set_elderly(conn, followed.get(user_id, set()))
+                # The app reloads its roles (pillbox list, member list) on this hint.
+                sends.append(self._send(conn, {"type": "roles"}, timeout))
+        if sends:
+            await asyncio.gather(*sends)
 
     def _worth_pushing(self, message: dict[str, Any]) -> bool:
         """False for a status that only moved its volatile fields and was pushed recently."""
