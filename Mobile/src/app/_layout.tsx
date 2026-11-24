@@ -22,9 +22,11 @@ perfLoginStep('app_start');
 // "12000ms timeout exceeded", although the browser still finishes loading the font. Each icon
 // awaits that same load without a catch, so the rejection showed up as a red error. Started here,
 // the @font-face rule exists before the icons mount, so they treat the font as loaded.
-Ionicons.loadFont().catch((err: unknown) => {
-  if (__DEV__) console.info('[pillbox] icon font still loading:', err instanceof Error ? err.message : err);
-});
+if (typeof window !== 'undefined') {
+  Ionicons.loadFont().catch((err: unknown) => {
+    if (__DEV__) console.info('[pillbox] icon font still loading:', err instanceof Error ? err.message : err);
+  });
+}
 
 // Keeps the native splash visible until the stored session and the onboarding flag have been read.
 function SplashScreenController() {
