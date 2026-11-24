@@ -23,7 +23,7 @@ from app.api.routes import (
 )
 from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.config import get_settings
-from app.core.errors import install_error_handlers
+from app.core.errors import UnhandledErrorMiddleware, install_error_handlers
 from app.core.logging import configure_logging, request_id_var
 from app.core.timing import correlation_id_var
 from app.db.session import get_background_engine, get_background_sessionmaker, get_engine, warm_pool
@@ -50,7 +50,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
 install_error_handlers(app)
 
-# Added first so it runs inside CORS: its 413 then carries the CORS headers (Expo web reads it).
+# Added before CORS so they run inside it: their 500/503/409 and 413 responses then carry the
+# CORS headers (Expo web reads them; B2 in docs/PROJECT_STATUS.md).
+app.add_middleware(UnhandledErrorMiddleware)
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
 app.add_middleware(
     CORSMiddleware,
