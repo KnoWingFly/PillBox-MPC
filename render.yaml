@@ -1,0 +1,39 @@
+# Render Blueprint for the PillCare Backend (FastAPI). The Mobile web app and auth API are on
+# Vercel (Mobile/vercel.json). Setup, costs and the Railway alternative: docs/DEPLOY_BACKEND.md.
+services:
+  - type: web
+    name: pillcare-backend
+    runtime: docker
+    rootDir: Backend
+    dockerfilePath: ./Backend/Dockerfile
+    dockerContext: ./Backend
+    # The free plan sleeps after 15 minutes without inbound traffic (about a minute to wake up),
+    # which pauses the missed-dose rules engine. A running pillbox's heartbeat (every 15 s) keeps it
+    # awake. For a deployment people rely on, use a paid plan (e.g. 0.5c-512mb): it never sleeps and
+    # supports preDeployCommand for the migrations.
+    plan: free
+    region: singapore
+    # Never more than one: device sockets and command acks live in this process's memory.
+    numInstances: 1
+    healthCheckPath: /health
+    envVars:
+      # Secrets: asked once when the Blueprint is created, never stored in the repo.
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: PROVISIONING_TOKEN
+        sync: false
+      - key: EXPO_ACCESS_TOKEN
+        sync: false
+      - key: AUTH_MODE
+        value: app_jwt
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: LOG_JSON
+        value: "true"
+      # The hosted web app's origin (Vercel). Add others as a JSON array.
+      - key: CORS_ORIGINS
+        value: '["https://mpc-mobile.vercel.app"]'
