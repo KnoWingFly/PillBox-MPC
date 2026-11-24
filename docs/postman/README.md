@@ -4,9 +4,12 @@ Referensi lengkap seluruh endpoint HTTP PillCare dalam format Postman Collection
 
 | File | Isi |
 |---|---|
-| `PillCare.postman_collection.json` | 70 request dalam 13 folder: 56 operasi backend FastAPI dan 14 operasi server auth |
+| `PillCare.postman_collection.json` | 72 request dalam 14 folder: 56 operasi backend FastAPI, 14 operasi server auth, dan 2 request di folder *Access control demo* |
 | `PillCare-Local.postman_environment.json` | Environment lokal: URL server dan variabel rahasia (kosong) |
-| `build_postman.py` | Generator koleksi dari skema OpenAPI backend |
+
+> **Status per 24 Nov 2026.** Backend saat ini punya 57 operasi HTTP. Satu belum masuk koleksi: `DELETE /api/v1/devices/{device_id}/alarm` (hentikan alarm, ditambahkan pada perbaikan *robustness hardening*). Tambahkan ke folder *Devices* bila koleksi diperbarui.
+>
+> Fitur Roles (24 Nov, belum di-commit) menambah 6 operasi yang juga belum ada di koleksi: `PUT /elderly/{id}/caregivers/{caregiver_id}`, `POST`/`GET /elderly/{id}/invitations`, `DELETE /elderly/{id}/invitations/{invitation_id}`, `POST /invitations/preview`, `POST /invitations/accept`. Bentuk request dan error ada di `docs/ROLES_FEATURE_PLAN.md`, "Baris API list yang perlu ditambahkan".
 
 ## Memakai koleksi
 
@@ -27,28 +30,22 @@ Referensi lengkap seluruh endpoint HTTP PillCare dalam format Postman Collection
 
 Deskripsi koleksi (tab *Overview*) memuat autentikasi, konvensi, format error, alur umum, dan kanal WebSocket.
 
-## Membangkitkan ulang
+## Memperbarui koleksi
 
-Koleksi diturunkan dari kode, jadi bangkitkan ulang setiap kali API berubah. Dari root repositori:
+Koleksi awalnya dibangkitkan dari `app.openapi()` backend oleh skrip `build_postman.py`, tetapi skrip itu **tidak pernah di-commit** ke repositori. Sejak itu koleksi diperbarui manual (misalnya folder *Access control demo*). Saat API berubah:
 
-```bash
-Backend/.venv/Scripts/python.exe docs/postman/build_postman.py
-```
-
-Di macOS/Linux, gunakan `Backend/.venv/bin/python`. Generator membaca `app.openapi()` (tanpa menjalankan server atau
-menyentuh database) dan **gagal** bila ada operasi baru yang belum didokumentasikan di `build_postman.py`, atau bila
-dokumentasi merujuk operasi yang sudah tidak ada.
-
-Endpoint server auth (Expo API routes) tidak memiliki skema OpenAPI, sehingga dipelihara manual di `AUTH_OPS`.
+1. Tambahkan atau ubah request di Postman, lalu **Export** sebagai Collection v2.1 ke file ini.
+2. Cocokkan daftar operasi dengan route backend (`Backend/app/api/routes/*.py`) dan route server auth (`Mobile/src/app/api/**`). Endpoint server auth tidak punya skema OpenAPI, jadi selalu dipelihara manual.
+3. Perbarui jumlah request di tabel atas.
 
 ## Prinsip penyusunan
 
 | Prinsip | Penerapan | Rujukan |
 |---|---|---|
-| Kelengkapan dan kejelasan adalah masalah dokumentasi paling berat | Semua 70 endpoint tercakup; setiap request mencantumkan tujuan, hak akses, aturan bisnis, dan tabel error | Uddin & Robillard (2015) |
+| Kelengkapan dan kejelasan adalah masalah dokumentasi paling berat | 70 dari 71 operasi tercakup (lihat status di atas); setiap request mencantumkan tujuan, hak akses, aturan bisnis, dan tabel error | Uddin & Robillard (2015) |
 | Contoh pemakaian mempercepat pemakaian REST API | Setiap request punya body contoh terisi dan contoh respons sukses serta error | Sohan et al. (2017); Robillard & DeLine (2011) |
 | Dokumentasi maksud dan pemetaan skenario | Deskripsi folder menjelaskan konsep (penilaian dosis, sinkronisasi konfigurasi, peran); deskripsi koleksi memuat alur umum | Robillard & DeLine (2011) |
-| Hindari dokumentasi usang, tidak konsisten, dan bertele-tele | Dibangkitkan dari OpenAPI pada commit tertentu; satu request per operasi, varian ditaruh sebagai contoh respons; error umum (401) dijelaskan sekali di tingkat koleksi | Uddin & Robillard (2015); Aghajani et al. (2019) |
+| Hindari dokumentasi usang, tidak konsisten, dan bertele-tele | Awalnya dibangkitkan dari OpenAPI, kini dicocokkan manual ke route (lihat *Memperbarui koleksi*); satu request per operasi, varian ditaruh sebagai contoh respons; error umum (401) dijelaskan sekali di tingkat koleksi | Uddin & Robillard (2015); Aghajani et al. (2019) |
 | Pengguna perlu cepat mencapai respons sukses pertama, dan autentikasi harus jelas | Bagian *Mulai dalam 3 langkah*; autentikasi diatur di tingkat koleksi dan folder lalu diwariskan | Postman Learning Center |
 | Rahasia tidak ikut dibagikan | Semua nilai rahasia kosong dan bertipe *secret* | Postman Learning Center |
 
