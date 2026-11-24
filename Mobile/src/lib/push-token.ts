@@ -46,11 +46,15 @@ export async function unregisterPushToken(): Promise<void> {
   }
 }
 
+/** What the backend puts in a push's `data` (Backend/app/services/notifications.py). */
+export type PushData = { notification_id?: string; type?: string; elderly_id?: string; device_id?: string | null };
+
 /**
  * While signed in: shows pushes that arrive in the foreground, re-registers when the OS rotates the
- * push token, and calls `onOpen` when the caregiver taps a notification. Returns the cleanup.
+ * push token, and calls `onOpen` with the push's data when the caregiver taps a notification.
+ * Returns the cleanup.
  */
-export function watchPushNotifications(onOpen: () => void): () => void {
+export function watchPushNotifications(onOpen: (data: PushData) => void): () => void {
   if (!pushSupported()) return () => undefined;
   let stopped = false;
   let subscriptions: { remove: () => void }[] = [];
@@ -68,7 +72,9 @@ export function watchPushNotifications(onOpen: () => void): () => void {
       subscriptions = [
         // The listener carries the native device token; the Expo token is derived from it again.
         Notifications.addPushTokenListener(() => void registerPushToken()),
-        Notifications.addNotificationResponseReceivedListener(() => onOpen()),
+        Notifications.addNotificationResponseReceivedListener((response) =>
+          onOpen((response.notification.request.content.data ?? {}) as PushData),
+        ),
       ];
     })
     .catch((err: unknown) => {

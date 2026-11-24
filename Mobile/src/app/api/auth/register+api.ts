@@ -1,11 +1,12 @@
 import { serverConfig } from '@/server/config';
 import { db } from '@/server/db';
 import { HttpError } from '@/server/errors';
-import { clientIp, json, parseBody, route, userAgent } from '@/server/http';
+import { clientIp, parseBody, route, userAgent } from '@/server/http';
 import { hashPassword } from '@/server/passwords';
 import { consumeAttempt } from '@/server/rate-limit';
 import { registerSchema } from '@/server/schemas';
-import { issueTokens, toTokenResponse } from '@/server/tokens';
+import { sessionResponse } from '@/server/session-cookie';
+import { issueTokens } from '@/server/tokens';
 import { isUniqueViolation } from '@/server/users';
 
 const emailTaken = () => new HttpError(409, 'EMAIL_ALREADY_REGISTERED', 'Email is already registered');
@@ -31,12 +32,12 @@ export const POST = route(async (request) => {
     throw err;
   }
 
+  // A new account is remembered: sign-up has no "Ingat saya" choice.
   const tokens = await issueTokens(user.id, { userAgent: userAgent(request) });
-  return json(
-    {
-      ...toTokenResponse(tokens),
-      caregiver: { id: user.id, full_name: user.fullName, created_at: user.createdAt.toISOString() },
-    },
+  return sessionResponse(
+    request,
+    tokens,
+    { caregiver: { id: user.id, full_name: user.fullName, created_at: user.createdAt.toISOString() } },
     201,
   );
 });

@@ -107,6 +107,8 @@ export function ConnectPillboxScreen({
   hiddenCount = 0,
   onCancel,
   onSignOut,
+  onJoinWithCode,
+  extra,
 }: {
   onConnected: (result: devices.ConnectPillboxResult) => void;
   /** The pillbox with this code if it is already on the account (hidden ones included). */
@@ -120,6 +122,10 @@ export function ConnectPillboxScreen({
   onCancel?: () => void;
   /** Full-screen mode: lets a caregiver without a pillbox still sign out. */
   onSignOut?: () => void;
+  /** Join an elderly profile with an invitation code from another caregiver. */
+  onJoinWithCode?: () => void;
+  /** Shown under the join button before a code is entered (e.g. profiles without a pillbox). */
+  extra?: ReactNode;
 }) {
   const [deviceCode, setDeviceCode] = useState('');
   const [check, setCheck] = useState<devices.PairingCheck | null>(null);
@@ -227,6 +233,16 @@ export function ConnectPillboxScreen({
       {!onCancel && hiddenCount > 0 && !check && (
         <Button label={S.showHidden(hiddenCount)} icon="eye-outline" variant="secondary" onPress={() => onUnhide('')} />
       )}
+      {onJoinWithCode && !check && (
+        <Button
+          label={Strings.settings.joinWithCode}
+          icon="key-outline"
+          variant="secondary"
+          onPress={onJoinWithCode}
+          disabled={busy}
+        />
+      )}
+      {!check && extra}
       {!check ? (
         <>
           <Card>

@@ -1,6 +1,11 @@
 # Dokumentasi Arsitektur Sistem & Spesifikasi Handover PillCare (Revisi v2 — Aligned with API Spec & ERD)
 **CE739 Mobile & Pervasive Computing — Smart Pillbox IoT System**
 
+> **Dokumen historis (30 Sep 2026). Jangan dipakai sebagai acuan kode saat ini.**
+> Dokumen ini adalah serah-terima awal sebelum backend dibangun. Checklist di bagian 6 sudah selesai, dan banyak detail sudah berubah: database kini berisi 19 tabel (13 milik migrasi SQL backend, 6 milik Prisma), ada WebSocket `/ws/device/{code}` dan `/ws/app`, perintah dari server ke pillbox, serta rules engine.
+> File ini tetap disimpan karena dirujuk sebagai sumber ERD awal oleh `Backend/migrations/0001_erd_domain_tables.sql`.
+> Acuan terkini: `docs/ai/architecture.md` (arsitektur dan kepemilikan tabel), `docs/ai/domain.md` (aturan domain), `docs/DEVICE_CONTRACT.md` (protokol perangkat), `Backend/README.md` (route), dan `docs/PROJECT_STATUS.md` (status project).
+
 ---
 
 ## 1. Ringkasan Eksekutif & Arsitektur Sistem (Hub-and-Spoke Pattern)

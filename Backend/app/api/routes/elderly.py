@@ -4,21 +4,25 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Response, status
 
 from app.api.deps import CurrentUser, DbSession, PaginationDep, SettingsDep
+from app.models.enums import Role
 from app.schemas.elderly import (
-    CaregiverInvite,
     CaregiverOut,
     CaregiverPage,
+    CaregiverRoleIn,
     ElderlyCreated,
     ElderlyDetail,
     ElderlyIn,
     ElderlyPage,
+    InvitationCreated,
+    InvitationCreateIn,
+    InvitationPage,
     NotificationPreferencesIO,
     TransferOwnershipIn,
     TransferOwnershipOut,
 )
 from app.schemas.journal import CalendarOut, DayOut, SummaryOut
 from app.services import elderly as svc
-from app.services import journal
+from app.services import invitations, journal
 
 router = APIRouter(prefix="/elderly", tags=["elderly"])
 
@@ -52,15 +56,21 @@ async def delete_elderly(elderly_id: UUID, user: CurrentUser, db: DbSession) -> 
 
 # --- caregivers ------------------------------------------------------------------
 
-@router.post("/{elderly_id}/caregivers", response_model=CaregiverOut, status_code=status.HTTP_201_CREATED)
-async def invite_caregiver(elderly_id: UUID, body: CaregiverInvite, user: CurrentUser, db: DbSession) -> CaregiverOut:
-    return await svc.invite(db, user, elderly_id, body, datetime.now(UTC))
-
+# Caregivers join by invitation code (POST /elderly/{id}/invitations, then /invitations/accept) or
+# by the pillbox PIN. The old email invite added people without their consent and told the caller
+# whether an email had an account; it was removed (docs/ROLES_FEATURE_PLAN.md).
 
 @router.get("/{elderly_id}/caregivers", response_model=CaregiverPage)
 async def list_caregivers(elderly_id: UUID, user: CurrentUser, db: DbSession, pagination: PaginationDep) -> CaregiverPage:
     items, total = await svc.list_caregivers(db, user, elderly_id, pagination.offset, pagination.limit)
     return CaregiverPage(data=items, page=pagination.page, limit=pagination.limit, total=total)
+
+
+@router.put("/{elderly_id}/caregivers/{caregiver_id}", response_model=CaregiverOut)
+async def change_caregiver_role(
+    elderly_id: UUID, caregiver_id: UUID, body: CaregiverRoleIn, user: CurrentUser, db: DbSession
+) -> CaregiverOut:
+    return await svc.change_role(db, user, elderly_id, caregiver_id, Role(body.role))
 
 
 @router.delete("/{elderly_id}/caregivers/{caregiver_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -74,6 +84,31 @@ async def transfer_ownership(
     elderly_id: UUID, body: TransferOwnershipIn, user: CurrentUser, db: DbSession
 ) -> TransferOwnershipOut:
     return await svc.transfer_ownership(db, user, elderly_id, body.new_owner_caregiver_id)
+
+
+# --- invitations by code ---------------------------------------------------------------
+
+@router.post("/{elderly_id}/invitations", response_model=InvitationCreated, status_code=status.HTTP_201_CREATED)
+async def create_invitation(
+    elderly_id: UUID, body: InvitationCreateIn, user: CurrentUser, db: DbSession, settings: SettingsDep
+) -> InvitationCreated:
+    return await invitations.create(db, user, elderly_id, body, datetime.now(UTC), settings)
+
+
+@router.get("/{elderly_id}/invitations", response_model=InvitationPage)
+async def list_invitations(
+    elderly_id: UUID, user: CurrentUser, db: DbSession, pagination: PaginationDep
+) -> InvitationPage:
+    items, total = await invitations.list_pending(
+        db, user, elderly_id, datetime.now(UTC), pagination.offset, pagination.limit
+    )
+    return InvitationPage(data=items, page=pagination.page, limit=pagination.limit, total=total)
+
+
+@router.delete("/{elderly_id}/invitations/{invitation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_invitation(elderly_id: UUID, invitation_id: UUID, user: CurrentUser, db: DbSession) -> Response:
+    await invitations.revoke(db, user, elderly_id, invitation_id, datetime.now(UTC))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- notification preferences ------------------------------------------------------

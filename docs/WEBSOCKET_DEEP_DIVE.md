@@ -5,8 +5,8 @@ Dokumen ini menjelaskan, langkah demi langkah, bagaimana backend dan pillbox ter
 ## Cara membaca dokumen
 
 - Setiap bagian berisi **penjelasan**, **analogi** (kotak kutipan), dan **kode** lengkap dengan lokasi file dan nomor baris.
-- **Semua nomor baris merujuk ke `origin/main` (commit `f40b196`).** Branch lokal `backend/connect-pillbox` belum memuat commit ini, jadi file di working tree Anda bisa berbeda. Nomor baris juga bergeser jika `main` berubah.
-- Isi dokumen dibaca dari kode. **Koneksinya belum saya jalankan.** Satu hal yang tidak diverifikasi tertulis di bagian 2.
+- **Nomor baris diambil dari commit `f40b196` dan masih berlaku sampai `main` per 24 Nov 2026 (`f5a85cd`)**: sejak `f40b196` tidak ada perubahan di `Backend/` maupun `SmartDevice/`. Nomor baris bergeser jika file-file itu berubah lagi. Branch lama `backend/connect-pillbox` (`d98ca74`) tidak memuat kode ini.
+- Isi dokumen disusun dari pembacaan kode. **Koneksinya tidak dijalankan saat dokumen ditulis.** Satu hal yang tidak diverifikasi tertulis di bagian 2.
 
 ## Daftar isi
 

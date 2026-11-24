@@ -1,20 +1,24 @@
 import { noContent, route } from '@/server/http';
 import { refreshSchema } from '@/server/schemas';
+import { clearSessionCookie, refreshTokenOf } from '@/server/session-cookie';
 import { findFamilyId, revokeFamily } from '@/server/tokens';
 
-// Public: the refresh token is the credential, so an expired access token never blocks logout.
-// Idempotent: always 204, even for malformed, unknown or already-revoked tokens.
+// Public: the refresh token (body, or the web app's HttpOnly cookie) is the credential, so an
+// expired access token never blocks logout. Idempotent: always 204, even for malformed, unknown or
+// already-revoked tokens. Revoking the session also deletes the push tokens registered under it.
 export const POST = route(async (request) => {
   let raw: unknown = {};
   try {
-    raw = await request.json();
+    const text = await request.text();
+    raw = text ? JSON.parse(text) : {};
   } catch {
-    return noContent();
+    raw = {};
   }
   const parsed = refreshSchema.safeParse(raw);
-  if (!parsed.success) return noContent();
-
-  const familyId = await findFamilyId(parsed.data.refresh_token);
-  if (familyId) await revokeFamily(familyId);
-  return noContent();
+  const refreshToken = refreshTokenOf(request, parsed.success ? parsed.data.refresh_token : undefined);
+  if (refreshToken) {
+    const familyId = await findFamilyId(refreshToken);
+    if (familyId) await revokeFamily(familyId);
+  }
+  return clearSessionCookie(request, noContent());
 });

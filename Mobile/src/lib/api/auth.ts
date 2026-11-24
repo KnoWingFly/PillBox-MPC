@@ -1,5 +1,7 @@
 import { AppConfig } from '@/config';
 
+import { COOKIE_SESSION_MARKER } from '@/constants/auth';
+
 import { apiFetch, type TokenResponse } from './client';
 
 export type Caregiver = { id: string; full_name: string; email?: string };
@@ -22,12 +24,18 @@ export type GoogleResponse = TokenResponse & {
 export const authApi = {
   register: (body: RegisterInput) =>
     apiFetch<RegisterResponse>('/api/auth/register', { method: 'POST', body, auth: false }),
-  login: (body: { email: string; password: string }) =>
+  // `remember` false ("Ingat saya" off): the server issues a short session.
+  login: (body: { email: string; password: string; remember: boolean }) =>
     apiFetch<LoginResponse>('/api/auth/login', { method: 'POST', body, auth: false }),
-  google: (body: { supabase_access_token: string; timezone: string }) =>
+  google: (body: { supabase_access_token: string; timezone: string; remember: boolean }) =>
     apiFetch<GoogleResponse>('/api/auth/google', { method: 'POST', body, auth: false }),
+  // A cookie session sends no token: the browser attaches the HttpOnly cookie, which logout clears.
   logout: (refreshToken: string) =>
-    apiFetch<void>('/api/auth/logout', { method: 'POST', body: { refresh_token: refreshToken }, auth: false }),
+    apiFetch<void>('/api/auth/logout', {
+      method: 'POST',
+      body: refreshToken === COOKIE_SESSION_MARKER ? {} : { refresh_token: refreshToken },
+      auth: false,
+    }),
   forgotPassword: (email: string) =>
     apiFetch<{ message: 'OTP_SENT_TO_EMAIL' }>('/api/auth/forgot-password', {
       method: 'POST',

@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import exc as sa_exc
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.config import get_settings
 
@@ -127,28 +128,65 @@ def install_error_handlers(app: FastAPI) -> None:
         message = exc.detail if isinstance(exc.detail, str) else code
         return JSONResponse(error_body(code, message), status_code=exc.status_code, headers=exc.headers)
 
+    # Fallback only: UnhandledErrorMiddleware normally answers first (see its docstring).
     @app.exception_handler(Exception)
     async def _unexpected(request: Request, exc: Exception) -> JSONResponse:
-        if is_db_unavailable(exc):
-            logger.warning(
-                "db_unavailable",
-                extra={"method": request.method, "path": request.url.path, "error": type(exc).__name__},
-                # A bare OSError/TimeoutError may also be a bug outside the database: keep its trace.
-                exc_info=not isinstance(exc, sa_exc.SQLAlchemyError),
-            )
-            return JSONResponse(
-                error_body("SERVICE_UNAVAILABLE", "Server is busy, please try again shortly"),
-                status_code=503,
-                headers={"Retry-After": str(get_settings().db_unavailable_retry_after_seconds)},
-            )
-        if isinstance(exc, sa_exc.IntegrityError) and getattr(exc.orig, "sqlstate", None) == _UNIQUE_VIOLATION:
-            # Two requests raced past a "does it exist yet?" check: the second one loses.
-            logger.warning("unique_violation", extra={"method": request.method, "path": request.url.path})
-            return JSONResponse(
-                error_body("CONFLICT", "This was changed at the same time by another request, please reload"),
-                status_code=409,
-            )
-        logger.exception(
-            "unhandled_error", extra={"method": request.method, "path": request.url.path}
+        return unexpected_error_response(request, exc)
+
+
+def unexpected_error_response(request: Request, exc: Exception) -> JSONResponse:
+    """500, 503 (database busy) or 409 CONFLICT (unique-violation race) for an unhandled error."""
+    if is_db_unavailable(exc):
+        logger.warning(
+            "db_unavailable",
+            extra={"method": request.method, "path": request.url.path, "error": type(exc).__name__},
+            # A bare OSError/TimeoutError may also be a bug outside the database: keep its trace.
+            exc_info=False if isinstance(exc, sa_exc.SQLAlchemyError) else exc,
         )
-        return JSONResponse(error_body("INTERNAL_ERROR", "Internal server error"), status_code=500)
+        return JSONResponse(
+            error_body("SERVICE_UNAVAILABLE", "Server is busy, please try again shortly"),
+            status_code=503,
+            headers={"Retry-After": str(get_settings().db_unavailable_retry_after_seconds)},
+        )
+    if isinstance(exc, sa_exc.IntegrityError) and getattr(exc.orig, "sqlstate", None) == _UNIQUE_VIOLATION:
+        # Two requests raced past a "does it exist yet?" check: the second one loses.
+        logger.warning("unique_violation", extra={"method": request.method, "path": request.url.path})
+        return JSONResponse(
+            error_body("CONFLICT", "This was changed at the same time by another request, please reload"),
+            status_code=409,
+        )
+    logger.error("unhandled_error", extra={"method": request.method, "path": request.url.path}, exc_info=exc)
+    return JSONResponse(error_body("INTERNAL_ERROR", "Internal server error"), status_code=500)
+
+
+class UnhandledErrorMiddleware:
+    """Turns an unhandled exception into the API's error response *inside* CORSMiddleware.
+
+    FastAPI's handler for `Exception` runs in Starlette's ServerErrorMiddleware, the outermost
+    layer, so its 500/503/409 responses never pass through CORSMiddleware and a browser sees them
+    as "server unreachable" (B2). Added before CORSMiddleware in main.py, this middleware sits
+    inside it, so those responses carry the CORS headers like every other error.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except Exception as exc:
+            if started:  # the response is already under way: nothing sensible to send
+                raise
+            response = unexpected_error_response(Request(scope), exc)
+            await response(scope, receive, send)

@@ -342,3 +342,31 @@ async def test_strangers_guessing_the_pin_do_not_lock_out_the_owner(client: http
         headers=owner.headers,
     )
     assert res.status_code == 200, res.text
+
+
+# --- B2: unhandled errors keep the CORS headers --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        (RuntimeError("bug"), 500, "INTERNAL_ERROR"),
+        (sa_exc.OperationalError("SELECT 1", {}, ConnectionRefusedError()), 503, "SERVICE_UNAVAILABLE"),
+    ],
+)
+async def test_unhandled_errors_carry_cors_headers(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, error: Exception, status: int, code: str
+) -> None:
+    """A browser reads a 500/503 only when it carries the CORS headers; before the fix it saw
+    "server unreachable" because the catch-all handler ran outside CORSMiddleware."""
+    from app.api.routes import health as health_routes
+
+    def broken(_settings: Any) -> dict[str, Any]:
+        raise error
+
+    monkeypatch.setattr(health_routes, "loop_health", broken)
+    origin = get_settings().cors_origins[0]
+    res = await client.get("/health", headers={"Origin": origin})
+    assert res.status_code == status
+    assert res.json()["error"]["code"] == code
+    assert res.headers.get("access-control-allow-origin") == origin

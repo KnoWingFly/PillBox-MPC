@@ -2,7 +2,21 @@
 
 For the SmartDevice team. This comes from a read-only audit of `SmartDevice/`. Nothing in that folder was changed. Each item gives the file and line, whether the code proves it or it still needs a measurement, and a suggested patch. Contract references point to [`DEVICE_CONTRACT.md`](DEVICE_CONTRACT.md).
 
-How the emulator reaches the backend today: a `QTimer` fires every `SYNC_INTERVAL_SECONDS` (15 s). Each tick runs one `SyncWorker` on a thread pool, which sends **a REST heartbeat first and then the telemetry flush**, one after the other. An event that happens between ticks waits in SQLite until the next tick.
+> **Status (24 Nov 2026).** This audit describes the emulator **before** commit `341e9bd` (17 Oct 2026). Most items were fixed afterwards; the analysis below is kept as the record of why.
+>
+> | # | Status | Where it was addressed |
+> |---|---|---|
+> | D1 | Fixed: every logged event triggers a sync about 300 ms later (debounced) | `341e9bd` |
+> | D2 | Fixed: normal order is flush then heartbeat, and the heartbeat is sent even when the flush or config apply fails | `341e9bd`; audit `docs/audits/backend-iot-audit-2026-11-03.md` M12 |
+> | D3 | Fixed: Wi-Fi back online starts a sync at once (heartbeat, then the offline flush) | `341e9bd` |
+> | D4 | Fixed: a sync requested while another runs is queued, not skipped | `341e9bd` |
+> | D5 | Fixed: WebSocket command channel (`core/ws_client.py`) with close-code handling and jittered backoff | `341e9bd`; audit M11 |
+> | D6 | Fixed: one `requests.Session` is reused | `341e9bd` |
+> | D7 | Partly open: `config-ack` `applied_at` uses the device clock when available, but falls back to a naive `datetime.now()` (`core/sync.py`, around line 490). Not re-measured | audit L7 |
+>
+> The "today" descriptions below refer to the code as it was on 17 Oct.
+
+How the emulator reached the backend at the time of this audit: a `QTimer` fires every `SYNC_INTERVAL_SECONDS` (15 s). Each tick runs one `SyncWorker` on a thread pool, which sends **a REST heartbeat first and then the telemetry flush**, one after the other. An event that happens between ticks waits in SQLite until the next tick.
 
 ## Summary: delay the emulator adds (device to backend)
 

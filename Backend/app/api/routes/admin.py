@@ -1,6 +1,7 @@
+from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, Header, Response, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import DbSession, SettingsDep
@@ -31,3 +32,11 @@ async def rotate_device_secret(
 ) -> RotateSecretOut:
     provisioning.check_provisioning_token(settings, token)
     return await provisioning.rotate_secret(db, device_code, body.device_secret, settings)
+
+
+@router.post("/devices/{device_code}/reset", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_device(device_code: str, db: DbSession, settings: SettingsDep, token: ProvisioningToken = None) -> Response:
+    """Factory reset: unpairs the device and deletes its schedules, doses, stock and notifications."""
+    provisioning.check_provisioning_token(settings, token)
+    await provisioning.factory_reset(db, device_code, datetime.now(UTC))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

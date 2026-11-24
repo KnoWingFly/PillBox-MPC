@@ -1,6 +1,7 @@
 """Schedule edits that must be refused: slots too close together, and a slot under way."""
 
 from datetime import datetime, timedelta
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -68,3 +69,47 @@ async def test_slot_under_way_cannot_be_changed_until_decided(client: httpx.Asyn
     await client.post(f"{API}/devices/{device.code}/heartbeat", json=hb, headers=device.device_headers)
     res = await _save(client, owner, device, [{"slot_number": 1, "window_start": later, "window_end": later}])
     assert res.status_code == 200, res.text
+
+
+# --- PUT /devices/{id}/schedules/{schedule_id} (B1) ----------------------------------------------
+# model_dump() turned the HHMM times into "07:00" strings, which then reached the TIME column and
+# failed with a server error. Only the fields present in the body may change.
+
+
+async def test_single_schedule_update_changes_the_times(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    created = await create_schedule(client, owner, device, slot=1, start="07:00", end="07:30", tolerance=30)
+
+    res = await client.put(
+        f"{API}/devices/{device.id}/schedules/{created['id']}",
+        json={"window_start": "08:00", "window_end": "08:15"},
+        headers=owner.headers,
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["window_start"] == "08:00" and body["window_end"] == "08:15"
+    # Fields left out of the body keep their values.
+    assert body["medication_name"] == "Amlodipine" and body["tolerance_minutes"] == 30
+    assert body["config_version"] > created["config_version"]
+    row = await db.fetchrow("SELECT window_start, window_end FROM schedules WHERE id = $1", UUID(created["id"]))
+    assert f"{row['window_start']:%H:%M}" == "08:00" and f"{row['window_end']:%H:%M}" == "08:15"
+
+
+async def test_single_schedule_update_of_other_fields(client: httpx.AsyncClient, db: asyncpg.Connection) -> None:
+    owner = await create_caregiver(db, "Owner")
+    device = await paired_device(client, owner)
+    created = await create_schedule(client, owner, device, slot=2, start="12:00", end="12:30")
+    url = f"{API}/devices/{device.id}/schedules/{created['id']}"
+
+    res = await client.put(url, json={"medication_name": "Metformin", "tolerance_minutes": 45}, headers=owner.headers)
+    assert res.status_code == 200, res.text
+    assert res.json()["medication_name"] == "Metformin" and res.json()["tolerance_minutes"] == 45
+    assert res.json()["window_start"] == "12:00"
+
+    # A required field sent as null is refused, not stored.
+    res = await client.put(url, json={"window_start": None}, headers=owner.headers)
+    assert res.status_code == 422 and res.json()["error"]["code"] == "VALIDATION_ERROR"
+    # An end before the start is refused.
+    res = await client.put(url, json={"window_end": "11:00"}, headers=owner.headers)
+    assert res.status_code == 422, res.text

@@ -657,6 +657,19 @@ export function subscribeToDeviceChanges(listener: DeviceChangeListener): () => 
   };
 }
 
+const roleListeners = new Set<() => void>();
+
+/**
+ * Called when this user's roles changed on the server (invited, removed, access changed,
+ * ownership transferred): reload anything that shows roles, such as the pillbox list.
+ */
+export function subscribeToRoleChanges(listener: () => void): () => void {
+  roleListeners.add(listener);
+  return () => {
+    roleListeners.delete(listener);
+  };
+}
+
 type PushMessage = {
   type?: string;
   items?: BackendNotification[];
@@ -777,6 +790,8 @@ async function openSocket(): Promise<void> {
       if (__DEV__) console.info('[pillbox] device update pushed');
       const status = message.status ? toStatusFields(message.status) : null;
       deviceListeners.forEach((listener) => listener(status));
+    } else if (type === 'roles') {
+      roleListeners.forEach((listener) => listener());
     }
   };
   ws.onclose = (e) => {

@@ -2,6 +2,7 @@ import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 
 import { AppConfig } from '@/config';
+import { COOKIE_SESSION_MARKER, TOKEN_TRANSPORT_COOKIE, TOKEN_TRANSPORT_HEADER } from '@/constants/auth';
 import { loginCorrelationId, perfEnabled, perfLoginStep } from '@/lib/perf';
 
 import { tokenStore } from './token-store';
@@ -20,7 +21,8 @@ export class ApiError extends Error {
 
 export type TokenResponse = {
   access_token: string;
-  refresh_token: string;
+  /** Absent on web: the refresh token is then in an HttpOnly cookie (src/constants/auth.ts). */
+  refresh_token?: string;
   token_type: 'Bearer';
   expires_in: number;
 };
@@ -98,6 +100,8 @@ let firstCallLogged = false;
 
 async function send(path: string, opts: RequestOptions, accessToken: string | null): Promise<Response> {
   const headers: Record<string, string> = { Accept: 'application/json' };
+  // Web: the refresh token travels in an HttpOnly cookie, not in the JSON (src/constants/auth.ts).
+  if (Platform.OS === 'web') headers[TOKEN_TRANSPORT_HEADER] = TOKEN_TRANSPORT_COOKIE;
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   if (perfEnabled()) {
@@ -130,13 +134,15 @@ let refreshInFlight: Promise<string | null> | null = null;
 async function doRefresh(): Promise<string | null> {
   const refreshToken = await tokenStore.getRefreshToken();
   if (!refreshToken) return null;
-  const res = await send('/api/auth/refresh', { method: 'POST', body: { refresh_token: refreshToken } }, null);
+  // A cookie session sends no token: the browser attaches the HttpOnly cookie itself.
+  const body = refreshToken === COOKIE_SESSION_MARKER ? {} : { refresh_token: refreshToken };
+  const res = await send('/api/auth/refresh', { method: 'POST', body }, null);
   if (!res.ok) {
     if (res.status === 401) return null; // refresh token rejected: session is over
     throw await toApiError(res);
   }
   const tokens = await readJson<TokenResponse>(res);
-  await tokenStore.setTokens(tokens.access_token, tokens.refresh_token);
+  await tokenStore.setTokens(tokens.access_token, tokens.refresh_token ?? COOKIE_SESSION_MARKER);
   return tokens.access_token;
 }
 

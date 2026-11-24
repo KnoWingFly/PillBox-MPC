@@ -106,16 +106,20 @@ model PasswordResetOtp {
 }
 
 model PushToken {
-  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId      String       @map("user_id") @db.Uuid
-  token       String       @unique @db.VarChar
-  platform    PushPlatform
-  deviceLabel String?      @map("device_label") @db.VarChar
-  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
-  lastSeenAt  DateTime     @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  id              String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId          String       @map("user_id") @db.Uuid
+  token           String       @unique @db.VarChar
+  platform        PushPlatform
+  deviceLabel     String?      @map("device_label") @db.VarChar
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastSeenAt      DateTime     @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  /// The session (refresh_tokens.family_id) the phone registered under: logout or the end of that
+  /// session deletes the token. NULL for tokens registered before this was recorded.
+  refreshFamilyId String?      @map("refresh_family_id") @db.Uuid
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@index([refreshFamilyId])
   @@map("push_tokens")
 }
 

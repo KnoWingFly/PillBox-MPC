@@ -11,6 +11,8 @@ import { ActivityIndicator, BackHandler, Linking, Modal, View } from 'react-nati
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppConfig } from '@/config';
+import { JoinCodeDialog } from '@/components/members/join-code-dialog';
+import { ProfilesWithoutPillboxCard } from '@/components/members/profiles-without-pillbox';
 import { ConnectPillboxScreen } from '@/components/pillbox/connect-card';
 import { TopBar } from '@/components/pillbox/blocks';
 import { PillboxListCard, RenamePillboxDialog } from '@/components/pillbox/device-list';
@@ -42,6 +44,7 @@ import { perfLog, perfLoginStep } from '@/lib/perf';
 import { DevicesProvider, useDevices } from '@root/context/devices-context';
 import * as api from '@root/lib/api';
 import { canEdit, type ConnectPillboxResult, type Pillbox } from '@root/lib/devices';
+import type { AcceptedInvitation } from '@root/lib/members';
 import { NOTIFICATION_DELETE_SUPPORTED } from '@root/lib/notifications';
 import { findAllConflicts, timezoneLabel } from '@root/lib/schedule-time';
 import type {
@@ -94,6 +97,24 @@ function useConnectedHandler(onCarry: (carry: Carry) => void, showToast: (text: 
   };
 }
 
+/**
+ * After joining an elderly profile with an invitation code: follow it live, reload the pillbox list
+ * and open the profile's members screen, which says "joined". It works even when the profile has no
+ * pillbox yet (the dashboard alone would show nothing new).
+ */
+function useJoinedHandler() {
+  const devices = useDevices();
+  const router = useRouter();
+  return (result: AcceptedInvitation, elderlyName: string) => {
+    api.resubscribeRealtime();
+    void devices.refresh();
+    router.push({
+      pathname: '/elderly/[id]/members',
+      params: { id: result.elderly_id, name: elderlyName, joined: '1' },
+    });
+  };
+}
+
 /** What survives the remount when the active pillbox changes (the dashboard is keyed by it). */
 type Carry = { tab?: TabKey; toast?: ToastData };
 
@@ -111,12 +132,27 @@ export default function PillboxScreen() {
  */
 function PillboxGate() {
   const devices = useDevices();
-  // `/?tab=schedule&at=<ms>` opens a tab (e.g. "Atur Jadwal Obat Sekarang" after saving a profile);
-  // `at` makes the same tab requested twice count as two requests.
-  const params = useLocalSearchParams<{ tab?: string; at?: string }>();
+  // `/?tab=schedule&at=<ms>` opens a tab; `at` makes the same tab requested twice count as two
+  // requests. `device=<id>` first makes that pillbox active (a tapped push, a profile's schedule
+  // page); `pair=1` opens "Tambah pillbox".
+  const params = useLocalSearchParams<{ tab?: string; at?: string; device?: string; pair?: string }>();
   const requestedTab = isTabKey(params.tab) ? params.tab : null;
   const tabRequest = requestedTab ? { tab: requestedTab, id: params.at ?? requestedTab } : null;
+  const pairRequest = params.pair ? { id: params.at ?? params.pair } : null;
   const [carriedTab, setCarriedTab] = useState<TabKey>(requestedTab ?? 'home');
+  // A pillbox asked for through the route, applied once per request once the list is known. The
+  // dashboard remounts for the new pillbox, so the requested tab is carried over first.
+  const deviceKey = params.device && devices.pillboxes ? `${params.device}:${params.at ?? ''}` : null;
+  const [seenDeviceKey, setSeenDeviceKey] = useState<string | null>(null);
+  if (deviceKey && deviceKey !== seenDeviceKey) {
+    setSeenDeviceKey(deviceKey);
+    if (requestedTab) setCarriedTab(requestedTab);
+  }
+  const requestedDevice = seenDeviceKey ? params.device : undefined;
+  const selectDevice = devices.select;
+  useEffect(() => {
+    if (requestedDevice) selectDevice(requestedDevice);
+  }, [requestedDevice, seenDeviceKey, selectDevice]);
   // Toasts that must outlive a remount (e.g. "dihapus" after removing the active pillbox) live here.
   const [carriedToast, setCarriedToast] = useState<ToastData | null>(null);
   const hideCarried = useCallback((id: number) => {
@@ -148,7 +184,13 @@ function PillboxGate() {
       {needsPairing ? (
         <NeedsPairingScreen onCarry={carry} />
       ) : (
-        <PillboxDashboard key={devices.active?.id ?? 'none'} initialTab={carriedTab} tabRequest={tabRequest} onCarry={carry} />
+        <PillboxDashboard
+          key={devices.active?.id ?? 'none'}
+          initialTab={carriedTab}
+          tabRequest={tabRequest}
+          pairRequest={pairRequest}
+          onCarry={carry}
+        />
       )}
       {carriedToast && <Toast key={carriedToast.id} toast={carriedToast} onDone={hideCarried} />}
     </>
@@ -163,6 +205,8 @@ function NeedsPairingScreen({ onCarry }: { onCarry: (carry: Carry) => void }) {
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [busy, setBusy] = useState(false);
   const handleConnected = useConnectedHandler(onCarry, showToast);
+  const handleJoined = useJoinedHandler();
+  const [joinOpen, setJoinOpen] = useState(false);
   const { myDeviceIds, findExisting } = pairingLookups(devices);
 
   const runConfirm = async () => {
@@ -187,8 +231,18 @@ function NeedsPairingScreen({ onCarry }: { onCarry: (carry: Carry) => void }) {
           onUnhide={() => void devices.unhideAll()}
           hiddenCount={devices.hidden.length}
           onSignOut={() => setConfirm(signOutRequest(signOut))}
+          onJoinWithCode={api.USE_MOCK ? undefined : () => setJoinOpen(true)}
+          extra={<ProfilesWithoutPillboxCard />}
         />
       </SafeAreaView>
+      <JoinCodeDialog
+        visible={joinOpen}
+        onJoined={(result, elderlyName) => {
+          setJoinOpen(false);
+          handleJoined(result, elderlyName);
+        }}
+        onClose={() => setJoinOpen(false)}
+      />
       <ConfirmDialog request={confirm} busy={busy} onConfirm={() => void runConfirm()} onCancel={() => setConfirm(null)} />
       {toastNode}
     </View>
@@ -209,11 +263,14 @@ function signOutRequest(signOut: () => Promise<void>): ConfirmRequest {
 function PillboxDashboard({
   initialTab,
   tabRequest,
+  pairRequest,
   onCarry,
 }: {
   initialTab: TabKey;
   /** A tab asked for through the route (see PillboxGate); applied once per request id. */
   tabRequest: { tab: TabKey; id: string } | null;
+  /** "Tambah pillbox" asked for through the route; opened once per request id. */
+  pairRequest: { id: string } | null;
   onCarry: (carry: Carry) => void;
 }) {
   const devices = useDevices();
@@ -231,6 +288,11 @@ function PillboxDashboard({
   const [dashboardError, setDashboardError] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [seenPairRequest, setSeenPairRequest] = useState<string | null>(null);
+  if (pairRequest && pairRequest.id !== seenPairRequest) {
+    setSeenPairRequest(pairRequest.id);
+    if (!api.USE_MOCK) setAddOpen(true);
+  }
   const [renameTarget, setRenameTarget] = useState<Pillbox | null>(null);
 
   const [savedSlots, setSavedSlots] = useState<Slot[]>([]);
@@ -260,6 +322,16 @@ function PillboxDashboard({
   const router = useRouter();
   // Today's doses, weekly chart, elderly profile, clock and preferences; days follow the pillbox clock.
   const insights = useDashboardInsights(pillboxNow(device, now), true);
+  const [joinOpen, setJoinOpen] = useState(false);
+  const handleJoined = useJoinedHandler();
+  const membersElderlyId = api.USE_MOCK ? null : (devices.active?.elderlyId ?? insights.elderly?.id ?? null);
+  const openMembers = () => {
+    if (!membersElderlyId) return;
+    router.push({
+      pathname: '/elderly/[id]/members',
+      params: { id: membersElderlyId, name: insights.elderly?.fullName ?? devices.active?.elderlyName ?? '' },
+    });
+  };
   const refreshDoses = insights.refreshDoses;
   const [remindBusy, setRemindBusy] = useState(false);
   const [calibrateOpen, setCalibrateOpen] = useState(false);
@@ -943,6 +1015,8 @@ function PillboxDashboard({
                   onOpenDevice={() => openTab('device')}
                   onAddElderly={api.USE_MOCK ? undefined : () => router.push('/elderly/new')}
                   onAddDevice={api.USE_MOCK ? undefined : () => setAddOpen(true)}
+                  onOpenMembers={membersElderlyId ? openMembers : undefined}
+                  onJoinWithCode={api.USE_MOCK ? undefined : () => setJoinOpen(true)}
                   onSignOut={handleSignOut}
                 />
               )}
@@ -1005,6 +1079,14 @@ function PillboxDashboard({
           openTab('home');
         }}
         onClose={() => setSyncedSlots(null)}
+      />
+      <JoinCodeDialog
+        visible={joinOpen}
+        onJoined={(result, elderlyName) => {
+          setJoinOpen(false);
+          handleJoined(result, elderlyName);
+        }}
+        onClose={() => setJoinOpen(false)}
       />
       <ConfirmDialog
         request={confirmRequest}

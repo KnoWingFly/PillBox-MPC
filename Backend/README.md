@@ -20,7 +20,7 @@ app/
   services/               all logic: telemetry, adherence, doses, rules_engine, presence,
                           connection_manager, notifications, device_management, schedules,
                           stock, elderly, journal, notification_feed, provisioning
-migrations/               0001 = ERD tables, 0002 = backend additions not in the ERD, 0003-0009 = indexes and later changes (0007 attempt counters, 0008 FK index, 0009 notify_on_taken default)
+migrations/               0001 = ERD tables, 0002 = backend additions not in the ERD, 0003-0012 = indexes and later changes (0007 attempt counters, 0008 FK index, 0009 notify_on_taken default, 0010-0011 invitation codes and limits, 0012 per-pillbox mutes)
 scripts/migrate.py        applies migrations/*.sql
 scripts/fake_device.py    device test client (REST + WS, Wi-Fi off/on simulation)
 tests/                    pytest suite against a real Postgres test database
@@ -103,15 +103,16 @@ Type `open 1`, `close 1`, `wifi off`, `wifi on`, `status`, `help` while it runs.
 | Area | Routes |
 |---|---|
 | Device protocol (X-Device-Key) | `POST /devices/{code}/heartbeat`, `GET /devices/{code}/config`, `POST /devices/{code}/config-ack`, `POST /devices/{code}/telemetry`, WS `/ws/device/{code}` |
-| Devices | `POST /devices/pairing/scan` (rate-limited per user), `POST /devices`, `GET /devices?page&limit`, `GET/PUT/DELETE /devices/{id}`, `POST /devices/{id}/join`, `PUT /devices/{id}/pin`, `GET /devices/{id}/status`, `GET /devices/{id}/clock`, `POST /devices/{id}/clock/calibrate`, `POST/DELETE /devices/{id}/alarm`, `GET /devices/{id}/events` |
+| Devices | `POST /devices/pairing/scan` (rate-limited per user), `POST /devices`, `GET /devices?page&limit`, `GET/PUT/DELETE /devices/{id}`, `POST /devices/{id}/join`, `PUT /devices/{id}/pin`, `GET /devices/{id}/status`, `GET /devices/{id}/clock`, `POST /devices/{id}/clock/calibrate`, `POST/DELETE /devices/{id}/alarm`, `GET /devices/{id}/events`, `DELETE /devices/{id}?purge_my_notifications=true` (unpair + delete the caller's notifications about it), `DELETE`/`PUT /devices/{id}/membership` (a non-owner stops / resumes following one pillbox; `GET /devices` items carry `is_muted`) |
 | Schedules | `GET/POST /devices/{id}/schedules`, `PUT/DELETE /devices/{id}/schedules/{schedule_id}`, `POST /devices/{id}/schedules/validate` |
 | Stock | `POST /devices/{id}/refill-mode`, `POST/GET /devices/{id}/refills`, `GET /devices/{id}/stock` |
-| Elderly | `POST/GET /elderly`, `GET/PUT/DELETE /elderly/{id}`, `POST /elderly/{id}/caregivers`, `GET /elderly/{id}/caregivers?page&limit`, `DELETE /elderly/{id}/caregivers/{caregiver_id}`, `POST /elderly/{id}/transfer-ownership`, `GET/PUT /elderly/{id}/notification-preferences` |
+| Elderly | `POST/GET /elderly`, `GET/PUT/DELETE /elderly/{id}`, `GET /elderly/{id}/caregivers?page&limit`, `PUT/DELETE /elderly/{id}/caregivers/{caregiver_id}`, `POST /elderly/{id}/transfer-ownership`, `GET/PUT /elderly/{id}/notification-preferences` |
+| Invitations | `POST/GET /elderly/{id}/invitations`, `DELETE /elderly/{id}/invitations/{invitation_id}`, `POST /invitations/preview`, `POST /invitations/accept` (rules: `docs/ai/domain.md`, "Roles") |
 | Elderly validation | `POST`/`PUT /elderly`: `full_name` is trimmed, `ELDERLY_NAME_MIN_LENGTH`..100 chars; `birth_date` must not be in the future nor more than `ELDERLY_MAX_AGE_YEARS` ago; `contact_phone` is E.164. Failures are `422 VALIDATION_ERROR` with `details[].path` (e.g. `body.birth_date`). A profile can be created with only `full_name`; devices are added afterwards through pairing. |
 | Journal | `GET /elderly/{id}/journal/calendar?month=YYYY-MM`, `GET /elderly/{id}/journal/{YYYY-MM-DD}`, `GET /elderly/{id}/journal/summary?start&end`, `PUT /journal/dose-logs/{id}/manual-confirmation` |
 | Notifications | `GET /notifications?tab=ALL\|LATE_MISSED\|RESOLVED&elderly_id&device_id&page&limit` (`unread_count` follows `elderly_id`/`device_id`), `GET /notifications/{id}`, `PUT /notifications/{id}/read`, `PUT /notifications/read-all`, `PUT /notifications/{id}/resolve`, `DELETE /notifications?device_id&up_to_created_at&up_to_id` (one pillbox's rows, or up to a boundary), `DELETE /notifications/{id}` |
 | App push (no prefix) | WS `/ws/app`: first message `{"type":"auth","token":"<access token>"}`, then right after each commit the server sends `{"type":"notifications","items":[…]}` (the new rows, as in `GET /notifications`) or `{"type":"device","device_id","status":{…}}` (the `GET /devices/{id}/status` body), so the app updates without refetching. Polling stays as the fallback (`app/services/app_hub.py`) |
-| Admin | `POST /admin/devices`, `POST /admin/devices/{code}/rotate-secret` (X-Provisioning-Token) |
+| Admin | `POST /admin/devices`, `POST /admin/devices/{code}/rotate-secret`, `POST /admin/devices/{code}/reset` (factory reset: unpair, delete schedules, doses, events, stock, notifications) (X-Provisioning-Token) |
 | Misc | `GET /me`, `GET /health`, `GET /health/db` |
 
 Auth, settings and push-token routes (`/auth/*`, `/setting*`) are served by the Mobile app's Expo API routes against the same database. They are not duplicated here.
@@ -120,4 +121,8 @@ Errors: `{"error": {"code", "message", "details"?}}`, the same format as the Mob
 
 ## Push notifications
 
-Notifications are written to the `notifications` table only. Real Expo/FCM delivery is a marked extension point: `app/services/notifications.py::dispatch_push`, which should read `push_tokens`.
+Every new notification row is also sent to the caregiver's phones through the Expo Push API, after the transaction commits (`app/services/push.py`): one message per row of `push_tokens` (read-only here), title and body in the caregiver's language, `high` priority for WARNING/CRITICAL, delivery receipts read `EXPO_PUSH_RECEIPT_DELAY_SECONDS` later. A caregiver who turned push off for that elderly (`channels.push`) or stopped following the pillbox gets none. `PUSH_ENABLED=false` turns it off (tests do). Unregistered tokens are logged by id; the auth server deletes a phone's token when its session ends.
+
+## Hosting
+
+One always-on process (never more than one worker or instance). `Dockerfile` here, Render Blueprint in `../render.yaml`, steps for Render and Railway in `../docs/DEPLOY_BACKEND.md`.

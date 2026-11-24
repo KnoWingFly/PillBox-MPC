@@ -9,14 +9,27 @@ from uuid import UUID
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError, conflict, forbidden, not_found, unprocessable
-from app.models import Device, Elderly, Invitation, Notification, NotificationPreference, User, UserElderlyRole
-from app.models.enums import ALL_ROLES, EDITOR_ROLES, Connectivity, Gender, InvitationStatus, Role, Severity
+from app.models import (
+    Device,
+    DeviceMute,
+    Elderly,
+    Notification,
+    NotificationPreference,
+    User,
+    UserElderlyRole,
+)
+from app.models.enums import (
+    ALL_ROLES,
+    EDITOR_ROLES,
+    Connectivity,
+    Gender,
+    Role,
+    Severity,
+)
 from app.schemas.elderly import (
-    CaregiverInvite,
     CaregiverOut,
     Channels,
     ElderlyCreated,
@@ -32,6 +45,7 @@ from app.schemas.common import E164_PATTERN
 from app.services.access import require_role
 from app.services.app_hub import queue_roles_changed
 from app.services.device_management import unpair
+from app.services.invitations import revoke_invitations_beyond
 from app.services.journal import day_doses_many, summarize
 from app.services.timeutil import zone
 
@@ -214,65 +228,6 @@ async def soft_delete(session: AsyncSession, user: User, elderly_id: UUID, now: 
 
 # --- caregivers -------------------------------------------------------------------
 
-async def invite(
-    session: AsyncSession, user: User, elderly_id: UUID, body: CaregiverInvite, now: datetime
-) -> CaregiverOut:
-    await require_role(session, user.id, elderly_id, EDITOR_ROLES)
-    email = body.email.strip().lower()  # Mobile stores emails lowercase
-    if email == user.email.lower():
-        raise AppError(400, "CANNOT_INVITE_SELF", "You cannot invite yourself")
-    invitee = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
-    if invitee is None:
-        raise not_found("CAREGIVER_NOT_REGISTERED", "No PillCare account uses this email")
-    existing = (
-        await session.execute(
-            select(UserElderlyRole).where(
-                UserElderlyRole.user_id == invitee.id, UserElderlyRole.elderly_id == elderly_id
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise conflict("ALREADY_CAREGIVER", "This user is already a caregiver of this elderly")
-    # The API List adds a registered user immediately; the invitation row is
-    # kept as the audit record (status ACCEPTED). ASSUMPTION.
-    session.add(
-        Invitation(
-            elderly_id=elderly_id,
-            invited_by_user_id=user.id,
-            invitee_email=email,
-            invitee_user_id=invitee.id,
-            role=body.role,
-            relationship_label=body.relationship_label,
-            status=InvitationStatus.ACCEPTED.value,
-            responded_at=now,
-        )
-    )
-    session.add(
-        UserElderlyRole(
-            user_id=invitee.id,
-            elderly_id=elderly_id,
-            role=body.role,
-            relationship_label=body.relationship_label,
-            created_at=now,
-        )
-    )
-    queue_roles_changed(session, invitee.id)
-    try:
-        await session.commit()
-    except IntegrityError as exc:
-        # Two invites of the same person raced past the check above.
-        await session.rollback()
-        raise conflict("ALREADY_CAREGIVER", "This user is already a caregiver of this elderly") from exc
-    logger.info("caregiver_added", extra={"elderly_id": str(elderly_id), "caregiver_id": str(invitee.id)})
-    return CaregiverOut(
-        caregiver_id=invitee.id,
-        full_name=invitee.full_name,
-        role=Role(body.role),
-        relationship_label=body.relationship_label,
-        added_at=now,
-    )
-
-
 async def list_caregivers(
     session: AsyncSession, user: User, elderly_id: UUID, offset: int, limit: int
 ) -> tuple[list[CaregiverOut], int]:
@@ -323,6 +278,14 @@ async def remove_caregiver(session: AsyncSession, user: User, elderly_id: UUID, 
     if my_role != Role.OWNER and caregiver_id != user.id:
         raise AppError(403, "FORBIDDEN", "Only the owner can remove other caregivers")
     await session.delete(target)
+    await revoke_invitations_beyond(session, elderly_id, caregiver_id, None)
+    # Their per-pillbox mutes of this profile's pillboxes go too (a rejoin starts clean).
+    await session.execute(
+        delete(DeviceMute).where(
+            DeviceMute.user_id == caregiver_id,
+            DeviceMute.device_id.in_(select(Device.id).where(Device.elderly_id == elderly_id)),
+        )
+    )
     queue_roles_changed(session, caregiver_id)
     await session.execute(
         delete(NotificationPreference).where(
@@ -330,6 +293,42 @@ async def remove_caregiver(session: AsyncSession, user: User, elderly_id: UUID, 
         )
     )
     await session.commit()
+
+
+async def change_role(
+    session: AsyncSession, user: User, elderly_id: UUID, caregiver_id: UUID, role: Role
+) -> CaregiverOut:
+    """OWNER changes another caregiver's access (ADMIN <-> PEMANTAU). The OWNER role itself only
+    moves with transfer_ownership()."""
+    await require_role(session, user.id, elderly_id, {Role.OWNER})
+    row = (
+        await session.execute(
+            select(UserElderlyRole, User.full_name)
+            .join(User, User.id == UserElderlyRole.user_id)
+            .where(UserElderlyRole.user_id == caregiver_id, UserElderlyRole.elderly_id == elderly_id)
+            .with_for_update(of=UserElderlyRole)
+        )
+    ).one_or_none()
+    if row is None:
+        raise not_found("CAREGIVER_NOT_FOUND", "Caregiver not found")
+    target, full_name = row
+    if target.role == Role.OWNER:
+        raise conflict("CANNOT_CHANGE_OWNER_ROLE", "Transfer ownership to change the owner's role")
+    target.role = role.value
+    await revoke_invitations_beyond(session, elderly_id, caregiver_id, role)
+    queue_roles_changed(session, caregiver_id)
+    await session.commit()
+    logger.info(
+        "caregiver_role_changed",
+        extra={"elderly_id": str(elderly_id), "caregiver_id": str(caregiver_id), "role": role.value},
+    )
+    return CaregiverOut(
+        caregiver_id=caregiver_id,
+        full_name=full_name,
+        role=role,
+        relationship_label=target.relationship_label,
+        added_at=target.created_at,
+    )
 
 
 async def transfer_ownership(
@@ -355,6 +354,8 @@ async def transfer_ownership(
     mine.role = Role.ADMIN.value
     await session.flush()
     target.role = Role.OWNER.value
+    await revoke_invitations_beyond(session, elderly_id, user.id, Role.ADMIN)
+    queue_roles_changed(session, user.id, new_owner_id)
     await session.commit()
     logger.info("ownership_transferred", extra={"elderly_id": str(elderly_id), "new_owner": str(new_owner_id)})
     return TransferOwnershipOut(message="OWNERSHIP_TRANSFERRED", your_new_role=Role.ADMIN)

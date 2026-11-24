@@ -449,3 +449,47 @@ def test_worker_pulls_a_waiting_config_after_the_flush(db, monkeypatch) -> None:
     monkeypatch.setattr(sync, "pull_latest_config", lambda *a, **k: calls.append("config") or True)
     SyncWorker(db, SimulatedClock(start_at=T0), battery=80, is_online=True, chambers=[]).run()
     assert calls == ["heartbeat", "flush", "config"]
+
+
+# --- Reset Identitas: factory reset on the server first (BACKEND_HANDOFF item 7) -----------------
+
+
+class _ResetBackend:
+    def __init__(self, status=None, error=None):
+        self.status, self.error, self.calls = status, error, []
+
+    def post(self, url, headers=None, timeout=None, **_):
+        self.calls.append((url, headers))
+        if self.error:
+            raise self.error
+        response = requests.Response()
+        response.status_code = self.status
+        return response
+
+
+def test_reset_on_server_calls_the_admin_endpoint(monkeypatch):
+    backend = _ResetBackend(status=204)
+    monkeypatch.setattr(sync, "_http", lambda: backend)
+    assert sync.reset_on_server("PB-ABCD1234", "token") is None
+    url, headers = backend.calls[0]
+    assert url.endswith("/admin/devices/PB-ABCD1234/reset")
+    assert headers == {"X-Provisioning-Token": "token"}
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "expected"),
+    [
+        (401, None, "token salah"),
+        (404, None, "tidak mengenal"),
+        (500, None, "HTTP 500"),
+        (None, requests.ConnectionError(), "tidak dapat dihubungi"),
+    ],
+)
+def test_reset_on_server_explains_failures(monkeypatch, status, error, expected):
+    monkeypatch.setattr(sync, "_http", lambda: _ResetBackend(status=status, error=error))
+    assert expected in sync.reset_on_server("PB-ABCD1234", "token")
+
+
+def test_reset_without_token_sends_nothing(monkeypatch):
+    monkeypatch.setattr(sync, "_http", lambda: pytest.fail("nothing may be sent"))
+    assert "PROVISIONING_TOKEN" in sync.reset_on_server("PB-ABCD1234", None)

@@ -8,10 +8,11 @@ PEMANTAU is read-only. A caller with no role on the elderly gets 404 (not
 from collections.abc import Collection
 from uuid import UUID
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import forbidden, not_found
+from app.core.config import Settings
+from app.core.errors import conflict, forbidden, not_found
 from app.models import Device, Elderly, UserElderlyRole
 from app.models.enums import Role
 
@@ -45,6 +46,31 @@ async def require_role(
     if role not in allowed:
         raise _deny(allowed)
     return role
+
+
+# Roles a caregiver may hand out, by the giver's own role (docs/ai/domain.md): an ADMIN
+# invites monitors only, so the ADMIN role is granted only by the OWNER.
+GRANTABLE_ROLES: dict[Role, frozenset[Role]] = {
+    Role.OWNER: frozenset({Role.ADMIN, Role.PEMANTAU}),
+    Role.ADMIN: frozenset({Role.PEMANTAU}),
+    Role.PEMANTAU: frozenset(),
+}
+
+
+def require_grantable(giver: Role, role: Role) -> None:
+    if role not in GRANTABLE_ROLES[giver]:
+        raise forbidden(message="Your role cannot grant this access")
+
+
+async def ensure_member_room(session: AsyncSession, elderly_id: UUID, settings: Settings) -> None:
+    """409 MEMBER_LIMIT_REACHED when one more caregiver would exceed MAX_CAREGIVERS_PER_ELDERLY.
+    Locks the elderly row until the caller commits, so two joins at once cannot both pass the count."""
+    await session.execute(select(Elderly.id).where(Elderly.id == elderly_id).with_for_update())
+    members = await session.scalar(
+        select(func.count()).select_from(UserElderlyRole).where(UserElderlyRole.elderly_id == elderly_id)
+    )
+    if (members or 0) >= settings.max_caregivers_per_elderly:
+        raise conflict("MEMBER_LIMIT_REACHED", "This elderly profile already has the maximum number of caregivers")
 
 
 async def get_device_for_user(

@@ -179,6 +179,31 @@ def forget_identity(db: Database) -> None:
         logger.info("Identity reset: dropped %d unsent event(s) of the old identity.", dropped)
 
 
+def reset_on_server(code: str, provisioning_token: str | None) -> str | None:
+    """Factory reset on the backend before the emulator forgets its identity
+    (POST /admin/devices/{code}/reset, Mobile/BACKEND_HANDOFF.md item 7): the server unpairs the
+    device and deletes its schedules, doses, stock and notifications, so the caregivers' apps stop
+    showing a pillbox that no longer exists. Returns None when done, else why it was not done
+    (the local reset still goes ahead)."""
+    if not provisioning_token:
+        return "PROVISIONING_TOKEN tidak ditemukan, jadi data pillbox ini tetap ada di server."
+    try:
+        response = _http().post(
+            f"{config.BACKEND_BASE_URL}/admin/devices/{code}/reset",
+            headers={"X-Provisioning-Token": provisioning_token},
+            timeout=config.REGISTER_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return f"Server tidak dapat dihubungi ({config.BACKEND_BASE_URL}), jadi data pillbox ini tetap ada di server."
+    if response.status_code == HTTPStatus.NO_CONTENT:
+        return None
+    if response.status_code == HTTPStatus.UNAUTHORIZED:
+        return "Provisioning token salah, jadi data pillbox ini tetap ada di server."
+    if response.status_code == HTTPStatus.NOT_FOUND:
+        return "Server tidak mengenal kode ini atau reset dinonaktifkan; tidak ada yang dihapus di server."
+    return f"Reset di server gagal (HTTP {response.status_code}); data pillbox ini tetap ada di server."
+
+
 def _pending_identity(db: Database) -> tuple[str, str]:
     """The code + secret this emulator asks the backend to register. Created once and
     kept until registration is confirmed, so retrying after a timeout re-sends the SAME

@@ -23,6 +23,8 @@ class AttemptScope(StrEnum):
     DEVICE_PIN = "DEVICE_PIN"  # PIN actions of a device's caregivers
     DEVICE_PIN_JOIN = "DEVICE_PIN_JOIN"  # join by callers who are not caregivers yet
     PAIRING_SCAN = "PAIRING_SCAN"
+    CAREGIVER_INVITE = "CAREGIVER_INVITE"  # invites sent, per inviting user (migration 0010)
+    INVITE_CODE = "INVITE_CODE"  # invitation code previews/accepts, per user (migration 0011)
 
 
 class Gender(StrEnum):

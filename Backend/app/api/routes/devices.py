@@ -91,8 +91,28 @@ async def update_device(device_id: UUID, body: DeviceUpdateIn, user: CurrentUser
 
 
 @router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def unpair_device(device_id: UUID, user: CurrentUser, db: DbSession) -> Response:
-    await svc.remove(db, user, device_id, datetime.now(UTC))
+async def unpair_device(
+    device_id: UUID,
+    user: CurrentUser,
+    db: DbSession,
+    purge_my_notifications: bool = Query(
+        False, description="Also delete the caller's own notifications about this pillbox, in the same transaction"
+    ),
+) -> Response:
+    await svc.remove(db, user, device_id, datetime.now(UTC), purge_my_notifications=purge_my_notifications)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/{device_id}/membership", status_code=status.HTTP_204_NO_CONTENT)
+async def leave_device(device_id: UUID, user: CurrentUser, db: DbSession) -> Response:
+    """Stop following this pillbox only (not the whole elderly profile)."""
+    await svc.leave(db, user, device_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/{device_id}/membership", status_code=status.HTTP_204_NO_CONTENT)
+async def rejoin_device(device_id: UUID, user: CurrentUser, db: DbSession) -> Response:
+    await svc.rejoin(db, user, device_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

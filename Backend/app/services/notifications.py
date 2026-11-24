@@ -5,7 +5,7 @@ Idempotency: every notification carries an `event_key` naming the incident
 re-running the rules engine, retrying telemetry, or restarting the server
 can never create the same notification twice.
 
-Push delivery (Expo/FCM) is NOT implemented: see dispatch_push().
+Phone push: every new row is queued for the Expo Push API and sent after commit (services/push.py).
 """
 
 import logging
@@ -23,7 +23,8 @@ from sqlalchemy.orm import Session, SessionTransaction
 
 from app.core import timing
 from app.services.app_hub import queue_notifications
-from app.models import Elderly, Notification, NotificationPreference, User, UserElderlyRole
+from app.services.push import PushItem, queue_push
+from app.models import DeviceMute, Elderly, Notification, NotificationPreference, User, UserElderlyRole
 from app.models.enums import NotificationType, Severity
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,23 @@ _TEMPLATES: dict[NotificationType, dict[str, str]] = {
 }
 
 
+# Phone push titles (the body is the localized message above).
+_PUSH_TITLES: dict[NotificationType, dict[str, str]] = {
+    NotificationType.DOSE_MISSED: {"ID": "Dosis terlewat", "EN": "Missed dose"},
+    NotificationType.DOSE_LATE: {"ID": "Obat diminum terlambat", "EN": "Dose taken late"},
+    NotificationType.DOSE_TAKEN: {"ID": "Obat sudah diminum", "EN": "Dose taken"},
+    NotificationType.DEVICE_OFFLINE: {"ID": "Pillbox tidak terhubung", "EN": "Pillbox offline"},
+    NotificationType.DEVICE_ONLINE: {"ID": "Pillbox terhubung lagi", "EN": "Pillbox back online"},
+    NotificationType.LOW_BATTERY: {"ID": "Baterai pillbox lemah", "EN": "Pillbox battery low"},
+    NotificationType.UNSCHEDULED_OPEN: {"ID": "Bilik dibuka di luar jadwal", "EN": "Compartment opened off schedule"},
+}
+
+
+def render_title(ntype: NotificationType, language: str) -> str:
+    titles = _PUSH_TITLES[ntype]
+    return titles.get(language, titles[DEFAULT_LANGUAGE])
+
+
 # Alternative wording for the same type, chosen with NotificationSpec.variant.
 _VARIANTS: dict[tuple[NotificationType, str], dict[str, str]] = {
     # A dose first reported missed was taken after all (late release, sensor, or caregiver).
@@ -306,6 +324,16 @@ async def notify(
     return await notify_many(session, [(spec, recipients, only_user_ids)])
 
 
+async def _muted_pairs(session: AsyncSession, device_ids: set[UUID]) -> set[tuple[UUID, UUID | None]]:
+    """(user_id, device_id) pairs that must not be notified; one query per batch, none without devices."""
+    if not device_ids:
+        return set()
+    rows = await session.execute(
+        select(DeviceMute.user_id, DeviceMute.device_id).where(DeviceMute.device_id.in_(device_ids))
+    )
+    return {(user_id, device_id) for user_id, device_id in rows.all()}
+
+
 async def notify_many(
     session: AsyncSession,
     batch: list[tuple[NotificationSpec, list[Recipient], Collection[UUID] | None]],
@@ -313,9 +341,12 @@ async def notify_many(
     """notify() for many incidents at once (spec, its elderly's recipients, optional user filter):
     one multi-row INSERT per chunk instead of one per incident (a backlog pass can decide
     thousands of doses). Returns the new row ids. Does not commit."""
+    muted = await _muted_pairs(session, {spec.device_id for spec, _, _ in batch if spec.device_id is not None})
     rows: list[tuple[NotificationSpec, Recipient, dict[str, Any]]] = []
     for spec, recipients, only_user_ids in batch:
         for r in recipients:
+            if (r.user_id, spec.device_id) in muted:
+                continue  # this caregiver stopped following the pillbox (DELETE /devices/{id}/membership)
             if wants(r.prefs, spec.type) and (only_user_ids is None or r.user_id in only_user_ids):
                 rows.append((spec, r, {
                     "user_id": r.user_id,
@@ -361,7 +392,7 @@ async def notify_many(
     )
     # Open app sockets receive the new rows right after commit.
     items: dict[UUID, list[dict[str, Any]]] = {}
-    push: list[tuple[UUID, UUID]] = []
+    push: list[PushItem] = []
     for nid, uid, created_at, key in inserted:
         spec, recipient, values = by_key[(key, uid)]
         items.setdefault(uid, []).append(
@@ -381,24 +412,24 @@ async def notify_many(
             }
         )
         if recipient.prefs.push_enabled:
-            push.append((nid, uid))
+            push.append(
+                PushItem(
+                    user_id=uid,
+                    title=render_title(spec.type, recipient.language),
+                    body=values["message"],
+                    severity=spec.severity.value,
+                    # What the app needs to open the right place; no health text beyond the body.
+                    data={
+                        "notification_id": str(nid),
+                        "type": spec.type.value,
+                        "elderly_id": str(spec.elderly_id),
+                        "device_id": str(spec.device_id) if spec.device_id else None,
+                    },
+                )
+            )
     queue_notifications(session, items)
-    await dispatch_push(session, push)
+    queue_push(session, push)
     return [nid for nid, _, _, _ in inserted]
-
-
-async def dispatch_push(session: AsyncSession, notifications: list[tuple[UUID, UUID]]) -> None:
-    """EXTENSION POINT for real push delivery (deliberately not implemented).
-
-    To add Expo/FCM push: for each (notification_id, user_id), read
-    push_tokens WHERE user_id = :user_id (app.models.PushToken), send via the
-    Expo Push API / FCM, and delete tokens the provider reports as
-    unregistered. Run delivery after the surrounding transaction commits
-    (e.g. collect ids here and send from a background task) so a rollback
-    never produces a push for a notification that does not exist.
-    """
-    if notifications:
-        logger.debug("push_dispatch_not_implemented", extra={"count": len(notifications)})
 
 
 def ts_key(dt: datetime) -> str:

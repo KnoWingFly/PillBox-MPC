@@ -13,7 +13,6 @@ import { Strings } from '@/constants/strings';
 import {
   BackendError,
   backendRequest as backend,
-  deleteBackendNotificationsForDevice,
   getDeviceStatus,
   USE_MOCK,
 } from './api';
@@ -33,6 +32,8 @@ export interface Pillbox {
   lastSeenAt: number | null;
   /** This caregiver's role on the pillbox's elderly profile; null = unknown. */
   myRole: PillboxRole | null;
+  /** This caregiver stopped following it (hidden on every phone, no new alerts about it). */
+  muted: boolean;
 }
 
 export interface ElderlyProfile {
@@ -62,6 +63,7 @@ type DeviceListItem = {
   connectivity: 'ONLINE' | 'OFFLINE';
   battery_percent: number | null;
   last_seen_at: string | null;
+  is_muted?: boolean;
 };
 type ElderlyListItem = { id: string; full_name: string; nickname: string | null; my_role: PillboxRole };
 
@@ -96,6 +98,7 @@ export async function listPillboxes(): Promise<Pillbox[]> {
         batteryPercent: status.batteryPercent,
         lastSeenAt: status.lastSyncedAt,
         myRole: 'OWNER',
+        muted: false,
       },
     ];
   }
@@ -115,6 +118,7 @@ export async function listPillboxes(): Promise<Pillbox[]> {
     batteryPercent: d.battery_percent,
     lastSeenAt: d.last_seen_at ? Date.parse(d.last_seen_at) : null,
     myRole: (d.elderly_id && roleOf.get(d.elderly_id)) || null,
+    muted: d.is_muted ?? false,
   }));
 }
 
@@ -259,24 +263,18 @@ export async function renamePillbox(id: string, name: string): Promise<void> {
 
 /** Most notifications scanned when deleting by device (100 per page). */
 /**
- * Unpairs a pillbox for EVERY caregiver of its elderly profile (OWNER only, server-enforced), then
- * deletes this caregiver's notification history for it.
- * The unpair itself (Backend device_management.unpair) soft-deletes the pillbox's schedules,
- * removes pending doses and clears its PIN and nickname. Notifications are not touched by the
- * backend, so the history purge is a second, best-effort request (one DELETE for all rows):
- * `notificationsFailed` > 0 means it failed and the rows can be deleted from the Notifikasi tab.
- * TODO(backend-branch): DELETE /devices/{id}?purge_my_notifications=true (handoff item 5).
+ * Unpairs a pillbox for EVERY caregiver of its elderly profile (OWNER only, server-enforced) and
+ * deletes this caregiver's notification history for it, in one transaction
+ * (`purge_my_notifications=true`, Mobile/BACKEND_HANDOFF.md item 5). The unpair soft-deletes the
+ * pillbox's schedules, removes pending doses and clears its PIN and nickname; other caregivers keep
+ * their notification history.
  */
 export async function unpairPillbox(
   pillbox: Pick<Pillbox, 'id' | 'elderlyId'>,
-): Promise<{ notificationsDeleted: number; notificationsFailed: number }> {
+): Promise<{ notificationsFailed: number }> {
   if (USE_MOCK) return mockUnsupported();
-  await backend(`/devices/${pillbox.id}`, 'DELETE');
-  const purge = await deleteBackendNotificationsForDevice(pillbox.id).then(
-    (deleted) => ({ deleted, failed: 0 }),
-    () => ({ deleted: 0, failed: 1 }),
-  );
-  return { notificationsDeleted: purge.deleted, notificationsFailed: purge.failed };
+  await backend(`/devices/${pillbox.id}?purge_my_notifications=true`, 'DELETE');
+  return { notificationsFailed: 0 };
 }
 
 // --- per-account preferences on this phone -----------------------------------------
@@ -297,9 +295,24 @@ export async function saveActivePillboxId(userId: string, id: string | null): Pr
 }
 
 /**
- * Pillboxes a non-owner chose to hide. The backend has no per-device "leave" for PEMANTAU/ADMIN
- * (their role is on the whole elderly profile), so hiding is local to this phone.
- * TODO(backend-branch): DELETE /devices/{id}/membership (handoff item 6).
+ * A non-owner stops following one pillbox without leaving the elderly profile: it is hidden on
+ * every phone of this account and sends them no new alerts (DELETE /devices/{id}/membership,
+ * Mobile/BACKEND_HANDOFF.md item 6). Their role, and so their access, stays.
+ */
+export async function mutePillbox(id: string): Promise<void> {
+  if (USE_MOCK) return mockUnsupported();
+  await backend(`/devices/${id}/membership`, 'DELETE');
+}
+
+/** Follow the pillbox again (PUT /devices/{id}/membership). */
+export async function unmutePillbox(id: string): Promise<void> {
+  if (USE_MOCK) return mockUnsupported();
+  await backend(`/devices/${id}/membership`, 'PUT');
+}
+
+/**
+ * Pillboxes hidden on this phone only, from before the server kept them. Read once on start-up,
+ * muted on the server, then cleared (DevicesProvider).
  */
 export async function loadHiddenPillboxIds(userId: string): Promise<string[]> {
   try {
@@ -311,6 +324,6 @@ export async function loadHiddenPillboxIds(userId: string): Promise<string[]> {
   }
 }
 
-export async function saveHiddenPillboxIds(userId: string, ids: string[]): Promise<void> {
-  await AsyncStorage.setItem(hiddenKey(userId), JSON.stringify(ids));
+export async function clearHiddenPillboxIds(userId: string): Promise<void> {
+  await AsyncStorage.removeItem(hiddenKey(userId)).catch(() => undefined);
 }

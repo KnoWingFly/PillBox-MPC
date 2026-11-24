@@ -5,15 +5,29 @@ that variable is unset. The plain secret is returned once and never stored."""
 import hmac
 import logging
 
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.errors import AppError, conflict, not_found, unprocessable
 from app.core.security import generate_device_code, generate_device_secret, hash_device_secret
-from app.models import Device
+from app.models import (
+    Device,
+    DeviceEvent,
+    DeviceMute,
+    DeviceStock,
+    Notification,
+    Refill,
+    Schedule,
+    TelemetryLog,
+    UserElderlyRole,
+)
 from app.schemas.admin import ProvisionDeviceIn, ProvisionDeviceOut, RotateSecretOut
-from app.services.connection_manager import WS_CLOSE_AUTH_FAILED, connection_manager
+from app.services.app_hub import queue_roles_changed
+from app.services.connection_manager import WS_CLOSE_AUTH_FAILED, WS_CLOSE_REPLACED, connection_manager
+from app.services.device_management import unpair
 
 logger = logging.getLogger(__name__)
 
@@ -72,3 +86,32 @@ async def rotate_secret(
     await connection_manager.close(device.id, WS_CLOSE_AUTH_FAILED, "device secret rotated")
     logger.info("device_secret_rotated", extra={"device_id": str(device.id)})
     return RotateSecretOut(device_code=device_code, device_secret=secret)
+
+
+async def factory_reset(session: AsyncSession, device_code: str, now: datetime) -> None:
+    """POST /admin/devices/{code}/reset (Mobile/BACKEND_HANDOFF.md item 7): the emulator's "Reset
+    Identitas", or a real factory reset. Unpairs the device and hard-deletes everything recorded
+    for it: schedules, doses, raw events, stock, refills, mutes and every caregiver's notifications
+    about it. The device row and its secret stay, so a real device whose code and secret are in its
+    firmware can be paired again. Caregivers' apps reload their pillbox list at once."""
+    device = (
+        await session.execute(select(Device).where(Device.device_code == device_code).with_for_update())
+    ).scalar_one_or_none()
+    if device is None:
+        raise not_found(message="Device not found")
+    caregivers: list = []
+    if device.elderly_id is not None:
+        caregivers = list(
+            (await session.execute(
+                select(UserElderlyRole.user_id).where(UserElderlyRole.elderly_id == device.elderly_id)
+            )).scalars()
+        )
+    # Children first (notifications and raw events point at doses, doses at schedules).
+    for model in (Notification, DeviceEvent, TelemetryLog, Schedule, DeviceStock, Refill, DeviceMute):
+        await session.execute(delete(model).where(model.device_id == device.id))
+    await unpair(session, device, now)
+    queue_roles_changed(session, *caregivers)
+    await session.commit()
+    # A socket from before the reset belongs to the old identity: the device reconnects.
+    await connection_manager.close(device.id, WS_CLOSE_REPLACED, "device reset")
+    logger.info("device_factory_reset", extra={"device_id": str(device.id), "caregivers": len(caregivers)})

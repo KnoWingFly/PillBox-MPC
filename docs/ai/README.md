@@ -40,12 +40,13 @@ Folder layouts, commands, env names, migration numbering, error body shape, JWT 
 Permission and rule syntax confirmed from the official docs on 23 Oct 2026: a `Bash(cmd *)` rule also matches the bare `cmd`; deny/ask rules apply to each part of a compound command (`cd X && cmd`) but not to rewritten forms such as `pnpm -C Mobile exec ...`; `Read(**/.env)` matches at any depth; `.claude/rules` `paths:` globs are relative to the repo root; Antigravity `globs` accepts comma-separated patterns and only reads files directly inside `.agents/rules/`.
 
 ## Not verified (check before relying on it)
-- Expo API route hosting outside the dev server.
 - Whether the API list spreadsheet has fields or codes the code does not implement yet.
 - Antigravity subagents were not configured; only rules and skills were.
+- Expo API routes hosted on Vercel (`Mobile/vercel.json`, Nov 2026): the configuration is in the repo, but these guides did not run a deployment.
 
 ## Open decisions (see `architecture.md`)
-Auth server hosting, account deletion for OWNERs, `notify_on_taken` default, device secret label in the mockups. (JWT sharing, Google verification and error body shape are decided.)
+Where the Backend (FastAPI) is hosted, and the device secret label in the mockups. (Decided: JWT sharing, Google verification, error body shape, auth server hosting on Vercel, `409 CANNOT_REMOVE_OWNER` for OWNER account deletion, `notify_on_taken` default TRUE.)
+Project-wide status, open bugs and the to-do list: `docs/PROJECT_STATUS.md`.
 
 ## Contract and schema links
 - API list: https://docs.google.com/spreadsheets/d/1VNqQSYk_syjNwLWFM7MFgtgstKPlbYqLhLAHlUGMuKk/edit?usp=sharing (copied from a PDF line break, open it to confirm)

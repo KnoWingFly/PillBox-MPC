@@ -5,10 +5,10 @@ import { Platform } from 'react-native';
 //   native, remembered  -> expo-secure-store (Keychain / Keystore)
 //   native, not         -> memory: a cold start finds no session, the only reliable
 //                          "clear on app close" (React Native has no kill hook)
-//   web, remembered     -> localStorage (survives reloads and browser restarts)
-//   web, not            -> sessionStorage (survives reloads, ends when the tab closes)
-// Web storage is readable by any script on the page; see the XSS note in the handoff list
-// (an httpOnly refresh cookie needs the auth server, which is out of scope here).
+//   web                 -> the refresh token is an HttpOnly cookie set by the auth server, which no
+//                          page script can read (src/server/session-cookie.ts). The store keeps only
+//                          COOKIE_SESSION_MARKER (localStorage when remembered, else sessionStorage)
+//                          and the access token in memory; a reload gets a new one from the cookie.
 const KEYS = {
   access: 'pillcare.access_token',
   refresh: 'pillcare.refresh_token',
@@ -95,7 +95,11 @@ async function secureSet(name: string, value: string): Promise<void> {
   for (let i = newChunks; i < oldChunks; i += 1) await SecureStore.deleteItemAsync(`${name}.${i}`, OPTIONS).catch(() => undefined);
 }
 
+/** On web the access token never touches web storage (it is refreshed from the cookie after a reload). */
+const memoryOnly = (key: Key) => isWeb && key === 'access';
+
 async function get(key: Key): Promise<string | null> {
+  if (memoryOnly(key)) return memory.get(KEYS[key]) ?? null;
   const where = current();
   if (where === 'secure') return secureGet(KEYS[key]);
   if (where === 'memory') return memory.get(KEYS[key]) ?? null;
@@ -105,6 +109,10 @@ async function get(key: Key): Promise<string | null> {
 }
 
 async function set(key: Key, value: string): Promise<void> {
+  if (memoryOnly(key)) {
+    memory.set(KEYS[key], value);
+    return;
+  }
   const where = current();
   if (where === 'secure') return secureSet(KEYS[key], value);
   const storage = where === 'memory' ? null : webStorage(where);

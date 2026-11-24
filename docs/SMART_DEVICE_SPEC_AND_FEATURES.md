@@ -1,6 +1,9 @@
 # 📱 Spesifikasi Lengkap, Arsitektur & Fitur Smart Device Emulator
 **CE739 Mobile & Pervasive Computing — Smart Pillbox IoT Digital Twin**
 
+> **Dokumen historis (30 Sep 2026).** Konsep tampilan (zona meja caregiver, sasis 2×4, meja lansia, workbench) masih menggambarkan emulator, tetapi detail teknisnya sudah berubah: emulator kini punya klien WebSocket (`core/ws_client.py`), sinkron yang dipicu tiap event, profil multi-pillbox (`--profile`), kode QR pairing yang ditampilkan emulator untuk dipindai aplikasi, dan outbox serta saluran perintah yang lebih tahan gangguan.
+> Acuan terkini: `SmartDevice/README.md` (cara pakai), `SmartDevice/CLAUDE.md` (struktur kode), dan `docs/DEVICE_CONTRACT.md` (protokol dengan backend).
+
 ---
 
 ## 1. Ringkasan Eksekutif & Filosofi Desain

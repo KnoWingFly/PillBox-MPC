@@ -73,44 +73,28 @@ user. Requested: `GET /api/v1/notifications?device_id={uuid}` (combinable with `
 `elderly_id`), with `unread_count` computed with the same filter. Rows with `device_id = null`
 (elderly-level) should be included when `elderly_id` matches the device's elderly.
 
-## 5. Unpair semantics (`DELETE /api/v1/devices/{id}`)
+## 5. Unpair semantics (`DELETE /api/v1/devices/{id}`) — DONE (24 Nov 2026)
 
-Current behaviour (`device_management.py` `unpair`): soft-deletes the device's schedules, deletes
-pending doses, clears `elderly_id`, PIN, `paired_at` and nickname. Notifications are untouched and
-stay visible to every caregiver of the elderly profile. The app's dialog tells the OWNER that
-removal affects every caregiver, and then purges the owner's own notifications (item 3).
+`DELETE /api/v1/devices/{id}?purge_my_notifications=true` unpairs the pillbox and deletes the caller's
+own notifications about it in the same transaction (`device_management.remove`). Decided: other
+caregivers keep theirs (their history). The app sends one request (`lib/devices.ts` `unpairPillbox`).
 
-Requested: `DELETE /api/v1/devices/{id}?purge_my_notifications=true` -> `204`, doing item 3 in
-the same transaction. Please also confirm whether other caregivers' notifications for an unpaired
-device should be kept (current) or removed.
+## 6. Per-pillbox "leave" for non-owners — DONE (24 Nov 2026)
 
-## 6. Per-pillbox "leave" for non-owners (design question)
+Decided: a per-pillbox mute, not per-device roles. `DELETE /api/v1/devices/{id}/membership` (204,
+idempotent) records a row in `device_mutes` (migration 0012): the pillbox is hidden on every phone of
+that caregiver (`GET /devices` items carry `is_muted`) and they get no new notifications or pushes
+about it. Their role on the elderly profile, and so their access, is unchanged. `PUT` follows it
+again. The OWNER gets `403` (they unpair instead). The app's "Sembunyikan" now mutes on the server;
+pillboxes hidden on a phone before this are muted once on start-up (`context/devices-context.tsx`).
 
-Roles live on the elderly profile (`user_elderly_roles`), so a PEMANTAU or ADMIN can only leave
-the whole profile (`DELETE /elderly/{id}/caregivers/{me}`), which drops every pillbox of that
-elderly. The app therefore offers non-owners "Sembunyikan" (hidden on this phone only).
-If per-pillbox membership is wanted:
+## 7. Factory reset for a device (simulator "Reset Identitas") — DONE (24 Nov 2026)
 
-```
-DELETE /api/v1/devices/{id}/membership -> 204
-```
-
-This needs a model change (a device-level membership or exclusion table). Until then hiding stays
-local (`Mobile/lib/devices.ts` `saveHiddenPillboxIds`).
-
-## 7. Factory reset for a device (simulator "Reset Identitas")
-
-"Reset Identitas" in the simulator only forgets the code and secret locally; the old device row
-stays on the server, still paired. Requested (provisioning token, like `/admin/devices`):
-
-```
-POST /api/v1/admin/devices/{device_code}/reset   (X-Provisioning-Token)
-204
-```
-
-Unpairs the device and hard-deletes its schedules, doses, stock and notifications, so the
-existing `ON DELETE CASCADE` / `SET NULL` rules (`migrations/0001`) are not needed for this.
-The simulator would call it before forgetting its identity.
+`POST /api/v1/admin/devices/{device_code}/reset` (X-Provisioning-Token) -> 204: unpairs the device
+and hard-deletes its schedules, doses, raw events, stock, refills, mutes and every caregiver's
+notifications about it (`provisioning.factory_reset`). The device row and its secret stay, so a real
+device can be paired again. Caregivers' apps reload their list at once (`roles` push). The emulator
+calls it before forgetting its identity (`SmartDevice/smart_pillbox/core/sync.py` `reset_on_server`).
 
 ## 8. RLS
 
@@ -118,22 +102,23 @@ All backend tables have RLS enabled with no policies (`migrations/0001`, `0002`)
 `anon` / `authenticated` roles cannot read them. The app only uses the API, so no change is
 needed unless direct Supabase queries are planned.
 
-## 9. Auth server (`Mobile/src/server`, `Mobile/src/app/api/auth`)
+## 9. Auth server (`Mobile/src/server`, `Mobile/src/app/api/auth`) — DONE (24 Nov 2026)
 
-- **Absolute 30-day session cap.** Each refresh issues a new token with a fresh 30-day expiry
-  (`src/server/tokens.ts` `rotateRefreshToken`), so a session never ends while it is used. The app
-  enforces 30 days from login on the phone; the server should too: store the family's first login
-  time and reject a refresh after 30 days with `401 REFRESH_TOKEN_INVALID`.
-- **"Ingat saya" off.** The app keeps tokens in memory (native) or `sessionStorage` (web), but the
-  refresh token stays valid on the server for 30 days. Accept `{"remember": false}` on
-  `/api/auth/login` and `/api/auth/google` and issue a short-lived refresh token (for example 12 h).
-- **Web token storage.** On web, "Ingat saya" keeps the refresh token in `localStorage`, readable by
-  any script on the page (XSS risk). Safer: set the refresh token as an `HttpOnly; Secure;
-  SameSite=Strict` cookie scoped to `/api/auth`, and have `/api/auth/refresh` read it from the
-  cookie. The app's token store would then keep only the access token in memory on web.
-- **Push tokens of ended sessions.** When a session ends without logout (app killed with
-  "Ingat saya" off, or the 30-day cap), the push token stays registered to the user. Delete push
-  tokens linked to a refresh-token family when that family is revoked or expires.
+- **Absolute session cap.** Rotation keeps the first token's `expires_at` (`tokens.ts`
+  `claimAndIssue`), so a session ends `REFRESH_TOKEN_TTL_DAYS` (30) after sign-in however often it is
+  refreshed; then `401 REFRESH_TOKEN_INVALID`.
+- **"Ingat saya" off.** `/api/auth/login` and `/api/auth/google` accept `"remember": false` and issue
+  a `REFRESH_TOKEN_SHORT_TTL_HOURS` (12) session. The app sends its checkbox value.
+- **Web token storage.** With header `X-Token-Transport: cookie` (sent by the web app,
+  `src/constants/auth.ts`) the refresh token is set as an `HttpOnly; SameSite=Strict` cookie scoped to
+  `/api/auth` (`Secure` on https) and left out of the JSON; `/api/auth/refresh` and `/logout` read it
+  from the cookie when the body has none, and logout clears it (`src/server/session-cookie.ts`). A
+  short session uses a browser-session cookie. The web app keeps only the access token, in memory.
+- **Push tokens of ended sessions.** `push_tokens.refresh_family_id` (Prisma migration
+  `20261124000000_push_token_session`) records the session a phone registered under. Revoking a
+  session (logout, reuse detection, password reset) deletes its push tokens; an expired one's are
+  deleted on its last refresh attempt and on the next sign-in or push registration
+  (`pruneEndedSessionPushTokens`).
 
 ## Contracts the app already relies on (no change needed)
 

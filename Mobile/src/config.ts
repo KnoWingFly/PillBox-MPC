@@ -111,4 +111,12 @@ export const AppConfig = {
 
   /** true = log "[perf]" timing lines (see src/lib/perf.ts). */
   perfTimingLogs: process.env.EXPO_PUBLIC_PERF_TIMING_LOGS === 'true',
+
+  /** "Share on WhatsApp" opens this URL with the message appended (url-encoded). */
+  whatsappShareUrl: process.env.EXPO_PUBLIC_WHATSAPP_SHARE_URL || 'https://wa.me/?text=',
+  /** Invitation codes: XXXX-XXXX (Backend/app/services/invitations.py CODE_LENGTH, CODE_ALPHABET). */
+  invitationCodeLength: 8,
+  invitationCodeAlphabet: '23456789ABCDEFGHJKMNPQRSTUVWXYZ',
+  /** Backend MAX_CAREGIVERS_PER_ELDERLY default; the backend enforces it (409 MEMBER_LIMIT_REACHED). */
+  maxCaregiversPerElderly: 10,
 } as const;

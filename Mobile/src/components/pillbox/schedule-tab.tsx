@@ -284,7 +284,10 @@ export function ScheduleTab({
           title={S.title}
           subtitle={S.subtitle}
           right={
-            draft.length > 0 ? (
+            !canEdit ? (
+              // A monitor sees the schedule but cannot change it: say so once, up front.
+              <StatusPill label={Strings.members.readOnly} tone="neutral" icon="eye" />
+            ) : draft.length > 0 ? (
               <StatusPill label={S.activeBadge(activeCount, draft.length)} tone="primary" icon="options-outline" />
             ) : undefined
           }
